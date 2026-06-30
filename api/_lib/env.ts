@@ -1,11 +1,11 @@
-import { SignatureType } from '@polymarket/clob-client'
+import { SignatureTypeV2 } from '@polymarket/clob-client-v2'
 
 export interface PolyServerConfig {
   address: string
   apiKey: string
   apiSecret: string
   apiPassphrase: string
-  signatureType: SignatureType
+  signatureType: SignatureTypeV2
   funderAddress: string
   privateKey?: string
 }
@@ -23,7 +23,7 @@ export function getPolyConfig(): PolyServerConfig | null {
 
   if (!address || !apiKey || !apiSecret || !apiPassphrase) return null
 
-  const signatureType = Number(read('POLY_SIGNATURE_TYPE') ?? SignatureType.EOA)
+  const signatureType = Number(read('POLY_SIGNATURE_TYPE') ?? SignatureTypeV2.EOA) as SignatureTypeV2
   const funderAddress = read('POLY_FUNDER_ADDRESS') ?? address
   const privateKey = read('POLY_PRIVATE_KEY')
 

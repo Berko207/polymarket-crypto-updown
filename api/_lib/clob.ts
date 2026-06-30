@@ -6,27 +6,13 @@ import {
   OrderType,
   Side,
   type ApiKeyCreds,
-} from '@polymarket/clob-client'
+} from '@polymarket/clob-client-v2'
 import { createWalletClient, http } from 'viem'
 import { privateKeyToAccount } from 'viem/accounts'
 import { polygon } from 'viem/chains'
 import { getPolyConfig, type PolyServerConfig } from './env.js'
 
 const CLOB_HOST = 'https://clob.polymarket.com'
-
-interface AddressSigner {
-  getAddress(): Promise<string>
-  _signTypedData(): Promise<string>
-}
-
-function addressSigner(address: string): AddressSigner {
-  return {
-    getAddress: async () => address,
-    _signTypedData: async () => {
-      throw new Error('Order signing requires POLY_PRIVATE_KEY on the server')
-    },
-  }
-}
 
 function normalizePrivateKey(key: string): `0x${string}` {
   const trimmed = key.trim()
@@ -53,25 +39,18 @@ function toApiCreds(config: PolyServerConfig): ApiKeyCreds {
 
 export function createClobClient(config: PolyServerConfig): ClobClient {
   const creds = toApiCreds(config)
-  const signer = config.privateKey
-    ? walletFromPrivateKey(config.privateKey)
-    : addressSigner(config.address)
+  const signer = config.privateKey ? walletFromPrivateKey(config.privateKey) : undefined
 
-  return new ClobClient(
-    CLOB_HOST,
-    Chain.POLYGON,
+  return new ClobClient({
+    host: CLOB_HOST,
+    chain: Chain.POLYGON,
     signer,
     creds,
-    config.signatureType,
-    config.funderAddress,
-    undefined,
-    undefined,
-    undefined,
-    undefined,
-    undefined,
-    undefined,
-    true,
-  )
+    signatureType: config.signatureType,
+    funderAddress: config.funderAddress,
+    useServerTime: true,
+    throwOnError: true,
+  })
 }
 
 export function getClobClient(): ClobClient | null {
