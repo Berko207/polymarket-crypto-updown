@@ -1,3 +1,4 @@
+import './loadEnv.js'
 import { SignatureTypeV2 } from '@polymarket/clob-client-v2'
 
 export interface PolyServerConfig {

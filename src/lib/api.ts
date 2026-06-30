@@ -18,9 +18,14 @@ export interface AccountStatusResponse {
 export interface PlaceOrderRequest {
   tokenId: string
   side: 'BUY' | 'SELL'
-  price: number
-  size: number
+  orderType?: 'market' | 'limit'
+  /** USDC to spend (market buy) */
+  amount?: number
+  price?: number
+  size?: number
 }
+
+export const MIN_BUY_USD = 1
 
 export interface PlaceOrderResponse {
   success: boolean
@@ -42,6 +47,21 @@ export interface OpenOrder {
   createdAt: number
 }
 
+export interface Position {
+  tokenId: string
+  outcome: string
+  size: number
+  avgPrice: number
+  currentPrice: number
+  initialValue?: number
+  currentValue?: number
+  cashPnl?: number
+  percentPnl?: number
+  title: string
+  eventSlug: string
+  redeemable: boolean
+}
+
 export async function fetchAccountStatus(): Promise<AccountStatusResponse> {
   const res = await authFetch('/api/account')
   if (!res.ok) throw new Error(`Account check failed (${res.status})`)
@@ -56,6 +76,24 @@ export async function fetchOpenOrders(): Promise<OpenOrder[]> {
   }
   const data = (await res.json()) as { orders: OpenOrder[] }
   return data.orders
+}
+
+export async function fetchPositions(options?: {
+  upTokenId?: string | null
+  downTokenId?: string | null
+}): Promise<Position[]> {
+  const params = new URLSearchParams()
+  if (options?.upTokenId) params.set('upToken', options.upTokenId)
+  if (options?.downTokenId) params.set('downToken', options.downTokenId)
+  const qs = params.toString()
+
+  const res = await authFetch(`/api/positions${qs ? `?${qs}` : ''}`)
+  if (!res.ok) {
+    const data = (await res.json().catch(() => ({}))) as { error?: string }
+    throw new Error(data.error ?? `Positions failed (${res.status})`)
+  }
+  const data = (await res.json()) as { positions: Position[] }
+  return data.positions
 }
 
 export async function cancelOrder(orderId: string): Promise<void> {

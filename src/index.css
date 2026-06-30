@@ -749,6 +749,42 @@ a.outcome-btn {
   border-radius: var(--radius-sm);
 }
 
+.trade-size-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.trade-size-mode {
+  display: inline-flex;
+  padding: 2px;
+  border-radius: 8px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+}
+
+.trade-size-mode button {
+  padding: 4px 8px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 0.68rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.trade-size-mode button.active {
+  background: var(--surface-2);
+  color: var(--text);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.12);
+}
+
+.trade-size-mode button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 .trade-size-label {
   display: flex;
   align-items: center;
@@ -759,7 +795,7 @@ a.outcome-btn {
 }
 
 .trade-size-input {
-  width: 64px;
+  width: 72px;
   padding: 6px 8px;
   border: 1px solid var(--border);
   border-radius: 8px;
@@ -1082,6 +1118,225 @@ a.outcome-btn {
 
 .open-orders-error {
   color: var(--down);
+}
+
+.open-orders-tabs {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.open-orders-tabs button {
+  flex: 1;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-2);
+  color: var(--text-muted);
+  font-size: 0.68rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.open-orders-tabs button.active {
+  color: var(--text);
+  border-color: var(--text-muted);
+}
+
+.open-order-title {
+  font-size: 0.68rem;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+}
+
+.open-order-sell {
+  border: none;
+  background: transparent;
+  font-size: 0.68rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.open-order-sell.up {
+  color: var(--up);
+}
+
+.open-order-sell.down {
+  color: var(--down);
+}
+
+.position-item {
+  display: grid;
+  gap: 4px;
+}
+
+.market-holdings {
+  margin: 0 0 12px;
+  padding: 12px;
+  background: var(--surface-2);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+}
+
+.market-holdings-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+  font-size: 0.8rem;
+}
+
+.market-holdings-refresh {
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 0.9rem;
+}
+
+.market-holdings-list {
+  list-style: none;
+  display: grid;
+  gap: 8px;
+}
+
+.market-holding-item {
+  padding: 8px 10px;
+  background: var(--surface);
+  border-radius: 8px;
+}
+
+.market-holding-main,
+.market-holding-meta {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+}
+
+.market-holding-meta {
+  margin-top: 6px;
+  font-size: 0.68rem;
+  color: var(--text-muted);
+}
+
+.market-holding-outcome {
+  font-size: 0.78rem;
+  font-weight: 700;
+}
+
+.market-holding-outcome.up {
+  color: var(--up);
+}
+
+.market-holding-outcome.down {
+  color: var(--down);
+}
+
+.market-holding-outcome.pending {
+  color: var(--text-muted);
+}
+
+.market-holding-size {
+  font-size: 0.75rem;
+  font-weight: 600;
+}
+
+.market-holding-sell {
+  border: none;
+  background: transparent;
+  font-size: 0.68rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.market-holding-sell.up {
+  color: var(--up);
+}
+
+.market-holding-sell.down {
+  color: var(--down);
+}
+
+.market-holding-sell.cancel {
+  color: var(--down);
+}
+
+.market-holdings-hint,
+.market-holdings-error {
+  font-size: 0.72rem;
+  color: var(--text-muted);
+}
+
+.market-holdings-error {
+  color: var(--down);
+}
+
+.market-holdings-msg.ok {
+  font-size: 0.72rem;
+  color: var(--up);
+}
+
+.market-holdings-msg.err {
+  font-size: 0.72rem;
+  color: var(--down);
+}
+
+.position-pnl {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  margin: 6px 0 2px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--surface-2);
+}
+
+.position-pnl.compact {
+  margin: 4px 0;
+  padding: 6px 8px;
+}
+
+.position-live-value {
+  font-size: 1rem;
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+
+.position-pnl.compact .position-live-value {
+  font-size: 0.85rem;
+}
+
+.position-pnl-change {
+  font-size: 0.78rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.position-pnl.compact .position-pnl-change {
+  font-size: 0.72rem;
+}
+
+.position-pnl-change.positive {
+  color: var(--up);
+}
+
+.position-pnl-change.negative {
+  color: var(--down);
+}
+
+.position-pnl.muted {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+}
+
+.position-pnl-pct {
+  opacity: 0.9;
 }
 
 .open-orders-refresh {

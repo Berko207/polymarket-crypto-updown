@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { placeOrder } from '../lib/api'
+import { MIN_BUY_USD, placeOrder } from '../lib/api'
 import {
   formatCountdown,
   formatPercent,
@@ -9,6 +9,7 @@ import {
 import { getCoin, getTimeframe } from '../lib/config'
 import type { ParsedMarket } from '../lib/types'
 import { OrderConfirmDialog } from './OrderConfirmDialog'
+import { MarketHoldings } from './MarketHoldings'
 
 interface MarketCardProps {
   market: ParsedMarket
@@ -16,9 +17,11 @@ interface MarketCardProps {
   canTrade?: boolean
   usdcBalance?: number
   onOrderPlaced?: () => void
+  holdingsRefreshKey?: number
 }
 
 type Outcome = 'up' | 'down'
+type SizeMode = 'shares' | 'usdc'
 
 function buyPrice(market: ParsedMarket, outcome: Outcome): number | null {
   if (outcome === 'up') {
@@ -31,14 +34,16 @@ function tokenIdFor(market: ParsedMarket, outcome: Outcome): string | null {
   return outcome === 'up' ? market.upTokenId : market.downTokenId
 }
 
-export function MarketCard({ market, updateHint, canTrade, usdcBalance, onOrderPlaced }: MarketCardProps) {
+export function MarketCard({ market, updateHint, canTrade, usdcBalance, onOrderPlaced, holdingsRefreshKey = 0 }: MarketCardProps) {
   const coin = getCoin(market.coin)
   const timeframe = getTimeframe(market.timeframe)
   const countdownInfo = getCountdownTarget(market)
   const [countdown, setCountdown] = useState(() => formatCountdown(countdownInfo.target))
   const [countdownLabel, setCountdownLabel] = useState(countdownInfo.label)
   const [priceFlash, setPriceFlash] = useState(false)
-  const [size, setSize] = useState(5)
+  const [sizeMode, setSizeMode] = useState<SizeMode>('usdc')
+  const [size, setSize] = useState(1)
+  const [usdcAmount, setUsdcAmount] = useState(1)
   const [placing, setPlacing] = useState<Outcome | null>(null)
   const [confirmOutcome, setConfirmOutcome] = useState<Outcome | null>(null)
   const [tradeMessage, setTradeMessage] = useState<{ type: 'ok' | 'err'; text: string } | null>(null)
@@ -93,21 +98,28 @@ export function MarketCard({ market, updateHint, canTrade, usdcBalance, onOrderP
     const price = buyPrice(market, outcome)
     if (!tokenId || price == null) return
 
+    const buyUsd = orderAmountUsd(outcome)
+    if (buyUsd < MIN_BUY_USD) {
+      setTradeMessage({ type: 'err', text: `Minimum buy is $${MIN_BUY_USD.toFixed(2)}` })
+      return
+    }
+
     setConfirmOutcome(null)
     setPlacing(outcome)
     setTradeMessage(null)
 
     try {
+      const buyUsd = orderAmountUsd(outcome)
       const result = await placeOrder({
         tokenId,
         side: 'BUY',
-        price,
-        size,
+        orderType: 'market',
+        amount: buyUsd,
       })
       const id = result.orderId ? ` · ${result.orderId.slice(0, 8)}…` : ''
       setTradeMessage({
         type: 'ok',
-        text: `Buy ${outcome === 'up' ? 'Up' : 'Down'} submitted${id}`,
+        text: `Buy ${outcome === 'up' ? 'Up' : 'Down'} filled${id}`,
       })
       onOrderPlaced?.()
     } catch (error) {
@@ -123,7 +135,35 @@ export function MarketCard({ market, updateHint, canTrade, usdcBalance, onOrderP
   const upPct = market.upPrice * 100
   const downPct = market.downPrice * 100
   const trading = Boolean(canTrade)
+  const refPrice = buyPrice(market, 'up') ?? market.upPrice
+
+  const orderSize = (outcome: Outcome): number => {
+    const price = buyPrice(market, outcome)
+    if (!price) return size
+    if (sizeMode === 'usdc') return Math.ceil((usdcAmount / price) * 100) / 100
+    return size
+  }
+
+  const orderAmountUsd = (outcome: Outcome): number => {
+    const price = buyPrice(market, outcome)
+    if (sizeMode === 'usdc') return Math.max(MIN_BUY_USD, usdcAmount)
+    if (!price) return MIN_BUY_USD
+    return Math.max(MIN_BUY_USD, size * price)
+  }
+
+  const switchSizeMode = (mode: SizeMode) => {
+    if (mode === sizeMode) return
+    if (mode === 'usdc') {
+      setUsdcAmount(Math.max(MIN_BUY_USD, Number((size * refPrice).toFixed(2))))
+    } else {
+      setSize(Math.max(1, Math.round(usdcAmount / refPrice) || 1))
+    }
+    setSizeMode(mode)
+  }
+
   const confirmPrice = confirmOutcome ? buyPrice(market, confirmOutcome) : null
+  const confirmSize = confirmOutcome ? orderSize(confirmOutcome) : size
+  const confirmCost = confirmOutcome ? orderAmountUsd(confirmOutcome) : usdcAmount
 
   return (
     <article className="market-card">
@@ -172,20 +212,49 @@ export function MarketCard({ market, updateHint, canTrade, usdcBalance, onOrderP
 
       {trading && (
         <div className="trade-controls">
-          <label className="trade-size-label">
-            Shares
-            <input
-              type="number"
-              className="trade-size-input"
-              min={1}
-              step={1}
-              value={size}
-              onChange={(e) => setSize(Math.max(1, Number(e.target.value) || 1))}
-              disabled={Boolean(placing)}
-            />
-          </label>
+          <div className="trade-size-row">
+            <div className="trade-size-mode" role="group" aria-label="Order size unit">
+              <button
+                type="button"
+                className={sizeMode === 'usdc' ? 'active' : ''}
+                onClick={() => switchSizeMode('usdc')}
+                disabled={Boolean(placing)}
+              >
+                USDC
+              </button>
+              <button
+                type="button"
+                className={sizeMode === 'shares' ? 'active' : ''}
+                onClick={() => switchSizeMode('shares')}
+                disabled={Boolean(placing)}
+              >
+                Shares
+              </button>
+            </div>
+            <label className="trade-size-label">
+              {sizeMode === 'usdc' ? 'Amount' : 'Shares'}
+              <input
+                type="number"
+                className="trade-size-input"
+                min={sizeMode === 'usdc' ? MIN_BUY_USD : 1}
+                step={sizeMode === 'usdc' ? 0.01 : 1}
+                value={sizeMode === 'usdc' ? usdcAmount : size}
+                onChange={(e) => {
+                  const raw = Number(e.target.value)
+                  if (sizeMode === 'usdc') {
+                    setUsdcAmount(Math.max(MIN_BUY_USD, raw || MIN_BUY_USD))
+                  } else {
+                    setSize(Math.max(1, raw || 1))
+                  }
+                }}
+                disabled={Boolean(placing)}
+              />
+            </label>
+          </div>
           <span className="trade-hint">
-            Est. ${((buyPrice(market, 'up') ?? market.upPrice) * size).toFixed(2)} per side
+            {sizeMode === 'usdc'
+              ? `≈ ${(usdcAmount / refPrice).toFixed(2)} shares · min $${MIN_BUY_USD}`
+              : `Est. $${Math.max(MIN_BUY_USD, refPrice * size).toFixed(2)} per side`}
           </span>
         </div>
       )}
@@ -256,6 +325,18 @@ export function MarketCard({ market, updateHint, canTrade, usdcBalance, onOrderP
         )}
       </div>
 
+      <MarketHoldings
+        enabled={trading}
+        upTokenId={market.upTokenId}
+        downTokenId={market.downTokenId}
+        bestBidUp={market.bestBidUp}
+        bestBidDown={market.bestBidDown}
+        upPrice={market.upPrice}
+        downPrice={market.downPrice}
+        refreshKey={holdingsRefreshKey}
+        onChanged={onOrderPlaced}
+      />
+
       {tradeMessage && (
         <p className={`trade-feedback ${tradeMessage.type === 'ok' ? 'ok' : 'err'}`}>
           {tradeMessage.text}
@@ -299,7 +380,8 @@ export function MarketCard({ market, updateHint, canTrade, usdcBalance, onOrderP
           outcome={confirmOutcome}
           coinSymbol={coin.symbol}
           price={confirmPrice}
-          size={size}
+          size={confirmSize}
+          estCost={confirmCost}
           usdcBalance={usdcBalance}
           onConfirm={() => void submitBuy(confirmOutcome)}
           onCancel={() => setConfirmOutcome(null)}

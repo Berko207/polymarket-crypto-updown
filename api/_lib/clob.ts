@@ -73,8 +73,10 @@ export interface AccountSnapshot {
 export interface PlaceOrderParams {
   tokenId: string
   side: 'BUY' | 'SELL'
-  price: number
-  size: number
+  price?: number
+  size?: number
+  amount?: number
+  orderType?: 'market' | 'limit'
 }
 
 export interface PlaceOrderResult {
@@ -83,7 +85,61 @@ export interface PlaceOrderResult {
   status?: string
 }
 
+export const MIN_BUY_USD = 1
+
 const DEPOSIT_WALLET_DOCS = 'https://docs.polymarket.com/trading/deposit-wallets'
+
+async function marketParams(client: ClobClient, tokenId: string) {
+  const [tickSize, negRisk] = await Promise.all([
+    client.getTickSize(tokenId),
+    client.getNegRisk(tokenId),
+  ])
+  return { tickSize, negRisk }
+}
+
+export async function placeMarketOrder(params: PlaceOrderParams): Promise<PlaceOrderResult> {
+  const config = getPolyConfig()
+  if (!config?.privateKey) {
+    throw new Error('POLY_PRIVATE_KEY is required to place orders')
+  }
+
+  assertWalletConfig(config)
+
+  const amount = params.amount
+  if (!Number.isFinite(amount) || amount <= 0) {
+    throw new Error('amount must be a positive number')
+  }
+
+  if (params.side === 'BUY' && amount < MIN_BUY_USD) {
+    throw new Error(`Minimum buy size is $${MIN_BUY_USD.toFixed(2)}`)
+  }
+
+  const client = createClobClient(config)
+
+  if (config.signatureType === SignatureTypeV2.POLY_1271) {
+    await client.updateBalanceAllowance({ asset_type: AssetType.COLLATERAL })
+  }
+
+  const { tickSize, negRisk } = await marketParams(client, params.tokenId)
+
+  const response = await client.createAndPostMarketOrder(
+    {
+      tokenID: params.tokenId,
+      side: params.side === 'SELL' ? Side.SELL : Side.BUY,
+      amount,
+      orderType: OrderType.FOK,
+    },
+    { tickSize, negRisk },
+    OrderType.FOK,
+  )
+
+  const record = response as Record<string, unknown> | null
+  return {
+    success: true,
+    orderId: typeof record?.orderID === 'string' ? record.orderID : undefined,
+    status: typeof record?.status === 'string' ? record.status : undefined,
+  }
+}
 
 export async function placeLimitOrder(params: PlaceOrderParams): Promise<PlaceOrderResult> {
   const config = getPolyConfig()
@@ -92,6 +148,19 @@ export async function placeLimitOrder(params: PlaceOrderParams): Promise<PlaceOr
   }
 
   assertWalletConfig(config)
+
+  const price = params.price
+  const size = params.size
+  if (!Number.isFinite(price) || price <= 0 || price >= 1) {
+    throw new Error('price must be between 0 and 1 (exclusive)')
+  }
+  if (!Number.isFinite(size) || size <= 0) {
+    throw new Error('size must be a positive number of shares')
+  }
+
+  if (params.side === 'BUY' && price * size < MIN_BUY_USD) {
+    throw new Error(`Minimum buy size is $${MIN_BUY_USD.toFixed(2)} (currently $${(price * size).toFixed(2)})`)
+  }
 
   const client = createClobClient(config)
 

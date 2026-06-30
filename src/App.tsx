@@ -116,6 +116,7 @@ export function AppShell() {
             canTrade={accountStatus?.canTrade === true}
             usdcBalance={accountStatus?.usdcBalance}
             onOrderPlaced={handleOrderPlaced}
+            holdingsRefreshKey={ordersRefreshKey}
           />
         )}
       </main>
