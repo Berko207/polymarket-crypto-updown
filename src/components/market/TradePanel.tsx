@@ -75,6 +75,9 @@ export function TradePanel({
         amountUsd: orderUsd(outcome),
         price: ask,
         label,
+        // Authoritative gamma metadata → server skips CLOB tick/neg-risk lookups.
+        tickSize: market.tickSize ?? undefined,
+        negRisk: market.negRisk ?? undefined,
       })
     } catch {
       // toast surfaced in useOrderActions

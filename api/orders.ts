@@ -1,5 +1,12 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node'
-import { fetchUsdcBalance, formatOrderError, placeLimitOrder, placeMarketOrder, MIN_BUY_USD } from './_lib/clob.js'
+import {
+  fetchUsdcBalance,
+  formatOrderError,
+  placeLimitOrder,
+  placeMarketOrder,
+  warmOrderPath,
+  MIN_BUY_USD,
+} from './_lib/clob.js'
 import { getMaxOrderCost, getMaxOrderSize, guardTradingApi, rateLimit } from './_lib/auth.js'
 import { requireCanPlaceOrders, requireConfigured, requireWalletReady } from './_lib/guards.js'
 
@@ -15,6 +22,19 @@ function readJsonBody(req: VercelRequest): Record<string, unknown> {
   return req.body as Record<string, unknown>
 }
 
+function readTokenIds(value: unknown): string[] {
+  if (Array.isArray(value)) return value.map((id) => String(id).trim()).filter(Boolean)
+  if (typeof value === 'string') return value.split(',').map((id) => id.trim()).filter(Boolean)
+  return []
+}
+
+/** Optional client-supplied tick size: only valid Polymarket ticks are accepted. */
+function readClientTickSize(value: unknown): number | undefined {
+  const n = typeof value === 'string' ? Number(value) : typeof value === 'number' ? value : NaN
+  if (!Number.isFinite(n)) return undefined
+  return [0.1, 0.01, 0.001, 0.0001].some((t) => Math.abs(t - n) < 1e-9) ? n : undefined
+}
+
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== 'POST') {
     res.setHeader('Allow', 'POST')
@@ -23,6 +43,22 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
   if (!guardTradingApi(req, res)) return
   if (!requireConfigured(res)) return
+
+  // Warm requests share this function so the prefetched CLOB metadata (tick size,
+  // neg-risk, fee, allowance) populates the SAME Lambda instance's in-memory cache
+  // that will place the order. /api/warm is a different Lambda whose cache the order
+  // path never sees. warmOrderPath no-ops when the wallet isn't ready.
+  if (req.query.warm === '1' || req.query.warm === 'true') {
+    try {
+      const ids = readTokenIds(readJsonBody(req).tokenIds ?? req.query.tokenIds)
+      if (ids.length) await warmOrderPath(ids)
+      return res.status(204).end()
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Warm failed'
+      return res.status(500).json({ error: message })
+    }
+  }
+
   if (!requireCanPlaceOrders(res)) return
   if (!requireWalletReady(res)) return
   if (!rateLimit(req, res, { limit: 20, key: 'place-order' })) return
@@ -35,6 +71,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const price = Number(body.price)
     const size = Number(body.size)
     const amount = Number(body.amount)
+    // Optional gamma metadata from the client — lets the order path skip CLOB
+    // tick/neg-risk lookups on a cold instance. Validated; server cache still wins.
+    const tickSize = readClientTickSize(body.tickSize)
+    const negRisk = typeof body.negRisk === 'boolean' ? body.negRisk : undefined
 
     if (!tokenId) {
       return res.status(400).json({ error: 'tokenId is required' })
@@ -83,6 +123,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         amount: marketAmount,
         price: marketPrice,
         orderType: 'market',
+        tickSize,
+        negRisk,
       })
       return res.status(200).json(result)
     }
@@ -121,7 +163,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
 
     console.info('[orders] limit', { side, price, size, tokenId: tokenId.slice(0, 12) })
-    const result = await placeLimitOrder({ tokenId, side, price, size, orderType: 'limit' })
+    const result = await placeLimitOrder({ tokenId, side, price, size, orderType: 'limit', tickSize, negRisk })
     return res.status(200).json(result)
   } catch (error) {
     const { message, status } = formatOrderError(error)

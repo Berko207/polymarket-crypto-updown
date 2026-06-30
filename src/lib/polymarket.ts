@@ -111,6 +111,8 @@ function parseMarket(
     bestAskDown: null,
     priceChange1h: market.oneHourPriceChange ?? null,
     polymarketUrl: `https://polymarket.com/event/${event.slug}`,
+    negRisk: market.negRisk ?? null,
+    tickSize: market.orderPriceMinTickSize ?? null,
     isLive,
     inWindow,
   }

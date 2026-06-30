@@ -1,4 +1,4 @@
-import { useMemo } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useQueries, useQuery } from '@tanstack/react-query'
 import { fetchCurrentMarket } from '@/lib/polymarket'
 import { COINS, getAvailableTimeframes } from '@/lib/config'
@@ -50,14 +50,73 @@ export interface LiveMarket {
   isError: boolean
   error: unknown
   connected: boolean
+  /** The current window has ended and we're polling fast for the next round. */
+  rolling: boolean
   refetch: () => void
+}
+
+/** How fast to re-check for the next round while the current one is resolving. */
+const ROLLOVER_RETRY_MS = 2_000
+/** Grace period after a window's end before fetching its successor. */
+const ROLLOVER_LEAD_MS = 400
+/** Stop fast-polling after this many tries; the normal 30s poll then takes over. */
+const ROLLOVER_MAX_ATTEMPTS = 20
+
+/**
+ * Auto-advance to the next round. The instant the focused window ends, refetch
+ * on a fast loop until the next live market appears — instead of sitting on a
+ * "Resolving…" clock for up to a full (30s) metadata poll. Returns true while a
+ * rollover is in progress so the UI can show a transition hint.
+ */
+function useMarketRollover(endMs: number | null, refetch: () => void): boolean {
+  const [rolling, setRolling] = useState(false)
+
+  useEffect(() => {
+    if (endMs == null) {
+      setRolling(false)
+      return
+    }
+
+    const wait = endMs - Date.now()
+    // A market whose window is still open means we're not (yet) rolling over.
+    if (wait > 0) setRolling(false)
+
+    let cancelled = false
+    let attempts = 0
+    let timer: ReturnType<typeof setTimeout> | null = null
+
+    const tick = () => {
+      if (cancelled) return
+      attempts += 1
+      refetch()
+      if (attempts >= ROLLOVER_MAX_ATTEMPTS) {
+        setRolling(false) // give up the fast loop; the normal poll keeps trying
+        return
+      }
+      setRolling(true)
+      timer = setTimeout(tick, ROLLOVER_RETRY_MS)
+    }
+
+    timer = setTimeout(tick, Math.max(0, wait) + ROLLOVER_LEAD_MS)
+    return () => {
+      cancelled = true
+      if (timer) clearTimeout(timer)
+    }
+  }, [endMs, refetch])
+
+  return rolling
 }
 
 /** Focused market: polled snapshot + live WS overlay, driven by the update-mode config. */
 export function useLiveMarket(coin: CoinId, timeframe: TimeframeId): LiveMarket {
   const config = useUpdateConfig()
   const query = useMarketQuery(coin, timeframe, config.pollMs)
-  const market = query.data ?? null
+
+  // Retain the last resolved market so a transient empty fetch during rollover
+  // (the brief gap while the next window goes live) doesn't blank the card.
+  const lastMarketRef = useRef<ParsedMarket | null>(null)
+  if (query.data) lastMarketRef.current = query.data
+  const market = query.data ?? lastMarketRef.current
 
   const tokenIds = useMemo(
     () => [market?.upTokenId, market?.downTokenId].filter(Boolean) as string[],
@@ -73,13 +132,20 @@ export function useLiveMarket(coin: CoinId, timeframe: TimeframeId): LiveMarket 
     [market, config.useWebSocket, quotes],
   )
 
+  // Stable refetch identity so the rollover effect only re-arms when the window changes.
+  const refetchRef = useRef<() => void>(() => {})
+  refetchRef.current = () => void query.refetch()
+  const refetch = useCallback(() => refetchRef.current(), [])
+  const rolling = useMarketRollover(market ? market.endDate.getTime() : null, refetch)
+
   return {
     market: displayMarket,
     isLoading: query.isLoading,
     isError: query.isError,
     error: query.error,
     connected,
-    refetch: () => void query.refetch(),
+    rolling,
+    refetch,
   }
 }
 

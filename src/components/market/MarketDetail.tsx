@@ -1,5 +1,5 @@
 import { useEffect } from 'react'
-import { ExternalLink } from 'lucide-react'
+import { ExternalLink, Loader2 } from 'lucide-react'
 import { useLiveMarket } from '@/queries/market'
 import { useWarmTradingPath } from '@/queries/trading'
 import { formatMarketHeading } from '@/lib/marketLabels'
@@ -25,7 +25,7 @@ export function MarketDetail({
   timeframe: TimeframeId
   canTrade: boolean
 }) {
-  const { market, isLoading, isError, error } = useLiveMarket(coin, timeframe)
+  const { market, isLoading, isError, error, rolling } = useLiveMarket(coin, timeframe)
   const subtitle = market ? formatMarketHeading(market).subtitle : ''
 
   useEffect(() => {
@@ -64,6 +64,13 @@ export function MarketDetail({
   return (
     <Card>
       <CardContent className="flex flex-col gap-5 p-5">
+        {rolling && (
+          <div className="flex items-center justify-center gap-2 rounded-lg bg-primary/10 px-3 py-1.5 text-xs font-medium text-primary">
+            <Loader2 className="size-3.5 animate-spin" />
+            Round ended — loading next market…
+          </div>
+        )}
+
         <header className="flex items-start justify-between gap-3">
           <div className="flex items-center gap-3">
             <CoinBadge coin={market.coin} size="lg" />

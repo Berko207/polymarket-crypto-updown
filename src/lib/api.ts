@@ -23,6 +23,9 @@ export interface PlaceOrderRequest {
   amount?: number
   price?: number
   size?: number
+  /** Gamma order metadata, passed through so the server skips CLOB tick/neg-risk lookups. */
+  tickSize?: number
+  negRisk?: boolean
 }
 
 export const MIN_BUY_USD = 1
@@ -120,13 +123,19 @@ export async function placeOrder(body: PlaceOrderRequest): Promise<PlaceOrderRes
   return data
 }
 
-/** Prefetch CLOB metadata for token(s) so the next order skips cold lookups. Fire-and-forget. */
+/**
+ * Prefetch CLOB metadata for token(s) so the next order skips cold lookups.
+ * Routed through /api/orders (not /api/warm) so the warmed in-memory cache lives in
+ * the SAME serverless instance that places the order. Fire-and-forget.
+ */
 export async function warmTradingPath(tokenIds: string[]): Promise<void> {
   const ids = [...new Set(tokenIds.map((id) => id.trim()).filter(Boolean))]
   if (!ids.length) return
 
-  const res = await authFetch(`/api/warm?tokenIds=${encodeURIComponent(ids.join(','))}`, {
+  const res = await authFetch('/api/orders?warm=1', {
     method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ tokenIds: ids }),
   })
   if (!res.ok && res.status !== 204) {
     const data = (await res.json().catch(() => ({}))) as { error?: string }

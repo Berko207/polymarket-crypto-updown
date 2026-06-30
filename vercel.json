@@ -6,6 +6,7 @@
   "framework": "vite",
   "outputDirectory": "dist",
   "regions": ["dub1"],
+  "fluid": true,
   "functions": {
     "api/**/*.ts": {
       "maxDuration": 30

@@ -35,6 +35,10 @@ export interface GammaMarket {
   eventStartTime?: string
   acceptingOrders?: boolean
   active?: boolean
+  /** Whether this market is part of a negative-risk event (binary up/down = false). */
+  negRisk?: boolean
+  /** Minimum price increment, e.g. 0.01 / 0.001. Authoritative metadata from gamma. */
+  orderPriceMinTickSize?: number
 }
 
 export interface GammaEvent {
@@ -82,6 +86,9 @@ export interface ParsedMarket {
   bestAskDown: number | null
   priceChange1h: number | null
   polymarketUrl: string
+  /** Order metadata from gamma — passed to the order API so the server skips CLOB lookups. */
+  negRisk: boolean | null
+  tickSize: number | null
   /** Market is open for trading (matches Polymarket "Live") */
   isLive: boolean
   /** Price measurement window is currently active */

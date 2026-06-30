@@ -75,17 +75,22 @@ export function PortfolioPanel({
   const sell = useSellFlow()
   const { cancellingId, cancel } = useCancelFlow()
 
-  const tokenIds = useMemo(() => {
-    const ids = new Set<string>()
-    for (const p of positions) ids.add(p.tokenId)
-    for (const o of orders) ids.add(o.assetId)
-    return [...ids]
-  }, [positions, orders])
+  // Two independent subscriptions so the open-orders view stays live and smooth
+  // when you switch coins/timeframes: order tokens are global and don't change on
+  // a timeframe switch, so their quotes never blink. Position tokens shift with the
+  // focused market, so they get their own subscription.
+  const positionTokenIds = useMemo(
+    () => [...new Set(positions.map((p) => p.tokenId))],
+    [positions],
+  )
+  const orderTokenIds = useMemo(
+    () => [...new Set(orders.map((o) => o.assetId))],
+    [orders],
+  )
 
-  const { quotes } = useTokenQuotes(tokenIds, {
-    enabled: enabled && config.useWebSocket,
-    throttleMs: config.throttleMs,
-  })
+  const quoteOpts = { enabled: enabled && config.useWebSocket, throttleMs: config.throttleMs }
+  const { quotes: positionQuotes } = useTokenQuotes(positionTokenIds, quoteOpts)
+  const { quotes: orderQuotes } = useTokenQuotes(orderTokenIds, quoteOpts)
 
   if (!enabled) {
     return (
@@ -95,7 +100,10 @@ export function PortfolioPanel({
     )
   }
 
-  const loading = (positionsQuery.isLoading || ordersQuery.isLoading) && tokenIds.length === 0
+  const loading =
+    (positionsQuery.isLoading || ordersQuery.isLoading) &&
+    positionTokenIds.length === 0 &&
+    orderTokenIds.length === 0
 
   return (
     <>
@@ -117,7 +125,7 @@ export function PortfolioPanel({
           ) : (
             <PositionGroups
               positions={positions}
-              quotes={quotes}
+              quotes={positionQuotes}
               sell={sell}
               focusedKey={focused?.eventSlug ?? null}
             />
@@ -136,6 +144,7 @@ export function PortfolioPanel({
                   key={o.id}
                   order={o}
                   positions={positions}
+                  quote={orderQuotes[o.assetId]}
                   cancelling={cancellingId === o.id}
                   onCancel={cancel}
                 />
