@@ -11,7 +11,7 @@ export interface PendingSell {
   label: string
 }
 
-/** Sell-with-confirmation flow, shared by the portfolio panel and per-market holdings. */
+/** Sell-with-confirmation flow for the portfolio panel. */
 export function useSellFlow() {
   const actions = useOrderActions()
   const [sellingId, setSellingId] = useState<string | null>(null)

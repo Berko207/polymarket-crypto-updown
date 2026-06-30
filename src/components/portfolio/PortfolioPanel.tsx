@@ -11,10 +11,21 @@ import { useMarketQuery } from '@/queries/market'
 import { useSellFlow, useCancelFlow } from '@/hooks/usePortfolioActions'
 import { useTokenQuotes } from '@/hooks/useTokenQuotes'
 import { useUpdateConfig } from '@/store/ui'
+import { formatMarketGroupLabel } from '@/lib/marketLabels'
+import { formatPnlPct, formatPnlUsd } from '@/lib/positionPnl'
+import {
+  buildPositionLeg,
+  groupPositionsByMarket,
+  recommendSellFirst,
+  summarizePair,
+} from '@/lib/sellPriority'
+import { cn } from '@/lib/utils'
 import { OrderRow } from './OrderRow'
 import { PositionRow } from './PositionRow'
+import { outcomeSide } from '@/components/common/OutcomeBadge'
 import { OrderConfirmDialog } from '@/components/dialogs/OrderConfirmDialog'
 import type { CoinId, TimeframeId } from '@/lib/types'
+import type { Position } from '@/lib/api'
 
 export function PortfolioPanel({
   enabled,
@@ -49,8 +60,16 @@ export function PortfolioPanel({
     [holdingsQuery.data, focused?.upTokenId, focused?.downTokenId],
   )
   const positions = useMemo(
-    () => mergeInstantHoldings(positionsQuery.data ?? [], holdingsQuery.data ?? [], focusedTokenIds),
-    [positionsQuery.data, holdingsQuery.data, focusedTokenIds],
+    () =>
+      mergeInstantHoldings(
+        positionsQuery.data ?? [],
+        holdingsQuery.data ?? [],
+        focusedTokenIds,
+        focused
+          ? { eventSlug: focused.eventSlug, title: focused.title, timeframe: focused.timeframe }
+          : null,
+      ),
+    [positionsQuery.data, holdingsQuery.data, focusedTokenIds, focused],
   )
 
   const sell = useSellFlow()
@@ -96,17 +115,12 @@ export function PortfolioPanel({
           ) : positions.length === 0 ? (
             <EmptyHint>No open positions.</EmptyHint>
           ) : (
-            <ul className="flex flex-col gap-2">
-              {positions.map((p) => (
-                <PositionRow
-                  key={p.tokenId}
-                  position={p}
-                  quote={quotes[p.tokenId]}
-                  selling={sell.sellingId === p.tokenId}
-                  onSell={sell.request}
-                />
-              ))}
-            </ul>
+            <PositionGroups
+              positions={positions}
+              quotes={quotes}
+              sell={sell}
+              focusedKey={focused?.eventSlug ?? null}
+            />
           )}
         </TabsContent>
 
@@ -143,6 +157,78 @@ export function PortfolioPanel({
 
 function EmptyHint({ children }: { children: React.ReactNode }) {
   return <p className="px-1 py-6 text-center text-sm text-muted-foreground">{children}</p>
+}
+
+function PositionGroups({
+  positions,
+  quotes,
+  sell,
+  focusedKey,
+}: {
+  positions: Position[]
+  quotes: Record<string, import('@/lib/clobSocket').TokenQuote>
+  sell: ReturnType<typeof useSellFlow>
+  focusedKey: string | null
+}) {
+  const groups = useMemo(() => {
+    const byMarket = groupPositionsByMarket(positions)
+    return [...byMarket.entries()].sort(([aKey], [bKey]) => {
+      if (aKey === focusedKey) return -1
+      if (bKey === focusedKey) return 1
+      return 0
+    })
+  }, [positions, focusedKey])
+
+  return (
+    <ul className="flex flex-col gap-3">
+      {groups.map(([key, rows]) => {
+        const legs = rows.map((p) => buildPositionLeg(p, quotes[p.tokenId]))
+        const recommendation = recommendSellFirst(legs)
+        const summary = summarizePair(legs)
+        const groupLabel = formatMarketGroupLabel(rows)
+        const showPairHeader = rows.length > 1
+        const netPositive = (summary.netPnl ?? 0) >= 0
+
+        return (
+          <li key={key} className="flex flex-col gap-1.5">
+            {showPairHeader && (
+              <div className="flex items-center justify-between gap-2 px-1">
+                <span className="truncate text-[0.65rem] font-semibold uppercase tracking-wide text-muted-foreground">
+                  {groupLabel}
+                  {rows.length === 2 && <span className="ml-1 normal-case opacity-70">· Up + Down</span>}
+                </span>
+                <div className="flex shrink-0 items-center gap-2 text-[0.65rem] tabular-nums">
+                  {summary.netPnl != null && (
+                    <span className={cn('font-bold', netPositive ? 'text-up' : 'text-down')}>
+                      {formatPnlUsd(summary.netPnl)}
+                      {summary.netPnlPct != null && (
+                        <span className="ml-1 opacity-90">{formatPnlPct(summary.netPnlPct)}</span>
+                      )}
+                    </span>
+                  )}
+                  {recommendation.first && (
+                    <span className="text-muted-foreground">{recommendation.reason}</span>
+                  )}
+                </div>
+              </div>
+            )}
+            <ul className="flex flex-col gap-2">
+              {rows.map((p) => (
+                <PositionRow
+                  key={p.tokenId}
+                  position={p}
+                  quote={quotes[p.tokenId]}
+                  selling={sell.sellingId === p.tokenId}
+                  sellFirst={recommendation.first === outcomeSide(p.outcome)}
+                  onSell={sell.request}
+                />
+              ))}
+            </ul>
+          </li>
+        )
+      })}
+    </ul>
+  )
 }
 
 function PortfolioSkeleton() {

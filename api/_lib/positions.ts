@@ -146,5 +146,5 @@ export async function fetchMarketHoldings(
     }
   })
 
-  return [...byToken.values()].filter((p) => p.size > 0)
+  return [...byToken.values()].filter((p) => p.size >= 0.01)
 }

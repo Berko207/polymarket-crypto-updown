@@ -8,8 +8,30 @@ import {
   type Position,
 } from '@/lib/api'
 import { qk } from './keys'
+import type { TimeframeId } from '@/lib/types'
 
 const PORTFOLIO_POLL_MS = 3_000
+
+/** Match Polymarket Data API dust threshold — below this, hide the row. */
+export const MIN_POSITION_SIZE = 0.01
+
+export function isMeaningfulPosition(p: Position): boolean {
+  return p.size >= MIN_POSITION_SIZE && !p.redeemable
+}
+
+export interface FocusedMarketMeta {
+  eventSlug: string
+  title: string
+  timeframe: TimeframeId
+}
+
+function enrichInstantPosition(p: Position, meta: FocusedMarketMeta): Position {
+  return {
+    ...p,
+    eventSlug: p.eventSlug || meta.eventSlug,
+    title: p.title === 'This market' || !p.title.trim() ? meta.title : p.title,
+  }
+}
 
 /** Live crypto up/down positions only (drops dust, resolved, and zero-price rows). */
 function isCryptoUpDown(title: string): boolean {
@@ -17,7 +39,10 @@ function isCryptoUpDown(title: string): boolean {
 }
 export function filterPositions(rows: Position[]): Position[] {
   return rows.filter(
-    (p) => isCryptoUpDown(p.title) && p.size > 0 && !p.redeemable && p.currentPrice > 0,
+    (p) =>
+      isCryptoUpDown(p.title) &&
+      isMeaningfulPosition(p) &&
+      p.currentPrice > 0,
   )
 }
 
@@ -54,11 +79,17 @@ export function mergeInstantHoldings(
   global: Position[],
   instant: Position[],
   focusedTokenIds: string[] = [],
+  focusedMarket?: FocusedMarketMeta | null,
 ): Position[] {
   const focused = new Set(focusedTokenIds)
   const byToken = new Map(global.filter((p) => !focused.has(p.tokenId)).map((p) => [p.tokenId, p]))
-  for (const p of instant) {
-    if (p.size > 0 && !p.redeemable) byToken.set(p.tokenId, p)
+  for (const raw of instant) {
+    if (!isMeaningfulPosition(raw)) continue
+    const p =
+      focusedMarket && focused.has(raw.tokenId)
+        ? enrichInstantPosition(raw, focusedMarket)
+        : raw
+    byToken.set(p.tokenId, p)
   }
   return [...byToken.values()]
 }
@@ -79,6 +110,7 @@ export function useMarketHoldingsQuery(
     queryFn: () => fetchPositions({ upTokenId, downTokenId }),
     enabled: enabled && Boolean(upTokenId || downTokenId),
     refetchInterval: PORTFOLIO_POLL_MS,
+    select: (rows) => rows.filter(isMeaningfulPosition),
   })
 }
 
@@ -88,9 +120,15 @@ export function usePlaceOrder() {
   return useMutation({
     mutationFn: (body: PlaceOrderRequest) => placeOrder(body),
     onSuccess: () => {
-      void qc.invalidateQueries({ queryKey: qk.orders })
-      void qc.invalidateQueries({ queryKey: qk.positions })
-      void qc.invalidateQueries({ queryKey: qk.account })
+      void qc.invalidateQueries({ queryKey: qk.orders, refetchType: 'none' })
+      void qc.invalidateQueries({ queryKey: qk.positions, refetchType: 'none' })
+      void qc.invalidateQueries({ queryKey: qk.account, refetchType: 'none' })
+      // Stagger refetches so the next click isn't blocked behind portfolio polling.
+      setTimeout(() => {
+        void qc.refetchQueries({ queryKey: qk.orders })
+        void qc.refetchQueries({ queryKey: qk.positions })
+        void qc.refetchQueries({ queryKey: qk.account })
+      }, 400)
     },
   })
 }

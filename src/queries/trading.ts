@@ -7,6 +7,9 @@ export function useWarmTradingPath(tokenIds: string[], enabled: boolean): void {
 
   useEffect(() => {
     if (!enabled || !key) return
-    void warmTradingPath(key.split(',')).catch(() => {})
+    const ids = key.split(',')
+    void warmTradingPath(ids).catch(() => {})
+    const timer = setInterval(() => void warmTradingPath(ids).catch(() => {}), 45_000)
+    return () => clearInterval(timer)
   }, [enabled, key])
 }

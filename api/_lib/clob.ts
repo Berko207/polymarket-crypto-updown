@@ -177,11 +177,16 @@ export interface PlaceOrderResult {
 export const MIN_BUY_USD = 1
 
 /** Extra headroom on top of a fresh FOK book walk — books move between quote and submit. */
-const MARKET_BUY_SLIPPAGE = 0.05
+export const MARKET_BUY_SLIPPAGE = 0.05
 
-function bufferMarketBuyPrice(bookPrice: number): number {
+export function bufferMarketBuyPrice(bookPrice: number): number {
   const bumped = bookPrice * (1 + MARKET_BUY_SLIPPAGE)
   return Math.min(0.99, Math.round(bumped * 100) / 100)
+}
+
+function clientBuyHint(price: number | undefined): number | null {
+  if (price == null || !Number.isFinite(price) || price <= 0 || price >= 1) return null
+  return price
 }
 
 async function resolveMarketBuyPrice(client: ClobClient, tokenId: string, amount: number): Promise<number> {
@@ -226,7 +231,15 @@ export async function placeMarketOrder(params: PlaceOrderParams): Promise<PlaceO
     throw new Error(`Minimum buy size is $${MIN_BUY_USD.toFixed(2)}`)
   }
 
-  const { client, tickSize, negRisk } = await prepareOrder(config, params.tokenId)
+  const hint = params.side === 'BUY' ? clientBuyHint(params.price) : null
+  const clob = createClobClient(config)
+
+  const [{ client, tickSize, negRisk }, bookPrice] = await Promise.all([
+    prepareOrder(config, params.tokenId),
+    hint == null && params.side === 'BUY'
+      ? resolveMarketBuyPrice(clob, params.tokenId, amount)
+      : Promise.resolve(null),
+  ])
 
   const orderArgs: Parameters<ClobClient['createAndPostMarketOrder']>[0] = {
     tokenID: params.tokenId,
@@ -236,19 +249,26 @@ export async function placeMarketOrder(params: PlaceOrderParams): Promise<PlaceO
   }
 
   if (params.side === 'BUY') {
-    // Fresh book at submit — client WS quotes are often stale vs polymarket.com.
-    orderArgs.price = await resolveMarketBuyPrice(client, params.tokenId, amount)
+    // Live WS ask from the browser skips a CLOB book-walk on the hot path.
+    orderArgs.price = hint != null ? bufferMarketBuyPrice(hint) : bookPrice!
   } else if (params.price != null) {
     orderArgs.price = params.price
   }
 
-  const response = await client.createAndPostMarketOrder(
+  let response = await client.createAndPostMarketOrder(
     orderArgs,
     { tickSize, negRisk },
     OrderType.FOK,
   )
 
-  return unwrapOrderResult(response)
+  let result = unwrapOrderResult(response)
+  if (params.side === 'BUY' && hint != null && (result.status ?? '').toLowerCase() === 'unmatched') {
+    orderArgs.price = await resolveMarketBuyPrice(client, params.tokenId, amount)
+    response = await client.createAndPostMarketOrder(orderArgs, { tickSize, negRisk }, OrderType.FOK)
+    result = unwrapOrderResult(response)
+  }
+
+  return result
 }
 
 export async function placeLimitOrder(params: PlaceOrderParams): Promise<PlaceOrderResult> {
