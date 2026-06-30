@@ -266,6 +266,16 @@ export async function placeMarketOrder(params: PlaceOrderParams): Promise<PlaceO
   const metaHint = clientMarketParamsHint(params)
   const clob = createClobClient(config)
 
+  // Hinted BUY only: walk the book NOW, concurrently with prepareOrder and the first
+  // post. If the hint is stale and the FOK comes back unmatched, this fresh price is
+  // already in hand, so the retry skips a sequential book-walk round trip and pays
+  // only the re-post. The walk runs hidden under the order's 250ms taker delay, so it
+  // never slows a fill; the hot-path price still comes from the hint. (Backlog #4.)
+  const fallbackBuyPrice =
+    params.side === 'BUY' && hint != null
+      ? resolveMarketBuyPrice(clob, params.tokenId, amount).catch(() => null)
+      : null
+
   const [{ client, tickSize, negRisk }, bookPrice] = await Promise.all([
     prepareOrder(config, params.tokenId, metaHint),
     hint == null && params.side === 'BUY'
@@ -303,7 +313,10 @@ export async function placeMarketOrder(params: PlaceOrderParams): Promise<PlaceO
 
   let result = unwrapOrderResult(response)
   if (params.side === 'BUY' && hint != null && (result.status ?? '').toLowerCase() === 'unmatched') {
-    orderArgs.price = await resolveMarketBuyPrice(client, params.tokenId, amount)
+    // The speculative walk has resolved during the taker-delay window; fall back to a
+    // fresh sequential walk only if it failed, preserving the original throw-on-walk-
+    // failure behavior.
+    orderArgs.price = (await fallbackBuyPrice) ?? (await resolveMarketBuyPrice(client, params.tokenId, amount))
     response = await client.createAndPostMarketOrder(orderArgs, { tickSize, negRisk }, marketOrderType)
     result = unwrapOrderResult(response)
   }
