@@ -120,6 +120,20 @@ export async function placeOrder(body: PlaceOrderRequest): Promise<PlaceOrderRes
   return data
 }
 
+/** Prefetch CLOB metadata for token(s) so the next order skips cold lookups. Fire-and-forget. */
+export async function warmTradingPath(tokenIds: string[]): Promise<void> {
+  const ids = [...new Set(tokenIds.map((id) => id.trim()).filter(Boolean))]
+  if (!ids.length) return
+
+  const res = await authFetch(`/api/warm?tokenIds=${encodeURIComponent(ids.join(','))}`, {
+    method: 'POST',
+  })
+  if (!res.ok && res.status !== 204) {
+    const data = (await res.json().catch(() => ({}))) as { error?: string }
+    throw new Error(data.error ?? `Warm failed (${res.status})`)
+  }
+}
+
 export function truncateAddress(address: string): string {
   if (address.length < 10) return address
   return `${address.slice(0, 6)}…${address.slice(-4)}`

@@ -7,6 +7,7 @@ import {
   Side,
   SignatureTypeV2,
   type ApiKeyCreds,
+  type TickSize,
 } from '@polymarket/clob-client-v2'
 import { createWalletClient, http } from 'viem'
 import { privateKeyToAccount } from 'viem/accounts'
@@ -38,7 +39,7 @@ function toApiCreds(config: PolyServerConfig): ApiKeyCreds {
   }
 }
 
-export function createClobClient(config: PolyServerConfig): ClobClient {
+function buildClobClient(config: PolyServerConfig): ClobClient {
   const creds = toApiCreds(config)
   const signer = config.privateKey ? walletFromPrivateKey(config.privateKey) : undefined
 
@@ -49,15 +50,103 @@ export function createClobClient(config: PolyServerConfig): ClobClient {
     creds,
     signatureType: config.signatureType,
     funderAddress: config.funderAddress,
-    useServerTime: true,
+    // Local clock for L2 HMAC — avoids an extra GET /time round trip on every auth call.
+    useServerTime: false,
     throwOnError: true,
   })
+}
+
+let cachedClient: { sig: string; client: ClobClient } | null = null
+
+function configSignature(c: PolyServerConfig): string {
+  return [c.address, c.funderAddress, c.signatureType, c.apiKey, c.privateKey ? 'pk' : 'nopk'].join('|')
+}
+
+/** Build a ClobClient, reusing a cached instance while the config is unchanged
+ * (env is static per deployment) — avoids rebuilding a viem signer per request. */
+export function createClobClient(config: PolyServerConfig): ClobClient {
+  const sig = configSignature(config)
+  if (cachedClient?.sig === sig) return cachedClient.client
+  const client = buildClobClient(config)
+  cachedClient = { sig, client }
+  return client
 }
 
 export function getClobClient(): ClobClient | null {
   const config = getPolyConfig()
   if (!config) return null
   return createClobClient(config)
+}
+
+function requirePrivateKey(action: string): PolyServerConfig {
+  const config = getPolyConfig()
+  if (!config?.privateKey) throw new Error(`POLY_PRIVATE_KEY is required to ${action}`)
+  return config
+}
+
+const ALLOWANCE_TTL_MS = 60_000
+let allowanceSyncedAt = 0
+let allowanceSyncPromise: Promise<void> | null = null
+
+/** Deposit-wallet flow: sync USDC allowance with CLOB (slow — cache ~60s per instance). */
+async function ensureCollateralAllowance(client: ClobClient): Promise<void> {
+  if (Date.now() - allowanceSyncedAt < ALLOWANCE_TTL_MS) return
+
+  if (!allowanceSyncPromise) {
+    allowanceSyncPromise = client
+      .updateBalanceAllowance({ asset_type: AssetType.COLLATERAL })
+      .then(() => {
+        allowanceSyncedAt = Date.now()
+      })
+      .finally(() => {
+        allowanceSyncPromise = null
+      })
+  }
+  await allowanceSyncPromise
+}
+
+function usesDepositWalletAllowance(config: PolyServerConfig): boolean {
+  return config.signatureType === SignatureTypeV2.POLY_1271
+}
+
+/** Shared pre-flight for placing an order: client + (1271) allowance + market params. */
+async function prepareOrder(config: PolyServerConfig, tokenId: string) {
+  const client = createClobClient(config)
+  const [, params] = await Promise.all([
+    usesDepositWalletAllowance(config) ? ensureCollateralAllowance(client) : Promise.resolve(),
+    marketParams(client, tokenId),
+  ])
+  return { client, ...params }
+}
+
+/**
+ * Prefetch tick size, neg-risk, fee metadata, and (when needed) collateral allowance so
+ * the first click on Buy/Sell skips cold CLOB lookups.
+ */
+export async function warmOrderPath(tokenIds: string[]): Promise<void> {
+  const config = getPolyConfig()
+  if (!config?.privateKey || getWalletSetupIssue(config)) return
+
+  const client = createClobClient(config)
+  const ids = [...new Set(tokenIds.map((id) => id.trim()).filter(Boolean))]
+  if (!ids.length) return
+
+  await Promise.all([
+    usesDepositWalletAllowance(config) ? ensureCollateralAllowance(client) : Promise.resolve(),
+    ...ids.flatMap((tokenId) => [
+      marketParams(client, tokenId),
+      client.getFeeExponent(tokenId).catch(() => {}),
+    ]),
+  ])
+}
+
+function unwrapOrderResult(response: unknown): PlaceOrderResult {
+  const record = response as Record<string, unknown> | null
+  return {
+    success: true,
+    orderId: typeof record?.orderID === 'string' ? record.orderID : undefined,
+    status: typeof record?.status === 'string' ? record.status : undefined,
+  }
 }
 
 export interface AccountSnapshot {
@@ -87,66 +176,83 @@ export interface PlaceOrderResult {
 
 export const MIN_BUY_USD = 1
 
+/** Extra headroom on top of a fresh FOK book walk — books move between quote and submit. */
+const MARKET_BUY_SLIPPAGE = 0.05
+
+function bufferMarketBuyPrice(bookPrice: number): number {
+  const bumped = bookPrice * (1 + MARKET_BUY_SLIPPAGE)
+  return Math.min(0.99, Math.round(bumped * 100) / 100)
+}
+
+async function resolveMarketBuyPrice(client: ClobClient, tokenId: string, amount: number): Promise<number> {
+  const fromBook = await client.calculateMarketPrice(tokenId, Side.BUY, amount, OrderType.FOK)
+  return bufferMarketBuyPrice(fromBook)
+}
+
 const DEPOSIT_WALLET_DOCS = 'https://docs.polymarket.com/trading/deposit-wallets'
 
+const marketParamsCache = new Map<string, { tickSize: TickSize; negRisk: boolean }>()
+
 async function marketParams(client: ClobClient, tokenId: string) {
+  const cached = marketParamsCache.get(tokenId)
+  if (cached) return cached
   const [tickSize, negRisk] = await Promise.all([
     client.getTickSize(tokenId),
     client.getNegRisk(tokenId),
   ])
-  return { tickSize, negRisk }
+  const params = { tickSize: tickSize as TickSize, negRisk }
+  marketParamsCache.set(tokenId, params)
+  return params
+}
+
+export async function fetchUsdcBalance(): Promise<number> {
+  const client = getClobClient()
+  if (!client) {
+    throw new Error('Polymarket credentials are not configured on the server')
+  }
+  const balanceRes = await client.getBalanceAllowance({ asset_type: AssetType.COLLATERAL })
+  return Number(balanceRes.balance) / 1e6
 }
 
 export async function placeMarketOrder(params: PlaceOrderParams): Promise<PlaceOrderResult> {
-  const config = getPolyConfig()
-  if (!config?.privateKey) {
-    throw new Error('POLY_PRIVATE_KEY is required to place orders')
-  }
-
+  const config = requirePrivateKey('place orders')
   assertWalletConfig(config)
 
   const amount = params.amount
   if (amount == null || !Number.isFinite(amount) || amount <= 0) {
     throw new Error('amount must be a positive number')
   }
-
   if (params.side === 'BUY' && amount < MIN_BUY_USD) {
     throw new Error(`Minimum buy size is $${MIN_BUY_USD.toFixed(2)}`)
   }
 
-  const client = createClobClient(config)
+  const { client, tickSize, negRisk } = await prepareOrder(config, params.tokenId)
 
-  if (config.signatureType === SignatureTypeV2.POLY_1271) {
-    await client.updateBalanceAllowance({ asset_type: AssetType.COLLATERAL })
+  const orderArgs: Parameters<ClobClient['createAndPostMarketOrder']>[0] = {
+    tokenID: params.tokenId,
+    side: params.side === 'SELL' ? Side.SELL : Side.BUY,
+    amount,
+    orderType: OrderType.FOK,
   }
 
-  const { tickSize, negRisk } = await marketParams(client, params.tokenId)
+  if (params.side === 'BUY') {
+    // Fresh book at submit — client WS quotes are often stale vs polymarket.com.
+    orderArgs.price = await resolveMarketBuyPrice(client, params.tokenId, amount)
+  } else if (params.price != null) {
+    orderArgs.price = params.price
+  }
 
   const response = await client.createAndPostMarketOrder(
-    {
-      tokenID: params.tokenId,
-      side: params.side === 'SELL' ? Side.SELL : Side.BUY,
-      amount,
-      orderType: OrderType.FOK,
-    },
+    orderArgs,
     { tickSize, negRisk },
     OrderType.FOK,
   )
 
-  const record = response as Record<string, unknown> | null
-  return {
-    success: true,
-    orderId: typeof record?.orderID === 'string' ? record.orderID : undefined,
-    status: typeof record?.status === 'string' ? record.status : undefined,
-  }
+  return unwrapOrderResult(response)
 }
 
 export async function placeLimitOrder(params: PlaceOrderParams): Promise<PlaceOrderResult> {
-  const config = getPolyConfig()
-  if (!config?.privateKey) {
-    throw new Error('POLY_PRIVATE_KEY is required to place orders')
-  }
-
+  const config = requirePrivateKey('place orders')
   assertWalletConfig(config)
 
   const price = params.price
@@ -157,21 +263,11 @@ export async function placeLimitOrder(params: PlaceOrderParams): Promise<PlaceOr
   if (size == null || !Number.isFinite(size) || size <= 0) {
     throw new Error('size must be a positive number of shares')
   }
-
   if (params.side === 'BUY' && price * size < MIN_BUY_USD) {
     throw new Error(`Minimum buy size is $${MIN_BUY_USD.toFixed(2)} (currently $${(price * size).toFixed(2)})`)
   }
 
-  const client = createClobClient(config)
-
-  if (config.signatureType === SignatureTypeV2.POLY_1271) {
-    await client.updateBalanceAllowance({ asset_type: AssetType.COLLATERAL })
-  }
-
-  const [tickSize, negRisk] = await Promise.all([
-    client.getTickSize(params.tokenId),
-    client.getNegRisk(params.tokenId),
-  ])
+  const { client, tickSize, negRisk } = await prepareOrder(config, params.tokenId)
 
   const response = await client.createAndPostOrder(
     {
@@ -184,12 +280,7 @@ export async function placeLimitOrder(params: PlaceOrderParams): Promise<PlaceOr
     OrderType.GTC,
   )
 
-  const record = response as Record<string, unknown> | null
-  return {
-    success: true,
-    orderId: typeof record?.orderID === 'string' ? record.orderID : undefined,
-    status: typeof record?.status === 'string' ? record.status : undefined,
-  }
+  return unwrapOrderResult(response)
 }
 
 function enrichOrderErrorMessage(message: string): string {
@@ -263,11 +354,7 @@ export async function fetchOpenOrders(): Promise<OpenOrderView[]> {
 }
 
 export async function cancelOpenOrder(orderId: string): Promise<void> {
-  const config = getPolyConfig()
-  if (!config?.privateKey) {
-    throw new Error('POLY_PRIVATE_KEY is required to cancel orders')
-  }
-
+  const config = requirePrivateKey('cancel orders')
   const client = createClobClient(config)
   await client.cancelOrder({ orderID: orderId })
 }
