@@ -1,7 +1,7 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node'
 import { cancelOpenOrder, fetchOpenOrders, formatOrderError } from './_lib/clob.js'
 import { guardTradingApi } from './_lib/auth.js'
-import { canPlaceOrders, isPolyConfigured } from './_lib/env.js'
+import { requireCanPlaceOrders, requireConfigured } from './_lib/guards.js'
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== 'GET' && req.method !== 'DELETE') {
@@ -10,14 +10,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   }
 
   if (!guardTradingApi(req, res)) return
-
-  if (!isPolyConfigured()) {
-    return res.status(503).json({ error: 'Polymarket credentials are not configured on the server' })
-  }
-
-  if (!canPlaceOrders()) {
-    return res.status(403).json({ error: 'Add POLY_PRIVATE_KEY on the server to manage orders' })
-  }
+  if (!requireConfigured(res)) return
+  if (!requireCanPlaceOrders(res, 'manage orders')) return
 
   try {
     if (req.method === 'GET') {

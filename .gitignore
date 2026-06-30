@@ -26,3 +26,6 @@ dist-ssr
 *.sln
 *.sw?
 .vercel
+.pnpm-store
+.claude
+*.tsbuildinfo

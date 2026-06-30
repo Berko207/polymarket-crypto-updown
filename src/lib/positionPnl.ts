@@ -1,3 +1,4 @@
+import { quoteToPrice, type TokenQuote } from './clobSocket'
 import type { Position } from './api'
 
 export interface PositionLiveStats {
@@ -8,21 +9,18 @@ export interface PositionLiveStats {
   pnlPct: number | null
 }
 
-export function livePriceForPosition(
-  position: Position,
-  bids: { up: number | null; down: number | null },
-  mids?: { up: number | null; down: number | null },
-  tokenBid?: number | null,
-): number | null {
-  if (tokenBid != null && tokenBid > 0) return tokenBid
-
-  const outcome = position.outcome.toLowerCase()
-  const bid = outcome === 'up' ? bids.up : outcome === 'down' ? bids.down : null
+/**
+ * Best live mark for a position: the token's live bid (what you'd actually sell
+ * into) first, then the live mid/last from the book, and only as a last resort the
+ * polled snapshot price. Consulting the whole live quote — not just `bestBid` —
+ * keeps the value ticking when the bid momentarily clears, instead of freezing on
+ * the 30s-polled `currentPrice`.
+ */
+export function livePositionMark(position: Position, quote?: TokenQuote): number | null {
+  const bid = quote?.bestBid
   if (bid != null && bid > 0) return bid
-
-  const mid = outcome === 'up' ? mids?.up : outcome === 'down' ? mids?.down : null
-  if (mid != null && mid > 0) return mid
-
+  const live = quoteToPrice(quote)
+  if (live != null && live > 0) return live
   if (position.currentPrice > 0) return position.currentPrice
   return null
 }
@@ -32,14 +30,16 @@ export function computePositionLiveStats(
   livePrice: number | null,
 ): PositionLiveStats {
   const price = livePrice
-  const liveValue =
-    price != null ? position.size * price : position.currentValue != null ? position.currentValue : null
+  const liveValue = price != null ? position.size * price : position.currentValue ?? null
 
+  // Cost basis from avgPrice × current size first: it's per-share, so it stays
+  // consistent with the live size through partial sells and lets the live P&L branch
+  // fire reliably — falling back to the indexed initialValue only if avgPrice is absent.
   const costBasis =
-    position.initialValue != null && position.initialValue > 0
-      ? position.initialValue
-      : position.avgPrice > 0
-        ? position.size * position.avgPrice
+    position.avgPrice > 0
+      ? position.size * position.avgPrice
+      : position.initialValue != null && position.initialValue > 0
+        ? position.initialValue
         : null
 
   let pnl: number | null = null

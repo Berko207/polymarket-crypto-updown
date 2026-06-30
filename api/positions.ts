@@ -1,6 +1,6 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node'
 import { authorizeApiRequest, rateLimit } from './_lib/auth.js'
-import { isPolyConfigured } from './_lib/env.js'
+import { requireConfigured } from './_lib/guards.js'
 import { fetchMarketHoldings, fetchPositions } from './_lib/positions.js'
 
 function parseTokenIds(req: VercelRequest): string[] | undefined {
@@ -21,10 +21,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
   if (!authorizeApiRequest(req, res)) return
   if (!rateLimit(req, res, { limit: 60, key: 'positions' })) return
-
-  if (!isPolyConfigured()) {
-    return res.status(503).json({ error: 'Polymarket credentials are not configured on the server' })
-  }
+  if (!requireConfigured(res)) return
 
   try {
     const upToken = typeof req.query.upToken === 'string' ? req.query.upToken.trim() : ''

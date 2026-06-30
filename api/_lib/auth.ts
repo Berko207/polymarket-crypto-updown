@@ -1,8 +1,17 @@
+import { timingSafeEqual } from 'node:crypto'
 import type { VercelRequest, VercelResponse } from '@vercel/node'
 
 function readEnv(name: string): string | undefined {
   const value = process.env[name]?.trim()
   return value || undefined
+}
+
+/** Length-safe, constant-time string comparison (avoids leaking the secret via timing). */
+function safeEqual(a: string, b: string): boolean {
+  const ab = Buffer.from(a)
+  const bb = Buffer.from(b)
+  if (ab.length !== bb.length) return false
+  return timingSafeEqual(ab, bb)
 }
 
 export function getApiSecret(): string | undefined {
@@ -37,7 +46,7 @@ export function authorizeApiRequest(req: VercelRequest, res: VercelResponse): bo
   if (!secret) return true
 
   const provided = extractToken(req)
-  if (!provided || provided !== secret) {
+  if (!provided || !safeEqual(provided, secret)) {
     res.status(401).json({ error: 'Unauthorized' })
     return false
   }

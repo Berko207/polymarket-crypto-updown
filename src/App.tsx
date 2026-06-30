@@ -1,49 +1,39 @@
 import { useEffect, useState } from 'react'
-import { getAvailableTimeframes } from './lib/config'
-import type { CoinId, TimeframeId } from './lib/types'
-import { fetchAuthConfig, getStoredApiSecret } from './lib/apiAuth'
-import { CoinPicker } from './components/CoinPicker'
-import { AccountStatus } from './components/AccountStatus'
-import { ApiUnlock } from './components/ApiUnlock'
-import { MarketCard } from './components/MarketCard'
-import { OpenOrders } from './components/OpenOrders'
-import { OpenOrdersBar } from './components/OpenOrdersBar'
-import { TimeframeTabs } from './components/TimeframeTabs'
-import { UpdateModeControl } from './components/UpdateModeControl'
-import { useMarket } from './hooks/useMarket'
-import { useAccount } from './hooks/useAccount'
-import { usePortfolio } from './hooks/usePortfolio'
-import { useUpdateMode } from './hooks/useUpdateMode'
+import { fetchAuthConfig, getStoredApiSecret } from '@/lib/apiAuth'
+import { COINS, getAvailableTimeframes } from '@/lib/config'
+import { useUiStore } from '@/store/ui'
+import { useAccountQuery } from '@/queries/account'
+import { useThemeSync } from '@/hooks/useThemeSync'
+import { Header } from '@/components/layout/Header'
+import { WatchlistPanel } from '@/components/watchlist/WatchlistPanel'
+import { MarketDetail } from '@/components/market/MarketDetail'
+import { PortfolioPanel } from '@/components/portfolio/PortfolioPanel'
+import { ApiUnlock } from '@/components/account/ApiUnlock'
+import { Card, CardContent } from '@/components/ui/card'
+import { Toaster } from '@/components/ui/sonner'
+import type { TimeframeId } from '@/lib/types'
+
+function PanelCard({ title, children }: { title: string; children: React.ReactNode }) {
+  return (
+    <Card className="lg:sticky lg:top-[4.5rem]">
+      <CardContent className="flex flex-col gap-3 p-4">
+        <h2 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">{title}</h2>
+        {children}
+      </CardContent>
+    </Card>
+  )
+}
 
 export function AppShell() {
-  const [coin, setCoin] = useState<CoinId>('btc')
-  const [timeframe, setTimeframe] = useState<TimeframeId>('5m')
-  const [authReady, setAuthReady] = useState(() => Boolean(getStoredApiSecret()))
-  const [authRequired, setAuthRequired] = useState<boolean | null>(null)
-  const [ordersRefreshKey, setOrdersRefreshKey] = useState(0)
-  const { mode, config, balancedIntervalMs, selectMode, setBalancedInterval } = useUpdateMode()
-  const accountEnabled = authRequired !== true || authReady
-  const { status: accountStatus, loading: accountLoading, error: accountError, refresh: refreshAccount } =
-    useAccount(accountEnabled)
-  const { market, loading, error, refresh } = useMarket(coin, timeframe, mode, balancedIntervalMs)
-  const marketMatches =
-    market != null && market.coin === coin && market.timeframe === timeframe
-  // While switching coin/timeframe, keep showing the previous market (dimmed,
-  // trading disabled) so open orders/positions stay visible during the load.
-  const marketStale = market != null && !marketMatches
-  const canTrade = accountStatus?.canTrade === true
-  const portfolio = usePortfolio(canTrade, ordersRefreshKey)
-  const [cancellingOrderId, setCancellingOrderId] = useState<string | null>(null)
+  useThemeSync()
 
-  const handleCancelOrder = async (orderId: string) => {
-    setCancellingOrderId(orderId)
-    try {
-      await portfolio.cancel(orderId)
-      void refreshAccount()
-    } finally {
-      setCancellingOrderId(null)
-    }
-  }
+  const coin = useUiStore((s) => s.selectedCoin)
+  const timeframe = useUiStore((s) => s.selectedTimeframe)
+  const setCoin = useUiStore((s) => s.setCoin)
+  const setTimeframe = useUiStore((s) => s.setTimeframe)
+
+  const [authRequired, setAuthRequired] = useState<boolean | null>(null)
+  const [authReady, setAuthReady] = useState(() => Boolean(getStoredApiSecret()))
 
   useEffect(() => {
     fetchAuthConfig()
@@ -57,132 +47,84 @@ export function AppShell() {
       })
   }, [])
 
-  useEffect(() => {
-    const available = getAvailableTimeframes(coin)
-    if (!available.includes(timeframe)) {
-      setTimeframe(available[0] ?? '5m')
-    }
-  }, [coin, timeframe])
+  const accountEnabled = authRequired !== true || authReady
+  const accountQuery = useAccountQuery(accountEnabled)
+  const status = accountQuery.data ?? null
+  const canTrade = status?.canTrade === true
 
-  const handleOrderPlaced = () => {
-    void refreshAccount()
-    setOrdersRefreshKey((k) => k + 1)
-    portfolio.refresh()
+  const account = {
+    status,
+    loading: accountQuery.isLoading && accountEnabled,
+    error: accountQuery.isError
+      ? accountQuery.error instanceof Error
+        ? accountQuery.error.message
+        : 'Could not load account'
+      : null,
+    refresh: () => void accountQuery.refetch(),
+  }
+
+  const handleTimeframe = (tf: TimeframeId) => {
+    setTimeframe(tf)
+    if (!getAvailableTimeframes(coin).includes(tf)) {
+      const firstCoin = COINS.find((c) => getAvailableTimeframes(c.id).includes(tf))
+      if (firstCoin) setCoin(firstCoin.id)
+    }
   }
 
   if (authRequired === null) {
     return (
-      <div className="app">
-        <main className="main">
-          <div className="state-card loading">
-            <div className="spinner" />
-            <p>Loading…</p>
-          </div>
-        </main>
+      <div className="grid min-h-dvh place-items-center">
+        <div className="size-8 animate-spin rounded-full border-2 border-border border-t-primary" />
       </div>
     )
   }
 
   if (!authReady && authRequired) {
-    return <ApiUnlock onUnlocked={() => setAuthReady(true)} />
+    return (
+      <>
+        <ApiUnlock onUnlocked={() => setAuthReady(true)} />
+        <Toaster position="top-center" />
+      </>
+    )
   }
 
   return (
-    <div className="app">
-      <header className="app-header">
-        <div className="brand">
-          <span className="brand-icon">◆</span>
-          <div>
-            <h1>Crypto Up/Down</h1>
-            <p className="brand-sub">Polymarket live odds</p>
-          </div>
-        </div>
-        <div className="header-actions">
-          <OpenOrders
-            enabled={canTrade}
-            orders={portfolio.orders}
-            positions={portfolio.positions}
-            loading={portfolio.loading}
-            error={portfolio.error}
-            onRefresh={portfolio.refresh}
-            onCancel={handleCancelOrder}
-            liveQuotesEnabled={config.useWebSocket}
-            liveThrottleMs={config.throttleMs}
-            onChanged={() => void refreshAccount()}
-          />
-          <AccountStatus
-            status={accountStatus}
-            loading={accountLoading}
-            error={accountError}
-            onRefresh={refreshAccount}
-          />
-          <UpdateModeControl
-            mode={mode}
-            balancedIntervalMs={balancedIntervalMs}
-            onChange={selectMode}
-            onBalancedIntervalChange={setBalancedInterval}
-          />
-          <button type="button" className="refresh-btn" onClick={() => void refresh()} aria-label="Refresh">
-            ↻
-          </button>
-        </div>
-      </header>
+    <div className="min-h-dvh">
+      <Header account={account} />
 
-      <CoinPicker selected={coin} onChange={setCoin} />
-      <TimeframeTabs coin={coin} selected={timeframe} onChange={setTimeframe} />
+      <div className="mx-auto grid max-w-6xl gap-4 px-4 py-4 lg:grid-cols-[260px_minmax(0,1fr)_340px] lg:items-start">
+        <aside className="order-1">
+          <PanelCard title="Watchlist">
+            <WatchlistPanel
+              timeframe={timeframe}
+              selectedCoin={coin}
+              onSelectCoin={setCoin}
+              onSelectTimeframe={handleTimeframe}
+            />
+          </PanelCard>
+        </aside>
 
-      {canTrade && (
-        <OpenOrdersBar
-          orders={portfolio.orders}
-          positions={portfolio.positions}
-          cancellingId={cancellingOrderId}
-          onCancel={(id) => void handleCancelOrder(id)}
-        />
-      )}
-
-      <main className="main">
-        {loading && market == null && (
-          <div className="state-card loading">
-            <div className="spinner" />
-            <p>Loading market…</p>
-          </div>
-        )}
-
-        {error && market == null && (
-          <div className="state-card error">
-            <p>{error}</p>
-            <button type="button" onClick={() => void refresh()}>
-              Retry
-            </button>
-          </div>
-        )}
-
-        {!loading && !error && market == null && (
-          <div className="state-card empty">
-            <p>No active market for this coin & timeframe.</p>
-          </div>
-        )}
-
-        {market && (
-          <MarketCard
+        <main className="order-2 min-w-0">
+          <MarketDetail
             key={`${coin}-${timeframe}`}
-            market={market}
-            stale={marketStale}
-            updateHint={config.description}
+            coin={coin}
+            timeframe={timeframe}
             canTrade={canTrade}
-            usdcBalance={accountStatus?.usdcBalance}
-            onOrderPlaced={handleOrderPlaced}
-            orders={portfolio.orders}
-            positions={portfolio.positions}
-            portfolioLoading={portfolio.loading}
-            onCancelOrder={handleCancelOrder}
           />
-        )}
-      </main>
+        </main>
 
-      <footer className="app-footer">
-        <p>Data from Polymarket · Not financial advice</p>
+        <aside className="order-3">
+          <PanelCard title="Portfolio">
+            <PortfolioPanel enabled={canTrade} coin={coin} timeframe={timeframe} />
+          </PanelCard>
+        </aside>
+      </div>
+
+      <footer className="px-4 py-6 text-center text-xs text-muted-foreground">
+        Data from Polymarket · Not financial advice
       </footer>
+
+      <Toaster position="top-center" />
     </div>
   )
 }

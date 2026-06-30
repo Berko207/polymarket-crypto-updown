@@ -3,6 +3,16 @@ import type { VercelRequest, VercelResponse } from '@vercel/node'
 const GAMMA_ORIGIN = 'https://gamma-api.polymarket.com'
 const ROUTE_PREFIX = '/api/gamma/'
 
+/** Upstream gamma endpoints the dashboard is allowed to proxy (first path segment). */
+const ALLOWED_SEGMENTS = new Set(['events', 'markets', 'series', 'public-profile', 'tags'])
+
+function isSafePath(segments: string): boolean {
+  if (!segments) return false
+  if (segments.includes('://') || segments.includes('..') || segments.startsWith('/')) return false
+  const first = segments.split('/')[0]?.split('?')[0] ?? ''
+  return ALLOWED_SEGMENTS.has(first)
+}
+
 function gammaPath(req: VercelRequest): string {
   const fromUrl = (() => {
     if (!req.url) return ''
@@ -24,8 +34,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   }
 
   const segments = gammaPath(req)
-  const params = new URLSearchParams()
+  if (!isSafePath(segments)) {
+    return res.status(404).json({ error: 'Unknown gamma endpoint' })
+  }
 
+  const params = new URLSearchParams()
   for (const [key, value] of Object.entries(req.query)) {
     if (key === 'path' || value == null) continue
     if (Array.isArray(value)) {
@@ -38,7 +51,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   const qs = params.toString()
   const upstreamUrl = `${GAMMA_ORIGIN}/${segments}${qs ? `?${qs}` : ''}`
 
-  const upstream = await fetch(upstreamUrl, { method: req.method })
+  let upstream: Response
+  try {
+    upstream = await fetch(upstreamUrl, { method: req.method })
+  } catch {
+    return res.status(502).json({ error: 'Upstream gamma request failed' })
+  }
   const body = req.method === 'HEAD' ? null : await upstream.text()
 
   res.setHeader('Cache-Control', 's-maxage=5, stale-while-revalidate=30')

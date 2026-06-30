@@ -1,12 +1,18 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node'
-import { fetchAccountSnapshot, formatOrderError, placeLimitOrder, placeMarketOrder, MIN_BUY_USD } from './_lib/clob.js'
+import { fetchUsdcBalance, formatOrderError, placeLimitOrder, placeMarketOrder, MIN_BUY_USD } from './_lib/clob.js'
 import { getMaxOrderCost, getMaxOrderSize, guardTradingApi, rateLimit } from './_lib/auth.js'
-import { canPlaceOrders, getPolyConfig, getWalletSetupIssue, isPolyConfigured } from './_lib/env.js'
+import { requireCanPlaceOrders, requireConfigured, requireWalletReady } from './_lib/guards.js'
 
-function readJsonBody(req: VercelRequest): unknown {
+function readJsonBody(req: VercelRequest): Record<string, unknown> {
   if (req.body == null || req.body === '') return {}
-  if (typeof req.body === 'string') return JSON.parse(req.body) as unknown
-  return req.body
+  if (typeof req.body === 'string') {
+    try {
+      return JSON.parse(req.body) as Record<string, unknown>
+    } catch {
+      return {}
+    }
+  }
+  return req.body as Record<string, unknown>
 }
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
@@ -16,24 +22,13 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   }
 
   if (!guardTradingApi(req, res)) return
-
-  if (!isPolyConfigured()) {
-    return res.status(503).json({ error: 'Polymarket credentials are not configured on the server' })
-  }
-
-  if (!canPlaceOrders()) {
-    return res.status(403).json({ error: 'Add POLY_PRIVATE_KEY on the server to place orders' })
-  }
-
-  const walletSetupIssue = getWalletSetupIssue(getPolyConfig()!)
-  if (walletSetupIssue) {
-    return res.status(400).json({ error: walletSetupIssue })
-  }
-
+  if (!requireConfigured(res)) return
+  if (!requireCanPlaceOrders(res)) return
+  if (!requireWalletReady(res)) return
   if (!rateLimit(req, res, { limit: 20, key: 'place-order' })) return
 
   try {
-    const body = readJsonBody(req) as Record<string, unknown>
+    const body = readJsonBody(req)
     const tokenId = String(body.tokenId ?? '').trim()
     const side = body.side === 'SELL' ? 'SELL' : 'BUY'
     const orderType = body.orderType === 'limit' ? 'limit' : 'market'
@@ -73,17 +68,22 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         return res.status(400).json({ error: `order cost $${marketAmount.toFixed(2)} exceeds max $${maxCost.toFixed(2)}` })
       }
 
-      if (side === 'BUY') {
-        const account = await fetchAccountSnapshot()
-        if (marketAmount > account.usdcBalance) {
-          return res.status(400).json({
-            error: `insufficient USDC (need $${marketAmount.toFixed(2)}, have $${account.usdcBalance.toFixed(2)})`,
-          })
-        }
-      }
+      const marketPrice =
+        Number.isFinite(price) && price > 0 && price < 1 ? price : undefined
 
-      console.info('[orders] market', { side, amount: marketAmount, tokenId: tokenId.slice(0, 12) })
-      const result = await placeMarketOrder({ tokenId, side, amount: marketAmount, orderType: 'market' })
+      console.info('[orders] market', {
+        side,
+        amount: marketAmount,
+        price: marketPrice,
+        tokenId: tokenId.slice(0, 12),
+      })
+      const result = await placeMarketOrder({
+        tokenId,
+        side,
+        amount: marketAmount,
+        price: marketPrice,
+        orderType: 'market',
+      })
       return res.status(200).json(result)
     }
 
@@ -112,10 +112,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
 
     if (side === 'BUY') {
-      const account = await fetchAccountSnapshot()
-      if (estCost > account.usdcBalance) {
+      const usdcBalance = await fetchUsdcBalance()
+      if (estCost > usdcBalance) {
         return res.status(400).json({
-          error: `insufficient USDC (need $${estCost.toFixed(2)}, have $${account.usdcBalance.toFixed(2)})`,
+          error: `insufficient USDC (need $${estCost.toFixed(2)}, have $${usdcBalance.toFixed(2)})`,
         })
       }
     }

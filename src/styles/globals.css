@@ -1,0 +1,132 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+@custom-variant dark (&:is(.dark *));
+
+/* ── Light theme (default :root) ─────────────────────────────── */
+:root {
+  --radius: 0.875rem;
+
+  --background: #f6f8fb;
+  --foreground: #0b0f14;
+  --card: #ffffff;
+  --card-foreground: #0b0f14;
+  --popover: #ffffff;
+  --popover-foreground: #0b0f14;
+  --primary: #3b82f6;
+  --primary-foreground: #ffffff;
+  --secondary: #eef2f7;
+  --secondary-foreground: #1c2430;
+  --muted: #eef2f7;
+  --muted-foreground: #5b6573;
+  --accent: #e8edf4;
+  --accent-foreground: #0b0f14;
+  --destructive: #ef4444;
+  --border: #dce3ec;
+  --input: #dce3ec;
+  --ring: #3b82f6;
+
+  /* Brand / market semantics */
+  --up: #16a34a;
+  --up-foreground: #ffffff;
+  --up-soft: rgba(22, 163, 74, 0.12);
+  --down: #dc2626;
+  --down-foreground: #ffffff;
+  --down-soft: rgba(220, 38, 38, 0.12);
+
+  --chart-1: #3b82f6;
+  --chart-2: #16a34a;
+  --chart-3: #dc2626;
+  --chart-4: #f59e0b;
+  --chart-5: #8b5cf6;
+}
+
+/* ── Dark theme (trading terminal; app default) ──────────────── */
+.dark {
+  --background: #0b0f14;
+  --foreground: #eef2f7;
+  --card: #141a22;
+  --card-foreground: #eef2f7;
+  --popover: #141a22;
+  --popover-foreground: #eef2f7;
+  --primary: #3b82f6;
+  --primary-foreground: #ffffff;
+  --secondary: #1c2430;
+  --secondary-foreground: #eef2f7;
+  --muted: #1c2430;
+  --muted-foreground: #8b95a5;
+  --accent: #1c2430;
+  --accent-foreground: #eef2f7;
+  --destructive: #ef4444;
+  --border: #2a3441;
+  --input: #2a3441;
+  --ring: #3b82f6;
+
+  --up: #22c55e;
+  --up-foreground: #03110a;
+  --up-soft: rgba(34, 197, 94, 0.15);
+  --down: #ef4444;
+  --down-foreground: #1a0606;
+  --down-soft: rgba(239, 68, 68, 0.15);
+
+  --chart-1: #3b82f6;
+  --chart-2: #22c55e;
+  --chart-3: #ef4444;
+  --chart-4: #f59e0b;
+  --chart-5: #a78bfa;
+}
+
+/* ── Map CSS vars → Tailwind v4 color/utility tokens ─────────── */
+@theme inline {
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+
+  --color-up: var(--up);
+  --color-up-foreground: var(--up-foreground);
+  --color-up-soft: var(--up-soft);
+  --color-down: var(--down);
+  --color-down-foreground: var(--down-foreground);
+  --color-down-soft: var(--down-soft);
+
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+
+  --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif;
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground;
+    font-synthesis: none;
+    text-rendering: optimizeLegibility;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+}
