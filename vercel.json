@@ -6,9 +6,6 @@
   "framework": "vite",
   "outputDirectory": "dist",
   "regions": ["dub1"],
-  "rewrites": [
-    { "source": "/((?!api/).*)", "destination": "/index.html" }
-  ],
   "functions": {
     "api/**/*.ts": {
       "maxDuration": 30
