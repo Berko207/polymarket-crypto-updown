@@ -1,18 +1,37 @@
 import { useEffect, useState } from 'react'
 import { getAvailableTimeframes } from './lib/config'
 import type { CoinId, TimeframeId } from './lib/types'
+import { fetchAuthConfig, getStoredApiSecret } from './lib/apiAuth'
 import { CoinPicker } from './components/CoinPicker'
+import { AccountStatus } from './components/AccountStatus'
+import { ApiUnlock } from './components/ApiUnlock'
 import { MarketCard } from './components/MarketCard'
+import { OpenOrders } from './components/OpenOrders'
 import { TimeframeTabs } from './components/TimeframeTabs'
 import { UpdateModeControl } from './components/UpdateModeControl'
 import { useMarket } from './hooks/useMarket'
+import { useAccount } from './hooks/useAccount'
 import { useUpdateMode } from './hooks/useUpdateMode'
 
 export function AppShell() {
   const [coin, setCoin] = useState<CoinId>('btc')
   const [timeframe, setTimeframe] = useState<TimeframeId>('5m')
+  const [authReady, setAuthReady] = useState(false)
+  const [authRequired, setAuthRequired] = useState(false)
+  const [ordersRefreshKey, setOrdersRefreshKey] = useState(0)
   const { mode, config, balancedIntervalMs, selectMode, setBalancedInterval } = useUpdateMode()
+  const { status: accountStatus, loading: accountLoading, error: accountError, refresh: refreshAccount } =
+    useAccount(authReady)
   const { market, loading, error, refresh } = useMarket(coin, timeframe, mode, balancedIntervalMs)
+
+  useEffect(() => {
+    fetchAuthConfig()
+      .then((cfg) => {
+        setAuthRequired(cfg.authRequired)
+        setAuthReady(!cfg.authRequired || Boolean(getStoredApiSecret()))
+      })
+      .catch(() => setAuthReady(true))
+  }, [])
 
   useEffect(() => {
     const available = getAvailableTimeframes(coin)
@@ -20,6 +39,15 @@ export function AppShell() {
       setTimeframe(available[0] ?? '5m')
     }
   }, [coin, timeframe])
+
+  const handleOrderPlaced = () => {
+    void refreshAccount()
+    setOrdersRefreshKey((k) => k + 1)
+  }
+
+  if (!authReady && authRequired) {
+    return <ApiUnlock onUnlocked={() => setAuthReady(true)} />
+  }
 
   return (
     <div className="app">
@@ -32,6 +60,17 @@ export function AppShell() {
           </div>
         </div>
         <div className="header-actions">
+          <OpenOrders
+            enabled={accountStatus?.canTrade === true}
+            refreshKey={ordersRefreshKey}
+            onChanged={() => void refreshAccount()}
+          />
+          <AccountStatus
+            status={accountStatus}
+            loading={accountLoading}
+            error={accountError}
+            onRefresh={refreshAccount}
+          />
           <UpdateModeControl
             mode={mode}
             balancedIntervalMs={balancedIntervalMs}
@@ -70,7 +109,15 @@ export function AppShell() {
           </div>
         )}
 
-        {market && <MarketCard market={market} updateHint={config.description} />}
+        {market && (
+          <MarketCard
+            market={market}
+            updateHint={config.description}
+            canTrade={accountStatus?.canTrade === true}
+            usdcBalance={accountStatus?.usdcBalance}
+            onOrderPlaced={handleOrderPlaced}
+          />
+        )}
       </main>
 
       <footer className="app-footer">

@@ -7,7 +7,8 @@ import type {
   TimeframeId,
 } from './types'
 
-const GAMMA_BASE = import.meta.env.DEV ? '/api/gamma' : 'https://gamma-api.polymarket.com'
+/** Always via our server — local (`vercel dev`) and production (Vercel functions). */
+const GAMMA_BASE = '/api/gamma'
 
 const WINDOW_MS: Record<TimeframeId, number> = {
   '5m': 5 * 60 * 1000,

@@ -1,10 +1,5 @@
-import {
-  useCallback,
-  useEffect,
-  useMemo,
-  useState,
-} from 'react'
-import { fetchCurrentMarket } from '../lib/polymarket'
+import { useCallback, useEffect, useMemo, useState } from 'react'
+import { fetchCurrentMarket, getCountdownTarget } from '../lib/polymarket'
 import { resolveUpdateConfig, type UpdateMode } from '../lib/updateMode'
 import { useLivePrices } from './useLivePrices'
 import type { CoinId, ParsedMarket, TimeframeId } from '../lib/types'
@@ -44,6 +39,28 @@ export function useMarket(
     const id = setInterval(() => void load(), config.pollMs)
     return () => clearInterval(id)
   }, [load, config.pollMs])
+
+  const rolloverKey = useMemo(() => {
+    if (!market) return null
+    const { target } = getCountdownTarget(market)
+    return `${market.eventSlug}:${target.getTime()}`
+  }, [market])
+
+  useEffect(() => {
+    if (!market || rolloverKey == null) return
+
+    const { target } = getCountdownTarget(market)
+    const ms = target.getTime() - Date.now()
+
+    if (ms <= 0) {
+      void load()
+      const retry = setInterval(() => void load(), 3_000)
+      return () => clearInterval(retry)
+    }
+
+    const id = setTimeout(() => void load(), ms + 750)
+    return () => clearTimeout(id)
+  }, [market, rolloverKey, load])
 
   const displayMarket = useMemo((): ParsedMarket | null => {
     if (!market) return null
