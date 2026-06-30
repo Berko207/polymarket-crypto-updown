@@ -106,7 +106,7 @@ export async function placeMarketOrder(params: PlaceOrderParams): Promise<PlaceO
   assertWalletConfig(config)
 
   const amount = params.amount
-  if (!Number.isFinite(amount) || amount <= 0) {
+  if (amount == null || !Number.isFinite(amount) || amount <= 0) {
     throw new Error('amount must be a positive number')
   }
 
@@ -151,10 +151,10 @@ export async function placeLimitOrder(params: PlaceOrderParams): Promise<PlaceOr
 
   const price = params.price
   const size = params.size
-  if (!Number.isFinite(price) || price <= 0 || price >= 1) {
+  if (price == null || !Number.isFinite(price) || price <= 0 || price >= 1) {
     throw new Error('price must be between 0 and 1 (exclusive)')
   }
-  if (!Number.isFinite(size) || size <= 0) {
+  if (size == null || !Number.isFinite(size) || size <= 0) {
     throw new Error('size must be a positive number of shares')
   }
 
@@ -176,8 +176,8 @@ export async function placeLimitOrder(params: PlaceOrderParams): Promise<PlaceOr
   const response = await client.createAndPostOrder(
     {
       tokenID: params.tokenId,
-      price: params.price,
-      size: params.size,
+      price,
+      size,
       side: params.side === 'SELL' ? Side.SELL : Side.BUY,
     },
     { tickSize, negRisk },

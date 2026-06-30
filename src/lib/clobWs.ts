@@ -110,18 +110,12 @@ interface LastTradeMessage {
   price?: string
 }
 
-function handleMessage(
-  raw: unknown,
-  map: QuoteMap,
-  upTokenId: string,
-  downTokenId: string,
-  onUpdate: (update: LiveQuoteUpdate) => void,
-): void {
-  const apply = () => onUpdate(buildUpdate(map, upTokenId, downTokenId))
+function handleQuotePatches(raw: unknown, map: QuoteMap, onChanged: () => void): void {
+  const apply = () => onChanged()
 
   if (Array.isArray(raw)) {
     for (const item of raw) {
-      handleMessage(item, map, upTokenId, downTokenId, onUpdate)
+      handleQuotePatches(item, map, onChanged)
     }
     return
   }
@@ -168,6 +162,109 @@ function handleMessage(
     if (!trade.asset_id) return
     patchQuote(map, trade.asset_id, { lastTrade: toNum(trade.price) })
     apply()
+  }
+}
+
+function handleMessage(
+  raw: unknown,
+  map: QuoteMap,
+  upTokenId: string,
+  downTokenId: string,
+  onUpdate: (update: LiveQuoteUpdate) => void,
+): void {
+  handleQuotePatches(raw, map, () => onUpdate(buildUpdate(map, upTokenId, downTokenId)))
+}
+
+export type TokenQuoteMap = Record<string, TokenQuote>
+
+export interface TokenQuotesStreamOptions {
+  tokenIds: string[]
+  onUpdate: (quotes: TokenQuoteMap) => void
+  onConnectedChange?: (connected: boolean) => void
+}
+
+function snapshotQuotes(map: QuoteMap, tokenIds: string[]): TokenQuoteMap {
+  const out: TokenQuoteMap = {}
+  for (const id of tokenIds) {
+    out[id] = map[id] ?? emptyQuote()
+  }
+  return out
+}
+
+/** Subscribe to live quotes for an arbitrary set of outcome tokens (e.g. portfolio positions). */
+export function subscribeTokenQuotes({
+  tokenIds,
+  onUpdate,
+  onConnectedChange,
+}: TokenQuotesStreamOptions): () => void {
+  const assetIds = [...new Set(tokenIds.filter(Boolean))]
+  if (!assetIds.length) return () => {}
+
+  const quotes: QuoteMap = {}
+  let ws: WebSocket | null = null
+  let pingTimer: ReturnType<typeof setInterval> | null = null
+  let reconnectTimer: ReturnType<typeof setTimeout> | null = null
+  let closed = false
+
+  const clearTimers = () => {
+    if (pingTimer) clearInterval(pingTimer)
+    if (reconnectTimer) clearTimeout(reconnectTimer)
+    pingTimer = null
+    reconnectTimer = null
+  }
+
+  const connect = () => {
+    if (closed) return
+
+    ws = new WebSocket(WS_URL)
+
+    ws.onopen = () => {
+      onConnectedChange?.(true)
+      ws?.send(
+        JSON.stringify({
+          assets_ids: assetIds,
+          type: 'market',
+          custom_feature_enabled: true,
+        }),
+      )
+      pingTimer = setInterval(() => {
+        if (ws?.readyState === WebSocket.OPEN) ws.send('PING')
+      }, PING_MS)
+    }
+
+    ws.onmessage = (event) => {
+      if (event.data === 'PONG') return
+      try {
+        handleQuotePatches(JSON.parse(event.data as string), quotes, () => {
+          onUpdate(snapshotQuotes(quotes, assetIds))
+        })
+      } catch {
+        // ignore malformed frames
+      }
+    }
+
+    ws.onclose = () => {
+      onConnectedChange?.(false)
+      clearTimers()
+      ws = null
+      if (!closed) {
+        reconnectTimer = setTimeout(connect, RECONNECT_MS)
+      }
+    }
+
+    ws.onerror = () => {
+      ws?.close()
+    }
+  }
+
+  connect()
+
+  return () => {
+    closed = true
+    clearTimers()
+    ws?.close()
+    ws = null
+    onConnectedChange?.(false)
   }
 }
 

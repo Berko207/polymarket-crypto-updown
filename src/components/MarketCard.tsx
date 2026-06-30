@@ -1,12 +1,14 @@
 import { useEffect, useRef, useState } from 'react'
-import { MIN_BUY_USD, placeOrder } from '../lib/api'
+import { MIN_BUY_USD, placeOrder, type OpenOrder, type Position } from '../lib/api'
 import {
   formatCountdown,
   formatPercent,
   formatVolume,
   getCountdownTarget,
 } from '../lib/polymarket'
-import { getCoin, getTimeframe } from '../lib/config'
+import { getCoin } from '../lib/config'
+import { formatMarketHeading } from '../lib/marketLabels'
+import { rememberMarketTokens } from '../lib/tokenLabels'
 import type { ParsedMarket } from '../lib/types'
 import { OrderConfirmDialog } from './OrderConfirmDialog'
 import { MarketHoldings } from './MarketHoldings'
@@ -14,10 +16,14 @@ import { MarketHoldings } from './MarketHoldings'
 interface MarketCardProps {
   market: ParsedMarket
   updateHint?: string
+  stale?: boolean
   canTrade?: boolean
   usdcBalance?: number
   onOrderPlaced?: () => void
-  holdingsRefreshKey?: number
+  orders: OpenOrder[]
+  positions: Position[]
+  portfolioLoading?: boolean
+  onCancelOrder: (orderId: string) => Promise<void>
 }
 
 type Outcome = 'up' | 'down'
@@ -34,9 +40,24 @@ function tokenIdFor(market: ParsedMarket, outcome: Outcome): string | null {
   return outcome === 'up' ? market.upTokenId : market.downTokenId
 }
 
-export function MarketCard({ market, updateHint, canTrade, usdcBalance, onOrderPlaced, holdingsRefreshKey = 0 }: MarketCardProps) {
+export function MarketCard({
+  market,
+  updateHint,
+  stale = false,
+  canTrade,
+  usdcBalance,
+  onOrderPlaced,
+  orders,
+  positions,
+  portfolioLoading,
+  onCancelOrder,
+}: MarketCardProps) {
   const coin = getCoin(market.coin)
-  const timeframe = getTimeframe(market.timeframe)
+  const { title: marketTitle, subtitle: marketSubtitle } = formatMarketHeading(market)
+
+  useEffect(() => {
+    rememberMarketTokens(market.upTokenId, market.downTokenId, marketSubtitle)
+  }, [market.upTokenId, market.downTokenId, marketSubtitle])
   const countdownInfo = getCountdownTarget(market)
   const [countdown, setCountdown] = useState(() => formatCountdown(countdownInfo.target))
   const [countdownLabel, setCountdownLabel] = useState(countdownInfo.label)
@@ -49,6 +70,8 @@ export function MarketCard({ market, updateHint, canTrade, usdcBalance, onOrderP
   const [tradeMessage, setTradeMessage] = useState<{ type: 'ok' | 'err'; text: string } | null>(null)
   const prevPrices = useRef({ up: market.upPrice, down: market.downPrice })
 
+  const countdownKey = `${market.eventSlug}:${market.endDate.getTime()}:${market.startDate?.getTime() ?? ''}`
+
   useEffect(() => {
     const tick = () => {
       const info = getCountdownTarget(market)
@@ -58,7 +81,7 @@ export function MarketCard({ market, updateHint, canTrade, usdcBalance, onOrderP
     tick()
     const id = setInterval(tick, 1000)
     return () => clearInterval(id)
-  }, [market])
+  }, [countdownKey])
 
   useEffect(() => {
     const prev = prevPrices.current
@@ -71,7 +94,7 @@ export function MarketCard({ market, updateHint, canTrade, usdcBalance, onOrderP
   }, [market.upPrice, market.downPrice])
 
   const requestBuy = (outcome: Outcome) => {
-    if (!canTrade || placing) return
+    if (!canTrade || placing || stale) return
 
     const tokenId = tokenIdFor(market, outcome)
     const price = buyPrice(market, outcome)
@@ -97,6 +120,8 @@ export function MarketCard({ market, updateHint, canTrade, usdcBalance, onOrderP
     const tokenId = tokenIdFor(market, outcome)
     const price = buyPrice(market, outcome)
     if (!tokenId || price == null) return
+
+    rememberMarketTokens(market.upTokenId, market.downTokenId, marketSubtitle)
 
     const buyUsd = orderAmountUsd(outcome)
     if (buyUsd < MIN_BUY_USD) {
@@ -166,18 +191,19 @@ export function MarketCard({ market, updateHint, canTrade, usdcBalance, onOrderP
   const confirmCost = confirmOutcome ? orderAmountUsd(confirmOutcome) : usdcAmount
 
   return (
-    <article className="market-card">
+    <article className={`market-card${stale ? ' is-stale' : ''}`} aria-busy={stale || undefined}>
       <header className="market-header">
         <div className="market-title-row">
           <span className="market-coin-badge" style={{ background: coin.color }}>
             {coin.symbol}
           </span>
           <div>
-            <h2 className="market-title">{coin.name} Up or Down</h2>
-            <p className="market-subtitle">{timeframe.label} · {market.title.split(' - ').slice(1).join(' - ') || market.title}</p>
+            <h2 className="market-title">{marketTitle}</h2>
+            <p className="market-subtitle">{marketSubtitle}</p>
           </div>
         </div>
         <div className="market-header-right">
+          {stale && <span className="market-updating">Updating…</span>}
           <div className="market-clock" aria-live="polite" title={updateHint}>
             <span className="market-clock-label">{countdownLabel}</span>
             <span className="market-clock-value">{countdown}</span>
@@ -266,7 +292,7 @@ export function MarketCard({ market, updateHint, canTrade, usdcBalance, onOrderP
               type="button"
               className="outcome-btn up"
               onClick={() => requestBuy('up')}
-              disabled={!market.isLive || placing !== null}
+              disabled={!market.isLive || placing !== null || stale}
             >
               <span className="outcome-label">{placing === 'up' ? 'Placing…' : 'Buy Up'}</span>
               <span className="outcome-price">{formatPercent(market.upPrice)}</span>
@@ -280,7 +306,7 @@ export function MarketCard({ market, updateHint, canTrade, usdcBalance, onOrderP
               type="button"
               className="outcome-btn down"
               onClick={() => requestBuy('down')}
-              disabled={!market.isLive || placing !== null}
+              disabled={!market.isLive || placing !== null || stale}
             >
               <span className="outcome-label">{placing === 'down' ? 'Placing…' : 'Buy Down'}</span>
               <span className="outcome-price">{formatPercent(market.downPrice)}</span>
@@ -327,13 +353,18 @@ export function MarketCard({ market, updateHint, canTrade, usdcBalance, onOrderP
 
       <MarketHoldings
         enabled={trading}
+        marketSubtitle={marketSubtitle}
+        coinSymbol={coin.symbol}
         upTokenId={market.upTokenId}
         downTokenId={market.downTokenId}
         bestBidUp={market.bestBidUp}
         bestBidDown={market.bestBidDown}
         upPrice={market.upPrice}
         downPrice={market.downPrice}
-        refreshKey={holdingsRefreshKey}
+        orders={orders}
+        positions={positions}
+        loading={portfolioLoading}
+        onCancelOrder={onCancelOrder}
         onChanged={onOrderPlaced}
       />
 

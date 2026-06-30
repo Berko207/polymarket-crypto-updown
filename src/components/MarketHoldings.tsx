@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useState } from 'react'
-import { cancelOrder, fetchOpenOrders, fetchPositions, placeOrder, type OpenOrder, type Position } from '../lib/api'
+import { useMemo, useState } from 'react'
+import { placeOrder, type OpenOrder, type Position } from '../lib/api'
 import { formatPercent } from '../lib/polymarket'
 import { livePriceForPosition } from '../lib/positionPnl'
 import { OrderConfirmDialog } from './OrderConfirmDialog'
@@ -7,13 +7,18 @@ import { PositionPnl } from './PositionPnl'
 
 interface MarketHoldingsProps {
   enabled: boolean
+  marketSubtitle?: string
+  coinSymbol?: string
   upTokenId: string | null
   downTokenId: string | null
   bestBidUp: number | null
   bestBidDown: number | null
   upPrice?: number | null
   downPrice?: number | null
-  refreshKey?: number
+  orders: OpenOrder[]
+  positions: Position[]
+  loading?: boolean
+  onCancelOrder: (orderId: string) => Promise<void>
   onChanged?: () => void
 }
 
@@ -33,57 +38,42 @@ function sellPrice(
 
 export function MarketHoldings({
   enabled,
+  marketSubtitle,
+  coinSymbol,
   upTokenId,
   downTokenId,
   bestBidUp,
   bestBidDown,
   upPrice,
   downPrice,
-  refreshKey = 0,
+  orders,
+  positions,
+  loading = false,
+  onCancelOrder,
   onChanged,
 }: MarketHoldingsProps) {
-  const [positions, setPositions] = useState<Position[]>([])
-  const [openOrders, setOpenOrders] = useState<OpenOrder[]>([])
-  const [loading, setLoading] = useState(false)
-  const [error, setError] = useState<string | null>(null)
   const [selling, setSelling] = useState<string | null>(null)
+  const [cancelling, setCancelling] = useState<string | null>(null)
   const [confirmSell, setConfirmSell] = useState<{
     position: Position
     price: number
   } | null>(null)
   const [message, setMessage] = useState<{ type: 'ok' | 'err'; text: string } | null>(null)
 
-  const load = useCallback(async () => {
-    if (!enabled || (!upTokenId && !downTokenId)) {
-      setPositions([])
-      setOpenOrders([])
-      return
-    }
-    setLoading(true)
-    setError(null)
-    try {
-      const tokenIds = new Set([upTokenId, downTokenId].filter(Boolean) as string[])
-      const [nextPositions, orders] = await Promise.all([fetchPositions({ upTokenId, downTokenId }), fetchOpenOrders()])
-      setPositions(nextPositions)
-      setOpenOrders(orders.filter((o) => tokenIds.has(o.assetId)))
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'Could not load holdings')
-      setPositions([])
-      setOpenOrders([])
-    } finally {
-      setLoading(false)
-    }
-  }, [enabled, upTokenId, downTokenId])
+  const tokenIds = useMemo(
+    () => new Set([upTokenId, downTokenId].filter(Boolean) as string[]),
+    [upTokenId, downTokenId],
+  )
 
-  useEffect(() => {
-    void load()
-  }, [load, refreshKey])
+  const marketOrders = useMemo(
+    () => orders.filter((o) => tokenIds.has(o.assetId)),
+    [orders, tokenIds],
+  )
 
-  useEffect(() => {
-    if (!enabled) return
-    const id = setInterval(() => void load(), 15_000)
-    return () => clearInterval(id)
-  }, [enabled, load])
+  const marketPositions = useMemo(
+    () => positions.filter((p) => tokenIds.has(p.tokenId)),
+    [positions, tokenIds],
+  )
 
   const requestSell = (position: Position) => {
     const price = sellPrice(position, bestBidUp, bestBidDown, upPrice, downPrice)
@@ -97,7 +87,7 @@ export function MarketHoldings({
 
   const submitSell = async () => {
     if (!confirmSell) return
-    const { position, price } = confirmSell
+    const { position } = confirmSell
     setConfirmSell(null)
     setSelling(position.tokenId)
     setMessage(null)
@@ -111,7 +101,6 @@ export function MarketHoldings({
       })
       const id = result.orderId ? ` · ${result.orderId.slice(0, 8)}…` : ''
       setMessage({ type: 'ok', text: `Sell ${position.outcome} submitted${id}` })
-      await load()
       onChanged?.()
     } catch (e) {
       setMessage({
@@ -123,31 +112,46 @@ export function MarketHoldings({
     }
   }
 
+  const handleCancel = async (orderId: string) => {
+    setCancelling(orderId)
+    try {
+      await onCancelOrder(orderId)
+      onChanged?.()
+    } catch (e) {
+      setMessage({
+        type: 'err',
+        text: e instanceof Error ? e.message : 'Cancel failed',
+      })
+    } finally {
+      setCancelling(null)
+    }
+  }
+
   if (!enabled) return null
 
-  const hasContent = loading || positions.length > 0 || openOrders.length > 0 || error || message
+  const hasContent =
+    loading || marketPositions.length > 0 || marketOrders.length > 0 || message
 
   if (!hasContent) return null
 
   return (
     <section className="market-holdings" aria-label="Your position">
       <div className="market-holdings-header">
-        <strong>Your position</strong>
-        <button type="button" className="market-holdings-refresh" onClick={() => void load()} disabled={loading}>
-          {loading ? '…' : '↻'}
-        </button>
+        <div>
+          <strong>Your position</strong>
+          {marketSubtitle && <p className="market-holdings-context">{marketSubtitle}</p>}
+        </div>
       </div>
 
-      {error && <p className="market-holdings-error">{error}</p>}
       {message && <p className={`market-holdings-msg ${message.type}`}>{message.text}</p>}
 
-      {positions.length === 0 && openOrders.length === 0 && !loading && !error && (
+      {marketPositions.length === 0 && marketOrders.length === 0 && !loading && (
         <p className="market-holdings-hint">No shares in this market yet.</p>
       )}
 
-      {openOrders.length > 0 && (
+      {marketOrders.length > 0 && (
         <ul className="market-holdings-list pending-orders">
-          {openOrders.map((order) => (
+          {marketOrders.map((order) => (
             <li key={order.id} className="market-holding-item pending">
               <div className="market-holding-main">
                 <span className="market-holding-outcome pending">Open {order.side}</span>
@@ -160,9 +164,10 @@ export function MarketHoldings({
                 <button
                   type="button"
                   className="market-holding-sell cancel"
-                  onClick={() => void cancelOrder(order.id).then(() => load()).then(() => onChanged?.())}
+                  onClick={() => void handleCancel(order.id)}
+                  disabled={cancelling === order.id}
                 >
-                  Cancel
+                  {cancelling === order.id ? '…' : 'Cancel'}
                 </button>
               </div>
             </li>
@@ -171,7 +176,7 @@ export function MarketHoldings({
       )}
 
       <ul className="market-holdings-list">
-        {positions.map((position) => {
+        {marketPositions.map((position) => {
           const price = sellPrice(position, bestBidUp, bestBidDown, upPrice, downPrice)
           const outcomeClass = position.outcome.toLowerCase()
 
@@ -211,7 +216,7 @@ export function MarketHoldings({
         <OrderConfirmDialog
           side="SELL"
           outcome={confirmSell.position.outcome.toLowerCase() === 'down' ? 'down' : 'up'}
-          coinSymbol="Position"
+          coinSymbol={coinSymbol ?? 'Market'}
           price={confirmSell.price}
           size={confirmSell.position.size}
           onConfirm={() => void submitSell()}

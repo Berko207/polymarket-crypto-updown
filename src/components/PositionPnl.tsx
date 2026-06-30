@@ -8,25 +8,28 @@ import type { Position } from '../lib/api'
 
 interface PositionPnlProps {
   position: Position
-  bestBidUp: number | null
-  bestBidDown: number | null
+  bestBidUp?: number | null
+  bestBidDown?: number | null
   upPrice?: number | null
   downPrice?: number | null
+  tokenBid?: number | null
   compact?: boolean
 }
 
 export function PositionPnl({
   position,
-  bestBidUp,
-  bestBidDown,
+  bestBidUp = null,
+  bestBidDown = null,
   upPrice,
   downPrice,
+  tokenBid,
   compact = false,
 }: PositionPnlProps) {
   const livePrice = livePriceForPosition(
     position,
     { up: bestBidUp, down: bestBidDown },
     { up: upPrice ?? null, down: downPrice ?? null },
+    tokenBid,
   )
   const stats = computePositionLiveStats(position, livePrice)
 

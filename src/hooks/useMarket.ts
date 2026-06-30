@@ -20,25 +20,34 @@ export function useMarket(
     throttleMs: config.throttleMs,
   })
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (signal?: { cancelled: boolean }) => {
     try {
       setError(null)
       const data = await fetchCurrentMarket(coin, timeframe)
+      if (signal?.cancelled) return
       setMarket(data)
     } catch (err) {
+      if (signal?.cancelled) return
       setError(err instanceof Error ? err.message : 'Failed to load market')
       setMarket(null)
     } finally {
-      setLoading(false)
+      if (!signal?.cancelled) setLoading(false)
     }
   }, [coin, timeframe])
 
   useEffect(() => {
+    const signal = { cancelled: false }
+    // Keep the previously loaded market on screen while the next one loads
+    // (stale-while-revalidate) so open orders/positions stay visible mid-switch.
     setLoading(true)
-    void load()
-    const id = setInterval(() => void load(), config.pollMs)
-    return () => clearInterval(id)
-  }, [load, config.pollMs])
+    setError(null)
+    void load(signal)
+    const id = setInterval(() => void load(signal), config.pollMs)
+    return () => {
+      signal.cancelled = true
+      clearInterval(id)
+    }
+  }, [coin, timeframe, config.pollMs, load])
 
   const rolloverKey = useMemo(() => {
     if (!market) return null
@@ -49,23 +58,40 @@ export function useMarket(
   useEffect(() => {
     if (!market || rolloverKey == null) return
 
+    const signal = { cancelled: false }
     const { target } = getCountdownTarget(market)
     const ms = target.getTime() - Date.now()
 
+    const run = () => void load(signal)
+
     if (ms <= 0) {
-      void load()
-      const retry = setInterval(() => void load(), 3_000)
-      return () => clearInterval(retry)
+      run()
+      const retry = setInterval(run, 3_000)
+      return () => {
+        signal.cancelled = true
+        clearInterval(retry)
+      }
     }
 
-    const id = setTimeout(() => void load(), ms + 750)
-    return () => clearTimeout(id)
-  }, [market, rolloverKey, load])
+    const id = setTimeout(run, ms + 750)
+    return () => {
+      signal.cancelled = true
+      clearTimeout(id)
+    }
+    // rolloverKey captures window identity; avoid re-firing on every polled market object.
+  }, [rolloverKey, load])
 
   const displayMarket = useMemo((): ParsedMarket | null => {
     if (!market) return null
 
     if (!config.useWebSocket) return market
+
+    const upPrice = live.upPrice ?? market.upPrice
+    const downPrice = live.downPrice ?? market.downPrice
+    const bestBidUp = live.bestBidUp ?? market.bestBidUp
+    const bestAskUp = live.bestAskUp ?? market.bestAskUp
+    const bestBidDown = live.bestBidDown ?? market.bestBidDown
+    const bestAskDown = live.bestAskDown ?? market.bestAskDown
 
     const hasLive =
       live.upPrice != null ||
@@ -75,16 +101,36 @@ export function useMarket(
 
     if (!hasLive) return market
 
+    if (
+      upPrice === market.upPrice &&
+      downPrice === market.downPrice &&
+      bestBidUp === market.bestBidUp &&
+      bestAskUp === market.bestAskUp &&
+      bestBidDown === market.bestBidDown &&
+      bestAskDown === market.bestAskDown
+    ) {
+      return market
+    }
+
     return {
       ...market,
-      upPrice: live.upPrice ?? market.upPrice,
-      downPrice: live.downPrice ?? market.downPrice,
-      bestBidUp: live.bestBidUp ?? market.bestBidUp,
-      bestAskUp: live.bestAskUp ?? market.bestAskUp,
-      bestBidDown: live.bestBidDown ?? market.bestBidDown,
-      bestAskDown: live.bestAskDown ?? market.bestAskDown,
+      upPrice,
+      downPrice,
+      bestBidUp,
+      bestAskUp,
+      bestBidDown,
+      bestAskDown,
     }
-  }, [market, live, config.useWebSocket])
+  }, [
+    market,
+    config.useWebSocket,
+    live.upPrice,
+    live.downPrice,
+    live.bestBidUp,
+    live.bestAskUp,
+    live.bestBidDown,
+    live.bestAskDown,
+  ])
 
   return {
     market: displayMarket,

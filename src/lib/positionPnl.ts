@@ -12,7 +12,10 @@ export function livePriceForPosition(
   position: Position,
   bids: { up: number | null; down: number | null },
   mids?: { up: number | null; down: number | null },
+  tokenBid?: number | null,
 ): number | null {
+  if (tokenBid != null && tokenBid > 0) return tokenBid
+
   const outcome = position.outcome.toLowerCase()
   const bid = outcome === 'up' ? bids.up : outcome === 'down' ? bids.down : null
   if (bid != null && bid > 0) return bid

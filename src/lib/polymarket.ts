@@ -121,27 +121,38 @@ function rankCandidate(a: ParsedMarket, b: ParsedMarket): number {
   return a.endDate.getTime() - b.endDate.getTime()
 }
 
+async function fetchMarketForSlug(
+  slug: string,
+  coin: CoinId,
+  timeframe: TimeframeId,
+): Promise<ParsedMarket | null> {
+  try {
+    const events = await fetchJson<GammaEvent[]>(`/events?slug=${slug}`)
+    const event = events[0]
+    if (!event?.markets?.[0] || event.closed) return null
+
+    const parsed = parseMarket(event, event.markets[0], coin, timeframe)
+    return parsed.isLive ? parsed : null
+  } catch {
+    return null
+  }
+}
+
 /** Resolve the current market by trying known slug patterns (avoids stale series lists). */
 async function fetchMarketBySlugs(
   coin: CoinId,
   timeframe: TimeframeId,
 ): Promise<ParsedMarket | null> {
   const candidates = buildEventSlugCandidates(coin, timeframe)
+  const results = await Promise.all(
+    candidates.map((slug) => fetchMarketForSlug(slug, coin, timeframe)),
+  )
+
   let best: ParsedMarket | null = null
-
-  for (const slug of candidates) {
-    const events = await fetchJson<GammaEvent[]>(`/events?slug=${slug}`)
-    const event = events[0]
-    if (!event?.markets?.[0] || event.closed) continue
-
-    const parsed = parseMarket(event, event.markets[0], coin, timeframe)
-    if (!parsed.isLive) continue
-
+  for (const parsed of results) {
+    if (!parsed) continue
     if (parsed.inWindow) return parsed
-
-    if (!best || rankCandidate(parsed, best) < 0) {
-      best = parsed
-    }
+    if (!best || rankCandidate(parsed, best) < 0) best = parsed
   }
 
   return best

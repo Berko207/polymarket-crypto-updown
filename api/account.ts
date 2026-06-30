@@ -24,14 +24,16 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
   const config = getPolyConfig()!
   const walletSetupIssue = getWalletSetupIssue(config)
-  const resolved = await resolveTradingWallet(config.address)
-  const suggestedFunderAddress = resolved.proxyWallet
-  const funderMismatch =
-    suggestedFunderAddress != null &&
-    suggestedFunderAddress.toLowerCase() !== config.funderAddress.toLowerCase()
 
   try {
-    const account = await fetchAccountSnapshot()
+    const [resolved, account] = await Promise.all([
+      resolveTradingWallet(config.address),
+      fetchAccountSnapshot(),
+    ])
+    const suggestedFunderAddress = resolved.proxyWallet
+    const funderMismatch =
+      suggestedFunderAddress != null &&
+      suggestedFunderAddress.toLowerCase() !== config.funderAddress.toLowerCase()
     return res.status(200).json({
       configured: true,
       ...account,
@@ -41,6 +43,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     })
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Could not verify credentials'
+    const resolved = await resolveTradingWallet(config.address)
+    const suggestedFunderAddress = resolved.proxyWallet
+    const funderMismatch =
+      suggestedFunderAddress != null &&
+      suggestedFunderAddress.toLowerCase() !== config.funderAddress.toLowerCase()
     return res.status(200).json({
       configured: true,
       address: config.address,
