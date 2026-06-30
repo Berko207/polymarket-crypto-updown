@@ -19,7 +19,14 @@ export function useOrderActions() {
   const place = usePlaceOrder()
   const cancelMut = useCancelOrder()
 
-  const buy = async (opts: { tokenId: string; amountUsd: number; label: string; price?: number }) => {
+  const buy = async (opts: {
+    tokenId: string
+    amountUsd: number
+    label: string
+    price?: number
+    tickSize?: number
+    negRisk?: boolean
+  }) => {
     const id = toast.loading(`Buying ${opts.label}…`)
     try {
       const result = await place.mutateAsync({
@@ -28,6 +35,8 @@ export function useOrderActions() {
         orderType: 'market',
         amount: opts.amountUsd,
         price: opts.price,
+        tickSize: opts.tickSize,
+        negRisk: opts.negRisk,
       })
       const status = (result.status ?? '').toLowerCase()
       if (status === 'unmatched') {
@@ -53,7 +62,14 @@ export function useOrderActions() {
         orderType: 'market',
         size: opts.size,
       })
-      toast.success(`Sell ${opts.label} submitted${idSuffix(result)}`, { id })
+      const status = (result.status ?? '').toLowerCase()
+      if (status === 'unmatched') {
+        toast.error(`Sell ${opts.label} didn't fill — no bids, try again`, { id })
+      } else if (status === 'delayed') {
+        toast.success(`Sell ${opts.label} matching…${idSuffix(result)}`, { id })
+      } else {
+        toast.success(`Sell ${opts.label} filled${idSuffix(result)}`, { id })
+      }
       return result
     } catch (e) {
       toast.error(errText(e, 'Sell failed'), { id })

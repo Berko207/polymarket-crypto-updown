@@ -110,11 +110,15 @@ function usesDepositWalletAllowance(config: PolyServerConfig): boolean {
 }
 
 /** Shared pre-flight for placing an order: client + (1271) allowance + market params. */
-async function prepareOrder(config: PolyServerConfig, tokenId: string) {
+async function prepareOrder(
+  config: PolyServerConfig,
+  tokenId: string,
+  hint?: { tickSize: TickSize; negRisk: boolean } | null,
+) {
   const client = createClobClient(config)
   const [, params] = await Promise.all([
     usesDepositWalletAllowance(config) ? ensureCollateralAllowance(client) : Promise.resolve(),
-    marketParams(client, tokenId),
+    marketParams(client, tokenId, hint),
   ])
   return { client, ...params }
 }
@@ -166,6 +170,24 @@ export interface PlaceOrderParams {
   size?: number
   amount?: number
   orderType?: 'market' | 'limit'
+  /** Client-supplied gamma metadata; used only on a cache miss (see {@link marketParams}). */
+  tickSize?: number
+  negRisk?: boolean
+}
+
+const VALID_TICK_SIZES: TickSize[] = ['0.1', '0.01', '0.001', '0.0001']
+
+/** Coerce a numeric (gamma) or string tick size to the client's TickSize union, or null. */
+function normalizeTickSize(value: number | undefined): TickSize | null {
+  if (value == null || !Number.isFinite(value)) return null
+  return VALID_TICK_SIZES.find((t) => Math.abs(Number(t) - value) < 1e-9) ?? null
+}
+
+/** A complete client-supplied metadata hint, or null when either field is missing/invalid. */
+function clientMarketParamsHint(params: PlaceOrderParams): { tickSize: TickSize; negRisk: boolean } | null {
+  const tickSize = normalizeTickSize(params.tickSize)
+  if (!tickSize || typeof params.negRisk !== 'boolean') return null
+  return { tickSize, negRisk: params.negRisk }
 }
 
 export interface PlaceOrderResult {
@@ -198,9 +220,18 @@ const DEPOSIT_WALLET_DOCS = 'https://docs.polymarket.com/trading/deposit-wallets
 
 const marketParamsCache = new Map<string, { tickSize: TickSize; negRisk: boolean }>()
 
-async function marketParams(client: ClobClient, tokenId: string) {
+async function marketParams(
+  client: ClobClient,
+  tokenId: string,
+  hint?: { tickSize: TickSize; negRisk: boolean } | null,
+) {
+  // Server cache is authoritative (populated by warmOrderPath / prior orders).
   const cached = marketParamsCache.get(tokenId)
   if (cached) return cached
+  // On a cold instance, trust the client's gamma-sourced metadata to skip two CLOB
+  // round trips (getTickSize + getNegRisk). Not cached — the next warm/order fetches
+  // the authoritative values, so a stale client value can't poison later orders.
+  if (hint) return hint
   const [tickSize, negRisk] = await Promise.all([
     client.getTickSize(tokenId),
     client.getNegRisk(tokenId),
@@ -232,20 +263,29 @@ export async function placeMarketOrder(params: PlaceOrderParams): Promise<PlaceO
   }
 
   const hint = params.side === 'BUY' ? clientBuyHint(params.price) : null
+  const metaHint = clientMarketParamsHint(params)
   const clob = createClobClient(config)
 
   const [{ client, tickSize, negRisk }, bookPrice] = await Promise.all([
-    prepareOrder(config, params.tokenId),
+    prepareOrder(config, params.tokenId, metaHint),
     hint == null && params.side === 'BUY'
       ? resolveMarketBuyPrice(clob, params.tokenId, amount)
       : Promise.resolve(null),
   ])
 
+  // SELL uses FAK (Fill-And-Kill): take whatever bids are resting right now and
+  // cancel the unfilled remainder. FOK (the BUY default) kills the WHOLE order if
+  // the book can't absorb the full position in one shot — which is exactly what
+  // happens when an up/down market consolidates and makers thin out the bids, so
+  // a position-close is rejected ("no match") until the book deepens, i.e. until
+  // the odds move against you. FAK lets you always offload what's actually there.
+  const marketOrderType = params.side === 'SELL' ? OrderType.FAK : OrderType.FOK
+
   const orderArgs: Parameters<ClobClient['createAndPostMarketOrder']>[0] = {
     tokenID: params.tokenId,
     side: params.side === 'SELL' ? Side.SELL : Side.BUY,
     amount,
-    orderType: OrderType.FOK,
+    orderType: marketOrderType,
   }
 
   if (params.side === 'BUY') {
@@ -258,13 +298,13 @@ export async function placeMarketOrder(params: PlaceOrderParams): Promise<PlaceO
   let response = await client.createAndPostMarketOrder(
     orderArgs,
     { tickSize, negRisk },
-    OrderType.FOK,
+    marketOrderType,
   )
 
   let result = unwrapOrderResult(response)
   if (params.side === 'BUY' && hint != null && (result.status ?? '').toLowerCase() === 'unmatched') {
     orderArgs.price = await resolveMarketBuyPrice(client, params.tokenId, amount)
-    response = await client.createAndPostMarketOrder(orderArgs, { tickSize, negRisk }, OrderType.FOK)
+    response = await client.createAndPostMarketOrder(orderArgs, { tickSize, negRisk }, marketOrderType)
     result = unwrapOrderResult(response)
   }
 
@@ -287,7 +327,7 @@ export async function placeLimitOrder(params: PlaceOrderParams): Promise<PlaceOr
     throw new Error(`Minimum buy size is $${MIN_BUY_USD.toFixed(2)} (currently $${(price * size).toFixed(2)})`)
   }
 
-  const { client, tickSize, negRisk } = await prepareOrder(config, params.tokenId)
+  const { client, tickSize, negRisk } = await prepareOrder(config, params.tokenId, clientMarketParamsHint(params))
 
   const response = await client.createAndPostOrder(
     {
