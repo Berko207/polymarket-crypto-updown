@@ -59,7 +59,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   }
   const body = req.method === 'HEAD' ? null : await upstream.text()
 
-  res.setHeader('Cache-Control', 's-maxage=5, stale-while-revalidate=30')
+  // Live prices ride the WS overlay and in-window/live state is recomputed
+  // client-side from the wall clock, so the gamma snapshot is mostly stable
+  // per-round metadata — a 10s edge TTL dedupes polling without staling the UI.
+  res.setHeader('Cache-Control', 's-maxage=10, stale-while-revalidate=30')
   const contentType = upstream.headers.get('content-type')
   if (contentType) res.setHeader('Content-Type', contentType)
 

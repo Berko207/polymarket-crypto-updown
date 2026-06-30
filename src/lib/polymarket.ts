@@ -140,11 +140,36 @@ async function fetchMarketForSlug(
   }
 }
 
+/**
+ * Last slug resolved as the live, in-window market for a `coin:timeframe`. Lets a
+ * steady-state poll hit ONE gamma request instead of fanning out across the ~4
+ * candidate slugs. Self-correcting: the entry is dropped the moment its market is
+ * no longer in window (round rolled over), so a stale slug can never be returned.
+ */
+const liveSlugCache = new Map<string, string>()
+
+function slugCacheKey(coin: CoinId, timeframe: TimeframeId): string {
+  return `${coin}:${timeframe}`
+}
+
 /** Resolve the current market by trying known slug patterns (avoids stale series lists). */
 async function fetchMarketBySlugs(
   coin: CoinId,
   timeframe: TimeframeId,
 ): Promise<ParsedMarket | null> {
+  const key = slugCacheKey(coin, timeframe)
+
+  // Fast path: re-poll the slug we last saw live. While a round is in progress this
+  // is the only request we make. `inWindow` is recomputed here from the wall clock
+  // (not from cache freshness), so an edge-cached body can't keep a finished round
+  // looking live — once it ends we fall through to rediscover.
+  const cachedSlug = liveSlugCache.get(key)
+  if (cachedSlug) {
+    const cached = await fetchMarketForSlug(cachedSlug, coin, timeframe)
+    if (cached?.inWindow) return cached
+    liveSlugCache.delete(key)
+  }
+
   const candidates = buildEventSlugCandidates(coin, timeframe)
   const results = await Promise.all(
     candidates.map((slug) => fetchMarketForSlug(slug, coin, timeframe)),
@@ -153,7 +178,10 @@ async function fetchMarketBySlugs(
   let best: ParsedMarket | null = null
   for (const parsed of results) {
     if (!parsed) continue
-    if (parsed.inWindow) return parsed
+    if (parsed.inWindow) {
+      liveSlugCache.set(key, parsed.eventSlug)
+      return parsed
+    }
     if (!best || rankCandidate(parsed, best) < 0) best = parsed
   }
 
