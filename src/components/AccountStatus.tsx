@@ -88,6 +88,12 @@ export function AccountStatus({ status, loading, error, onRefresh }: AccountStat
                   <dd>{truncateAddress(status.funderAddress)}</dd>
                 </div>
               )}
+              {status.suggestedFunderAddress && status.funderMismatch && (
+                <div>
+                  <dt>Should be</dt>
+                  <dd className="account-fix">{truncateAddress(status.suggestedFunderAddress)}</dd>
+                </div>
+              )}
               {status.usdcBalance != null && (
                 <div>
                   <dt>USDC</dt>
@@ -104,7 +110,25 @@ export function AccountStatus({ status, loading, error, onRefresh }: AccountStat
                 <dt>Can trade</dt>
                 <dd>{status.canTrade ? 'Yes (private key on server)' : 'No — add POLY_PRIVATE_KEY'}</dd>
               </div>
+              {status.signatureType != null && (
+                <div>
+                  <dt>Signature type</dt>
+                  <dd>{status.signatureType}</dd>
+                </div>
+              )}
             </dl>
+          )}
+
+          {status?.funderMismatch && status.suggestedFunderAddress && (
+            <p className="account-error">
+              Funder must be your Polymarket trading wallet, not your signer. Set{' '}
+              <code>POLY_FUNDER_ADDRESS={status.suggestedFunderAddress}</code> and{' '}
+              <code>POLY_SIGNATURE_TYPE=3</code> in your env, then restart.
+            </p>
+          )}
+
+          {status?.walletSetupIssue && (
+            <p className="account-error">{status.walletSetupIssue}</p>
           )}
 
           {status?.error && <p className="account-error">{status.error}</p>}

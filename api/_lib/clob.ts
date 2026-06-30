@@ -5,12 +5,13 @@ import {
   ClobClient,
   OrderType,
   Side,
+  SignatureTypeV2,
   type ApiKeyCreds,
 } from '@polymarket/clob-client-v2'
 import { createWalletClient, http } from 'viem'
 import { privateKeyToAccount } from 'viem/accounts'
 import { polygon } from 'viem/chains'
-import { getPolyConfig, type PolyServerConfig } from './env.js'
+import { assertWalletConfig, getPolyConfig, getWalletSetupIssue, type PolyServerConfig } from './env.js'
 
 const CLOB_HOST = 'https://clob.polymarket.com'
 
@@ -62,9 +63,11 @@ export function getClobClient(): ClobClient | null {
 export interface AccountSnapshot {
   address: string
   funderAddress: string
+  signatureType: number
   usdcBalance: number
   openOrderCount: number
   canTrade: boolean
+  walletSetupIssue: string | null
 }
 
 export interface PlaceOrderParams {
@@ -80,13 +83,22 @@ export interface PlaceOrderResult {
   status?: string
 }
 
+const DEPOSIT_WALLET_DOCS = 'https://docs.polymarket.com/trading/deposit-wallets'
+
 export async function placeLimitOrder(params: PlaceOrderParams): Promise<PlaceOrderResult> {
   const config = getPolyConfig()
   if (!config?.privateKey) {
     throw new Error('POLY_PRIVATE_KEY is required to place orders')
   }
 
+  assertWalletConfig(config)
+
   const client = createClobClient(config)
+
+  if (config.signatureType === SignatureTypeV2.POLY_1271) {
+    await client.updateBalanceAllowance({ asset_type: AssetType.COLLATERAL })
+  }
+
   const [tickSize, negRisk] = await Promise.all([
     client.getTickSize(params.tokenId),
     client.getNegRisk(params.tokenId),
@@ -111,12 +123,31 @@ export async function placeLimitOrder(params: PlaceOrderParams): Promise<PlaceOr
   }
 }
 
+function enrichOrderErrorMessage(message: string): string {
+  const lower = message.toLowerCase()
+  if (lower.includes('maker address not allowed') || lower.includes('deposit wallet')) {
+    return (
+      'Your account must use the deposit wallet flow. Set POLY_SIGNATURE_TYPE=3, ' +
+      'POLY_FUNDER_ADDRESS to your deposit wallet (from polymarket.com/profile → proxyAddress), ' +
+      'keep POLY_ADDRESS/POLY_PRIVATE_KEY as your signer EOA, and place one small trade on ' +
+      `polymarket.com first to deploy the wallet. Docs: ${DEPOSIT_WALLET_DOCS}`
+    )
+  }
+  if (lower.includes('signer address has to be the address of the api key')) {
+    return (
+      'Deposit wallet may not be deployed yet — place one small trade on polymarket.com, ' +
+      'then confirm POLY_FUNDER_ADDRESS matches proxyAddress on your profile page.'
+    )
+  }
+  return message
+}
+
 export function formatOrderError(error: unknown): { message: string; status: number } {
   if (error instanceof ApiError) {
-    return { message: error.message, status: error.status || 400 }
+    return { message: enrichOrderErrorMessage(error.message), status: error.status || 400 }
   }
   if (error instanceof Error) {
-    return { message: error.message, status: 500 }
+    return { message: enrichOrderErrorMessage(error.message), status: 500 }
   }
   return { message: 'Order failed', status: 500 }
 }
@@ -184,11 +215,15 @@ export async function fetchAccountSnapshot(): Promise<AccountSnapshot> {
     client.getOpenOrders(undefined, true),
   ])
 
+  const walletSetupIssue = getWalletSetupIssue(config)
+
   return {
     address: config.address,
     funderAddress: config.funderAddress,
+    signatureType: config.signatureType,
     usdcBalance: Number(balanceRes.balance) / 1e6,
     openOrderCount: Array.isArray(ordersRes) ? ordersRes.length : 0,
-    canTrade: Boolean(config.privateKey),
+    canTrade: Boolean(config.privateKey) && !walletSetupIssue,
+    walletSetupIssue,
   }
 }

@@ -45,3 +45,33 @@ export function isPolyConfigured(): boolean {
 export function canPlaceOrders(): boolean {
   return Boolean(getPolyConfig()?.privateKey)
 }
+
+function sameAddress(a: string, b: string): boolean {
+  return a.toLowerCase() === b.toLowerCase()
+}
+
+/** Returns a setup hint when env vars don't match Polymarket's wallet model. */
+export function getWalletSetupIssue(config: PolyServerConfig): string | null {
+  const funderMatchesSigner = sameAddress(config.funderAddress, config.address)
+
+  if (funderMatchesSigner) {
+    return (
+      'POLY_FUNDER_ADDRESS must be your Polymarket trading wallet (deposit/proxy), not the same as POLY_ADDRESS. ' +
+      'Check the Account panel for the suggested address.'
+    )
+  }
+
+  if (config.signatureType === SignatureTypeV2.EOA) {
+    return (
+      'New Polymarket accounts require the deposit wallet flow: POLY_SIGNATURE_TYPE=3 and ' +
+      'POLY_FUNDER_ADDRESS set to your deposit wallet address.'
+    )
+  }
+
+  return null
+}
+
+export function assertWalletConfig(config: PolyServerConfig): void {
+  const issue = getWalletSetupIssue(config)
+  if (issue) throw new Error(issue)
+}

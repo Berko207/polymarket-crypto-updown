@@ -1,7 +1,7 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node'
 import { fetchAccountSnapshot, formatOrderError, placeLimitOrder } from './_lib/clob.js'
 import { getMaxOrderCost, getMaxOrderSize, guardTradingApi, rateLimit } from './_lib/auth.js'
-import { canPlaceOrders, isPolyConfigured } from './_lib/env.js'
+import { canPlaceOrders, getPolyConfig, getWalletSetupIssue, isPolyConfigured } from './_lib/env.js'
 
 function readJsonBody(req: VercelRequest): unknown {
   if (req.body == null || req.body === '') return {}
@@ -23,6 +23,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
   if (!canPlaceOrders()) {
     return res.status(403).json({ error: 'Add POLY_PRIVATE_KEY on the server to place orders' })
+  }
+
+  const walletSetupIssue = getWalletSetupIssue(getPolyConfig()!)
+  if (walletSetupIssue) {
+    return res.status(400).json({ error: walletSetupIssue })
   }
 
   if (!rateLimit(req, res, { limit: 20, key: 'place-order' })) return

@@ -1,7 +1,8 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node'
 import { fetchAccountSnapshot } from './_lib/clob.js'
 import { authorizeApiRequest, rateLimit } from './_lib/auth.js'
-import { canPlaceOrders, getPolyConfig, isPolyConfigured } from './_lib/env.js'
+import { canPlaceOrders, getPolyConfig, getWalletSetupIssue, isPolyConfigured } from './_lib/env.js'
+import { resolveTradingWallet } from './_lib/wallet.js'
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== 'GET') {
@@ -22,12 +23,21 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   }
 
   const config = getPolyConfig()!
+  const walletSetupIssue = getWalletSetupIssue(config)
+  const resolved = await resolveTradingWallet(config.address)
+  const suggestedFunderAddress = resolved.proxyWallet
+  const funderMismatch =
+    suggestedFunderAddress != null &&
+    suggestedFunderAddress.toLowerCase() !== config.funderAddress.toLowerCase()
 
   try {
     const account = await fetchAccountSnapshot()
     return res.status(200).json({
       configured: true,
       ...account,
+      suggestedFunderAddress,
+      funderMismatch,
+      canTrade: account.canTrade && !funderMismatch,
     })
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Could not verify credentials'
@@ -35,7 +45,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       configured: true,
       address: config.address,
       funderAddress: config.funderAddress,
-      canTrade: canPlaceOrders(),
+      signatureType: config.signatureType,
+      suggestedFunderAddress,
+      funderMismatch,
+      canTrade: canPlaceOrders() && !walletSetupIssue && !funderMismatch,
+      walletSetupIssue,
       error: message,
     })
   }

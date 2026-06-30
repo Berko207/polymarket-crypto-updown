@@ -5,8 +5,12 @@ export interface AccountStatusResponse {
   canTrade?: boolean
   address?: string
   funderAddress?: string
+  suggestedFunderAddress?: string | null
+  funderMismatch?: boolean
+  signatureType?: number
   usdcBalance?: number
   openOrderCount?: number
+  walletSetupIssue?: string | null
   error?: string
   message?: string
 }
