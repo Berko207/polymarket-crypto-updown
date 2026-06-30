@@ -1,6 +1,6 @@
-import { useState } from 'react'
+import { useState, useCallback } from 'react'
 import { toast } from 'sonner'
-import { MIN_BUY_USD } from '@/lib/api'
+import { MIN_BUY_USD, warmTradingPath } from '@/lib/api'
 import { formatPercent } from '@/lib/polymarket'
 import { rememberMarketTokens } from '@/lib/tokenLabels'
 import { cn } from '@/lib/utils'
@@ -34,6 +34,14 @@ export function TradePanel({
   const [size, setSize] = useState(1)
   const [placing, setPlacing] = useState<OutcomeSide | null>(null)
 
+  const prefetch = useCallback(
+    (outcome: OutcomeSide) => {
+      const tokenId = outcome === 'up' ? market.upTokenId : market.downTokenId
+      if (tokenId) void warmTradingPath([tokenId])
+    },
+    [market.upTokenId, market.downTokenId],
+  )
+
   const refPrice = buyPrice(market, 'up') || market.upPrice || 0.5
 
   const orderUsd = (outcome: OutcomeSide): number => {
@@ -65,6 +73,7 @@ export function TradePanel({
       await actions.buy({
         tokenId,
         amountUsd: orderUsd(outcome),
+        price: ask,
         label,
       })
     } catch {
@@ -118,8 +127,10 @@ export function TradePanel({
           <button
             key={outcome}
             type="button"
+            onPointerEnter={() => prefetch(outcome)}
+            onPointerDown={() => prefetch(outcome)}
             onClick={() => void buy(outcome)}
-            disabled={!market.isLive || placing !== null || disabled}
+            disabled={!market.isLive || placing === outcome || disabled}
             className={cn(
               'flex flex-col items-center gap-1 rounded-xl border px-3 py-4 transition active:scale-[0.98] disabled:opacity-55',
               outcome === 'up'

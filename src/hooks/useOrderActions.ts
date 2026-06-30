@@ -19,7 +19,7 @@ export function useOrderActions() {
   const place = usePlaceOrder()
   const cancelMut = useCancelOrder()
 
-  const buy = async (opts: { tokenId: string; amountUsd: number; label: string }) => {
+  const buy = async (opts: { tokenId: string; amountUsd: number; label: string; price?: number }) => {
     const id = toast.loading(`Buying ${opts.label}…`)
     try {
       const result = await place.mutateAsync({
@@ -27,6 +27,7 @@ export function useOrderActions() {
         side: 'BUY',
         orderType: 'market',
         amount: opts.amountUsd,
+        price: opts.price,
       })
       const status = (result.status ?? '').toLowerCase()
       if (status === 'unmatched') {

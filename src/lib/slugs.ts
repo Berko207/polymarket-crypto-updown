@@ -94,6 +94,24 @@ function addDaysEt(base: Date, days: number): Date {
   return new Date(base.getTime() + days * 86_400_000)
 }
 
+/** Infer market timeframe from a Polymarket event slug. */
+export function timeframeFromEventSlug(slug: string): TimeframeId | null {
+  if (!slug) return null
+  const lower = slug.toLowerCase()
+
+  const rolling = lower.match(/-updown-(5m|15m|4h)-\d+/)
+  if (rolling) return rolling[1] as TimeframeId
+
+  if (lower.includes('up-or-down-5m') || lower.includes('updown-5m')) return '5m'
+  if (lower.includes('up-or-down-15m') || lower.includes('updown-15m')) return '15m'
+  if (lower.includes('up-or-down-4h') || lower.includes('updown-4h')) return '4h'
+  if (lower.includes('up-or-down-on-')) return 'daily'
+  if (lower.includes('up-or-down-hourly')) return '1h'
+  if (/up-or-down-[a-z]+-\d+-\d+-\d+(am|pm)-et/.test(lower)) return '1h'
+
+  return null
+}
+
 /** Candidate event slugs to try, most likely first. */
 export function buildEventSlugCandidates(coin: CoinId, timeframe: TimeframeId): string[] {
   const now = new Date()

@@ -1,7 +1,16 @@
-import { getCoin, getTimeframe } from './config'
+import { getCoin, getTimeframe, TIMEFRAMES } from './config'
+import { timeframeFromEventSlug } from './slugs'
 import type { OpenOrder, Position } from './api'
-import type { ParsedMarket } from './types'
+import type { ParsedMarket, TimeframeId } from './types'
 import { getTokenMarketLabel } from './tokenLabels'
+
+export interface MarketLabelParts {
+  timeframe: TimeframeId | null
+  timeframeLabel: string | null
+  asset: string
+  window: string
+  short: string
+}
 
 /** Window text after "Coin Up or Down - " in a Polymarket title. */
 export function marketWindowLabel(title: string): string {
@@ -19,19 +28,70 @@ export function formatMarketHeading(market: ParsedMarket): { title: string; subt
   }
 }
 
-export function formatPositionLabel(position: Position): {
-  asset: string
-  window: string
-  short: string
-} {
-  const title = position.title.trim()
-  const dash = title.indexOf(' - ')
-  if (dash < 0) {
-    return { asset: title, window: '', short: title }
+function timeframeFromDisplayLabel(label: string): TimeframeId | null {
+  const normalized = label.trim().toLowerCase()
+  for (const tf of TIMEFRAMES) {
+    if (normalized === tf.label.toLowerCase() || normalized === tf.shortLabel.toLowerCase()) {
+      return tf.id
+    }
   }
-  const asset = title.slice(0, dash).trim()
-  const window = title.slice(dash + 3).trim()
-  return { asset, window, short: window ? `${asset} · ${window}` : asset }
+  return null
+}
+
+/** Parse a stored token subtitle ("15 Min · June 30, 2:00PM-2:15PM ET"). */
+function parseStoredTokenLabel(stored: string): { timeframe: TimeframeId | null; window: string } {
+  const sep = stored.indexOf(' · ')
+  if (sep < 0) return { timeframe: null, window: stored.trim() }
+  const head = stored.slice(0, sep).trim()
+  const window = stored.slice(sep + 3).trim()
+  return { timeframe: timeframeFromDisplayLabel(head), window }
+}
+
+function parseTitle(title: string): { asset: string; window: string } {
+  const trimmed = title.trim()
+  const dash = trimmed.indexOf(' - ')
+  if (dash < 0) return { asset: trimmed, window: '' }
+  return {
+    asset: trimmed.slice(0, dash).trim(),
+    window: trimmed.slice(dash + 3).trim(),
+  }
+}
+
+export function formatPositionLabel(position: Position): MarketLabelParts {
+  const stored = getTokenMarketLabel(position.tokenId)
+  const storedParts = stored ? parseStoredTokenLabel(stored) : null
+
+  let timeframe = timeframeFromEventSlug(position.eventSlug)
+  if (!timeframe && storedParts?.timeframe) timeframe = storedParts.timeframe
+
+  let { asset, window } =
+    position.title.trim() && position.title.trim() !== 'This market'
+      ? parseTitle(position.title)
+      : { asset: '', window: '' }
+
+  if (!window && storedParts?.window) window = storedParts.window
+
+  const tfConfig = timeframe ? getTimeframe(timeframe) : null
+  const timeframeLabel =
+    tfConfig?.shortLabel ?? (stored ? stored.split(' · ')[0]?.trim() : null) ?? null
+
+  const shortParts = [timeframeLabel, asset, window].filter(Boolean)
+  const short =
+    shortParts.length >= 2
+      ? `${shortParts[0]} · ${shortParts.slice(1).join(' · ')}`
+      : shortParts[0] ?? 'Position'
+
+  return { timeframe, timeframeLabel, asset, window, short }
+}
+
+/** Group header for paired Up/Down legs in the same market window. */
+export function formatMarketGroupLabel(positions: Position[]): string {
+  if (positions.length === 0) return 'Market'
+  const primary = formatPositionLabel(positions[0])
+  if (primary.timeframeLabel && primary.window) {
+    return `${primary.timeframeLabel} · ${primary.window}`
+  }
+  return primary.short
 }
 
 export function coinSymbolFromPosition(position: Position): string {
@@ -49,28 +109,33 @@ export function coinSymbolFromPosition(position: Position): string {
   return known[word] ?? word.slice(0, 4).toUpperCase()
 }
 
-/** Label for an open order (uses position title or remembered market window). */
+/** Label for an open order (uses position title, event slug, or remembered market window). */
 export function formatOrderLabel(
   order: OpenOrder,
   positions: Position[],
-): { asset: string; window: string; short: string } {
+): MarketLabelParts {
   const position = positions.find((p) => p.tokenId === order.assetId)
   if (position) return formatPositionLabel(position)
 
   const stored = getTokenMarketLabel(order.assetId)
   if (stored) {
-    const dash = stored.indexOf(' · ')
-    if (dash >= 0) {
-      return {
-        asset: stored.slice(0, dash).trim(),
-        window: stored.slice(dash + 3).trim(),
-        short: stored,
-      }
+    const storedParts = parseStoredTokenLabel(stored)
+    const timeframeLabel = storedParts.timeframe
+      ? getTimeframe(storedParts.timeframe).shortLabel
+      : stored.split(' · ')[0]?.trim() ?? null
+    const short = stored
+    return {
+      timeframe: storedParts.timeframe,
+      timeframeLabel,
+      asset: 'Crypto Up/Down',
+      window: storedParts.window,
+      short,
     }
-    return { asset: 'Crypto Up/Down', window: stored, short: stored }
   }
 
   return {
+    timeframe: null,
+    timeframeLabel: null,
     asset: 'Crypto Up/Down',
     window: `${order.side} ${order.outcome}`,
     short: `${order.side} ${order.outcome}`,
@@ -83,17 +148,9 @@ export function coinSymbolFromOrder(order: OpenOrder, positions: Position[]): st
   const stored = getTokenMarketLabel(order.assetId)
   if (stored) {
     const first = stored.split(' · ')[0]?.trim() ?? ''
-    if (first) {
-      const word = first.split(/\s+/)[0]?.toLowerCase() ?? ''
-      const known: Record<string, string> = {
-        bitcoin: 'BTC',
-        btc: 'BTC',
-        ethereum: 'ETH',
-        eth: 'ETH',
-        solana: 'SOL',
-        sol: 'SOL',
-      }
-      if (known[word]) return known[word]
+    const tf = timeframeFromDisplayLabel(first)
+    if (tf) {
+      // Stored label is "15 Min · …" — coin isn't in the stored string; fall through.
     }
   }
   return order.outcome.slice(0, 3).toUpperCase()
