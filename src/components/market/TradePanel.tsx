@@ -26,18 +26,32 @@ export function TradePanel({
   coinSymbol,
   subtitle,
   disabled = false,
+  quotesLive = false,
 }: {
   market: ParsedMarket
   coinSymbol: string
   subtitle: string
   usdcBalance?: number
   disabled?: boolean
+  /** True when the CLOB socket is streaming this market — a null ask then means the book really is empty. */
+  quotesLive?: boolean
 }) {
   const actions = useOrderActions()
   const [sizeMode, setSizeMode] = useState<SizeMode>('usdc')
   const [usdcAmount, setUsdcAmount] = useState(1)
   const [size, setSize] = useState(1)
   const [placing, setPlacing] = useState<OutcomeSide | null>(null)
+  // Sides that just bounced off an empty/thin book ("no match" / unmatched). Cleared
+  // after a short cooldown — long enough to stop instant re-clicks, short enough to
+  // retry once makers re-quote.
+  const [thinBook, setThinBook] = useState<{ up: boolean; down: boolean }>({
+    up: false,
+    down: false,
+  })
+  const flagThinBook = (outcome: OutcomeSide) => {
+    setThinBook((s) => ({ ...s, [outcome]: true }))
+    setTimeout(() => setThinBook((s) => ({ ...s, [outcome]: false })), 8_000)
+  }
 
   const prefetch = useCallback(
     (outcome: OutcomeSide) => {
@@ -77,7 +91,7 @@ export function TradePanel({
     setPlacing(outcome)
     rememberMarketTokens(market.upTokenId, market.downTokenId, subtitle)
     try {
-      await actions.buy({
+      const result = await actions.buy({
         tokenId,
         amountUsd: orderUsd(outcome),
         price: ask,
@@ -93,8 +107,10 @@ export function TradePanel({
           downTokenId: market.downTokenId,
         },
       })
-    } catch {
-      // toast surfaced in useOrderActions
+      if ((result.status ?? '').toLowerCase() === 'unmatched') flagThinBook(outcome)
+    } catch (e) {
+      // Toast surfaced in useOrderActions; reflect empty-book rejections on the button.
+      if (e instanceof Error && /no match|liquidity/i.test(e.message)) flagThinBook(outcome)
     } finally {
       setPlacing(null)
     }
@@ -145,38 +161,47 @@ export function TradePanel({
       </p>
 
       <div className="grid grid-cols-2 gap-2.5">
-        {(['up', 'down'] as const).map((outcome) => (
-          <button
-            key={outcome}
-            type="button"
-            onPointerEnter={() => prefetch(outcome)}
-            onPointerDown={() => prefetch(outcome)}
-            onClick={() => void buy(outcome)}
-            disabled={!market.isLive || placing === outcome || disabled}
-            className={cn(
-              'flex flex-col items-center gap-1 rounded-xl border px-3 py-4 transition active:scale-[0.98] disabled:opacity-55',
-              outcome === 'up'
-                ? 'border-up/40 bg-up-soft text-up'
-                : 'border-down/40 bg-down-soft text-down',
-            )}
-          >
-            <span className="text-sm font-semibold opacity-90">
-              {placing === outcome ? 'Placing…' : `Buy ${outcome === 'up' ? 'Up' : 'Down'}`}
-            </span>
-            <span className="text-2xl font-extrabold leading-none tabular-nums">
-              {formatPercent(outcome === 'up' ? market.upPrice : market.downPrice)}
-            </span>
-            {(() => {
-              const bid = outcome === 'up' ? market.bestBidUp : market.bestBidDown
-              const ask = outcome === 'up' ? market.bestAskUp : market.bestAskDown
-              return bid != null && ask != null ? (
+        {(['up', 'down'] as const).map((outcome) => {
+          const bid = outcome === 'up' ? market.bestBidUp : market.bestBidDown
+          const ask = outcome === 'up' ? market.bestAskUp : market.bestAskDown
+          // Only trust "no ask" as "book empty" while the socket is streaming — REST
+          // never fills the Down book, so a null ask in saver mode proves nothing.
+          const bookEmpty = quotesLive && ask == null
+          const blocked = bookEmpty || thinBook[outcome]
+          return (
+            <button
+              key={outcome}
+              type="button"
+              onPointerEnter={() => prefetch(outcome)}
+              onPointerDown={() => prefetch(outcome)}
+              onClick={() => void buy(outcome)}
+              disabled={!market.isLive || placing === outcome || disabled || blocked}
+              className={cn(
+                'flex flex-col items-center gap-1 rounded-xl border px-3 py-4 transition active:scale-[0.98] disabled:opacity-55',
+                outcome === 'up'
+                  ? 'border-up/40 bg-up-soft text-up'
+                  : 'border-down/40 bg-down-soft text-down',
+                blocked && 'border-amber-500/50',
+              )}
+            >
+              <span className="text-sm font-semibold opacity-90">
+                {placing === outcome ? 'Placing…' : `Buy ${outcome === 'up' ? 'Up' : 'Down'}`}
+              </span>
+              <span className="text-2xl font-extrabold leading-none tabular-nums">
+                {formatPercent(outcome === 'up' ? market.upPrice : market.downPrice)}
+              </span>
+              {blocked ? (
+                <span className="text-[0.65rem] font-medium text-amber-400">
+                  {thinBook[outcome] ? 'No liquidity — retrying soon' : 'No asks — book empty'}
+                </span>
+              ) : bid != null && ask != null ? (
                 <span className="text-[0.65rem] tabular-nums opacity-70">
                   {formatPercent(bid)} – {formatPercent(ask)}
                 </span>
-              ) : null
-            })()}
-          </button>
-        ))}
+              ) : null}
+            </button>
+          )
+        })}
       </div>
     </div>
   )
