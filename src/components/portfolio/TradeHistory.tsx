@@ -133,7 +133,11 @@ export function TradeHistory({ enabled }: { enabled: boolean }) {
         {isFetchingNextPage ? (
           <span className="text-[0.65rem] text-muted-foreground">Loading more…</span>
         ) : !hasNextPage ? (
-          <span className="text-[0.65rem] text-muted-foreground/70">End of history</span>
+          <span className="text-[0.65rem] text-muted-foreground/70">
+            {query.data?.pages.at(-1)?.capReached
+              ? 'Older fills exist, but the Data API stops here.'
+              : 'End of history'}
+          </span>
         ) : null}
       </div>
     </div>
