@@ -75,8 +75,12 @@ export function PositionRow({
   const { short, timeframeLabel, asset, window } = formatPositionLabel(position)
   const detail = [asset, window].filter(Boolean).join(' · ') || short
   const side = outcomeSide(position.outcome)
-  const bid = quote?.bestBid ?? null
   const live = livePositionMark(position, quote)
+  // Sell mark is the best available price (live bid → mid/last → polled snapshot), not
+  // just the WS bid: it's only a server hint (the book is walked anyway), so gating the
+  // Sell button on a live bid needlessly blocks selling in saver mode / before first quote.
+  const sellMark = live
+  const proceeds = sellMark != null ? position.size * sellMark : null
   const avgPrice =
     position.avgPrice > 0
       ? position.avgPrice
@@ -112,10 +116,16 @@ export function PositionRow({
           size="xs"
           variant="ghost"
           className={cn('h-6 px-2', side === 'up' ? 'text-up' : 'text-down')}
-          disabled={selling || bid == null || position.redeemable || position.size < MIN_POSITION_SIZE}
-          onClick={() => bid != null && onSell(position, bid)}
+          disabled={selling || sellMark == null || position.redeemable || position.size < MIN_POSITION_SIZE}
+          onClick={() => sellMark != null && onSell(position, sellMark)}
         >
-          {selling ? 'Selling…' : position.redeemable ? 'Resolved' : 'Sell'}
+          {selling
+            ? 'Selling…'
+            : position.redeemable
+              ? 'Resolved'
+              : proceeds != null
+                ? `Sell ≈$${proceeds.toFixed(2)}`
+                : 'Sell'}
         </Button>
       </div>
     </li>

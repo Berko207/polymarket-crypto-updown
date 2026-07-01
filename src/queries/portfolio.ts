@@ -1,9 +1,16 @@
 import { useMemo } from 'react'
-import { useMutation, useQueries, useQuery, useQueryClient } from '@tanstack/react-query'
+import {
+  useInfiniteQuery,
+  useMutation,
+  useQueries,
+  useQuery,
+  useQueryClient,
+} from '@tanstack/react-query'
 import {
   cancelOrder,
   fetchOpenOrders,
   fetchPositions,
+  fetchTradeHistory,
   placeOrder,
   type PlaceOrderRequest,
   type PlaceOrderResponse,
@@ -131,6 +138,54 @@ export function usePositionsQuery(enabled: boolean) {
 }
 
 /**
+ * Resolved crypto up/down positions that still hold redeemable VALUE (winning legs) —
+ * the actual "to redeem" backlog. Losing legs resolve to $0 (curPrice/currentValue 0)
+ * and are just dead dust, so they're excluded rather than cluttering the panel.
+ */
+export function filterResolvedPositions(rows: Position[]): Position[] {
+  return rows.filter(
+    (p) =>
+      isCryptoUpDown(p) &&
+      p.redeemable &&
+      p.size >= MIN_POSITION_SIZE &&
+      (p.currentValue ?? 0) > 0.01,
+  )
+}
+
+/**
+ * Resolved holdings the operator can still redeem. Shares the same fetch/cache as
+ * {@link usePositionsQuery} (same query key) — only the `select` differs, so this adds
+ * no extra network. Kept out of the open-positions merge pipeline on purpose.
+ */
+export function useResolvedPositionsQuery(enabled: boolean) {
+  return useQuery({
+    queryKey: qk.positions,
+    queryFn: () => fetchPositions(),
+    enabled,
+    refetchInterval: PORTFOLIO_POLL_MS,
+    select: filterResolvedPositions,
+  })
+}
+
+const TRADE_HISTORY_PAGE_SIZE = 40
+
+/**
+ * Filled-order ledger (Data-API trades), offset-paged for infinite scroll. Not
+ * interval-polled — refetching would replay every loaded page; instead fills
+ * invalidate it (see usePlaceOrder) and focus/remount refresh page one.
+ */
+export function useTradeHistoryQuery(enabled: boolean) {
+  return useInfiniteQuery({
+    queryKey: qk.tradeHistory,
+    queryFn: ({ pageParam }) => fetchTradeHistory(pageParam, TRADE_HISTORY_PAGE_SIZE),
+    initialPageParam: 0,
+    getNextPageParam: (last) => last.nextOffset,
+    enabled,
+    staleTime: 15_000,
+  })
+}
+
+/**
  * Overlay the focused market's instant on-chain holdings onto the Data-API global
  * list so a fill shows immediately, before the Data API indexes it.
  *
@@ -150,7 +205,7 @@ export function mergeInstantHoldings(
   const globalByToken = new Map(global.map((p) => [p.tokenId, p]))
   const byToken = new Map(
     global
-      .filter((p) => !authoritative.has(p.tokenId))
+      .filter((p) => !authoritative.has(p.tokenId) && !isRecentlySold(p.tokenId))
       .map((p) => [p.tokenId, enrichFromMeta(p, marketMetaByToken?.get(p.tokenId))]),
   )
   for (const raw of instant) {
@@ -427,9 +482,11 @@ function rollbackFillOptimistic(
 /** True when a market sell fully closed the position (not unmatched / partial zero-fill). */
 function isFullSellFill(body: PlaceOrderRequest, fill: ResolvedFill, filled: boolean): boolean {
   if (body.side !== 'SELL' || !filled) return false
-  const sold = fill.size
-  const held = body.size ?? sold
-  return sold >= held - 1e-6
+  const held = body.size ?? fill.size
+  if (!(held > 0)) return false
+  const sold = fill.size > 0 ? fill.size : held
+  const remaining = held - sold
+  return remaining < MIN_POSITION_SIZE
 }
 
 /** Place a market/limit BUY or SELL; refresh orders + positions + account on success. */
@@ -460,19 +517,29 @@ export function usePlaceOrder() {
           rememberRecentSell(body.tokenId)
           patchMarketHoldingsCache(qc, body.tokenId, body.side, fill, body.fillMeta)
           patchGlobalPositionsCache(qc, body.tokenId, body.side, fill, body.fillMeta)
-        } else {
+        } else if (body.side === 'SELL') {
           // Partial sell — show reduced size, don't hide the row.
           clearRecentSell(body.tokenId)
           if (snapshot) rollbackFillOptimistic(qc, snapshot, body)
           patchMarketHoldingsCache(qc, body.tokenId, 'SELL', fill, body.fillMeta)
           patchGlobalPositionsCache(qc, body.tokenId, 'SELL', fill, body.fillMeta)
         }
+      } else if (body.side === 'SELL' && filled) {
+        // Defensive only — sells always carry a size, so `fill` can't resolve null.
+        // If it ever does, hide the row (portfolio sells are full-close intents);
+        // don't patch caches with a fabricated fill.
+        rememberRecentSell(body.tokenId)
       }
 
       void qc.invalidateQueries({ queryKey: qk.orders, refetchType: 'none' })
       void qc.invalidateQueries({ queryKey: qk.positions, refetchType: 'none' })
       void qc.invalidateQueries({ queryKey: ['positions', 'market'], refetchType: 'none' })
       void qc.invalidateQueries({ queryKey: qk.account, refetchType: 'none' })
+      if (filled) {
+        // Once, after Data-API trade indexing lag — not in the refetch burst, which
+        // would replay every loaded history page seven times.
+        setTimeout(() => void qc.invalidateQueries({ queryKey: qk.tradeHistory }), 2_500)
+      }
       schedulePortfolioRefetches(qc)
     },
     onError: (_error, body, snapshot) => {

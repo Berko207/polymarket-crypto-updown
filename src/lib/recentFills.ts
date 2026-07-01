@@ -2,6 +2,10 @@ import type { Position } from './api'
 import type { TimeframeId } from './types'
 
 const FILL_TTL_MS = 5 * 60_000
+// Sold-hides must outlive Data-API indexing lag (stale rows would resurrect the sold
+// position) but not the whole session — a token re-bought outside the app was
+// invisible until page reload when this was a plain Set.
+const SOLD_TTL_MS = 5 * 60_000
 const MIN_SIZE = 0.01
 
 export interface RecentFillMeta {
@@ -21,7 +25,7 @@ interface RecentFillEntry {
 }
 
 const fills = new Map<string, RecentFillEntry>()
-const soldTokens = new Set<string>()
+const soldTokens = new Map<string, number>()
 let version = 0
 const listeners = new Set<() => void>()
 
@@ -65,12 +69,19 @@ export function rememberRecentFill(
 export function rememberRecentSell(tokenId: string): void {
   if (!tokenId) return
   fills.delete(tokenId)
-  soldTokens.add(tokenId)
+  soldTokens.set(tokenId, Date.now())
   bump()
 }
 
 export function isRecentlySold(tokenId: string): boolean {
-  return soldTokens.has(tokenId)
+  const at = soldTokens.get(tokenId)
+  if (at == null) return false
+  if (Date.now() - at > SOLD_TTL_MS) {
+    // Lazy expiry, no bump — callers run per render, so the change is already visible.
+    soldTokens.delete(tokenId)
+    return false
+  }
+  return true
 }
 
 export function hasRecentFill(tokenId: string): boolean {
@@ -85,16 +96,6 @@ export function clearRecentFill(tokenId: string): void {
 export function clearRecentSell(tokenId: string): void {
   if (!soldTokens.delete(tokenId)) return
   bump()
-}
-
-/** Drop sold-hide once authoritative on-chain holdings confirm zero balance. */
-export function reconcileSoldHides(instant: Position[], authoritativeTokenIds: string[]): void {
-  const held = new Set(instant.map((p) => p.tokenId))
-  let changed = false
-  for (const tokenId of authoritativeTokenIds) {
-    if (!held.has(tokenId) && soldTokens.delete(tokenId)) changed = true
-  }
-  if (changed) bump()
 }
 
 export function recentFillPrice(tokenId: string): number | undefined {

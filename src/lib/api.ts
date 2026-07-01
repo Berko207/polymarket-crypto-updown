@@ -114,6 +114,36 @@ export async function fetchPositions(options?: {
   return data.positions
 }
 
+export interface TradeFill {
+  id: string
+  tokenId: string
+  side: 'BUY' | 'SELL'
+  outcome: string
+  size: number
+  price: number
+  /** Unix seconds. */
+  timestamp: number
+  title: string
+  eventSlug: string
+  transactionHash: string
+}
+
+export interface TradeHistoryPage {
+  trades: TradeFill[]
+  /** Offset of the next page, or null when this page was the last. */
+  nextOffset: number | null
+}
+
+export async function fetchTradeHistory(offset: number, limit = 40): Promise<TradeHistoryPage> {
+  const params = new URLSearchParams({ offset: String(offset), limit: String(limit) })
+  const res = await authFetch(`/api/trade-history?${params}`)
+  if (!res.ok) {
+    const data = (await res.json().catch(() => ({}))) as { error?: string }
+    throw new Error(data.error ?? `Trade history failed (${res.status})`)
+  }
+  return res.json() as Promise<TradeHistoryPage>
+}
+
 export async function cancelOrder(orderId: string): Promise<void> {
   const res = await authFetch(`/api/open-orders?orderId=${encodeURIComponent(orderId)}`, {
     method: 'DELETE',

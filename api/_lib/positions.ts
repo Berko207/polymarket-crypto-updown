@@ -4,6 +4,12 @@ import { getClobClient } from './clob.js'
 
 const DATA_API = 'https://data-api.polymarket.com/positions'
 
+// The Data API sorts by size descending and caps a page, so a heavy account's small
+// recent up/down positions live on later pages. Page through them all instead of
+// silently truncating at the first page (which hid ~1/3 of this app's positions).
+const PAGE_LIMIT = 500
+const MAX_PAGES = 8
+
 export interface PositionView {
   tokenId: string
   outcome: string
@@ -72,6 +78,49 @@ export async function fetchTokenBalance(tokenId: string): Promise<number> {
   return Number(res.balance) / 1e6
 }
 
+async function fetchDataApiPage(user: string, offset: number): Promise<DataApiPosition[]> {
+  const url = `${DATA_API}?user=${encodeURIComponent(user)}&sizeThreshold=0.01&limit=${PAGE_LIMIT}&offset=${offset}`
+  const res = await fetch(url)
+  if (!res.ok) {
+    throw new Error(`Could not load positions (${res.status})`)
+  }
+  const rows = (await res.json()) as unknown
+  return Array.isArray(rows) ? (rows as DataApiPosition[]) : []
+}
+
+// One shared account scan per short window: the per-market instant-holdings pollers
+// (~1.5s cadence, one per watchlist market) and the global positions poll all funnel
+// through fetchPositions, and a scan can span several sequential Data-API pages.
+// Reuse the in-flight/recent scan instead of re-walking per request. Raw rows are
+// cached (not normalized objects) because fetchMarketHoldings mutates its results.
+// Per-instance and best-effort, like the rate limiter.
+const SCAN_TTL_MS = 1_500
+let scanCache: { user: string; promise: Promise<DataApiPosition[]>; expiresAt: number } | null =
+  null
+
+function fetchAccountScan(user: string): Promise<DataApiPosition[]> {
+  const now = Date.now()
+  if (scanCache && scanCache.user === user && scanCache.expiresAt > now) {
+    return scanCache.promise
+  }
+
+  const promise = (async () => {
+    const raw: DataApiPosition[] = []
+    for (let page = 0; page < MAX_PAGES; page += 1) {
+      const rows = await fetchDataApiPage(user, page * PAGE_LIMIT)
+      raw.push(...rows)
+      if (rows.length < PAGE_LIMIT) break
+    }
+    return raw
+  })()
+
+  scanCache = { user, promise, expiresAt: now + SCAN_TTL_MS }
+  promise.catch(() => {
+    if (scanCache?.promise === promise) scanCache = null
+  })
+  return promise
+}
+
 export async function fetchPositions(tokenIds?: string[]): Promise<PositionView[]> {
   const config = getPolyConfig()
   if (!config) {
@@ -79,17 +128,17 @@ export async function fetchPositions(tokenIds?: string[]): Promise<PositionView[
   }
 
   const filter = tokenIds?.filter(Boolean)
-  const url = `${DATA_API}?user=${encodeURIComponent(config.funderAddress)}&sizeThreshold=0.01&limit=200`
 
-  const res = await fetch(url)
-  if (!res.ok) {
-    throw new Error(`Could not load positions (${res.status})`)
+  const raw = await fetchAccountScan(config.funderAddress)
+
+  // Offset pages of a size-sorted, live-mutating list can return the same position
+  // on two pages — dedupe by token (last occurrence wins; it's the fresher fetch).
+  const byToken = new Map<string, PositionView>()
+  for (const row of raw) {
+    const p = normalize(row)
+    if (p) byToken.set(p.tokenId, p)
   }
-
-  const rows = (await res.json()) as DataApiPosition[]
-  if (!Array.isArray(rows)) return []
-
-  const positions = rows.map(normalize).filter((p): p is PositionView => p != null)
+  const positions = [...byToken.values()]
 
   if (!filter?.length) return positions
 
