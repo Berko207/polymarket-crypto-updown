@@ -125,6 +125,7 @@ export function MarketDetail({
             market={market}
             coinSymbol={coinMeta.symbol}
             subtitle={heading.subtitle}
+            quotesLive={connected}
           />
         ) : (
           <div className="grid grid-cols-2 gap-2.5">

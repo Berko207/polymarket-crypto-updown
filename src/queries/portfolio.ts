@@ -479,14 +479,19 @@ function rollbackFillOptimistic(
   }
 }
 
-/** True when a market sell fully closed the position (not unmatched / partial zero-fill). */
+/** True when a sell fully closed the position (not unmatched / partial zero-fill). */
 function isFullSellFill(body: PlaceOrderRequest, fill: ResolvedFill, filled: boolean): boolean {
   if (body.side !== 'SELL' || !filled) return false
+  // Portfolio market sells are always full-close intents, and FAK fill sizes come
+  // back rounded (e.g. "sold 3.22" of 3.23 held), so size arithmetic misreads a full
+  // close as partial — clearing the sold-hide and resurrecting the row with a phantom
+  // unrealized P&L. Never trust fill size for market sells; any fill hides the row.
+  if (body.orderType !== 'limit') return true
   const held = body.size ?? fill.size
   if (!(held > 0)) return false
   const sold = fill.size > 0 ? fill.size : held
-  const remaining = held - sold
-  return remaining < MIN_POSITION_SIZE
+  // Float-noise guard: 3.23 - 3.22 is 0.010000000000000231, not 0.01.
+  return held - sold < MIN_POSITION_SIZE + 1e-6
 }
 
 /** Place a market/limit BUY or SELL; refresh orders + positions + account on success. */
