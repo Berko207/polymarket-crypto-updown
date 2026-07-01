@@ -30,6 +30,7 @@ import {
   summarizePair,
 } from '@/lib/sellPriority'
 import { cn } from '@/lib/utils'
+import { ExportHistoryButton } from './ExportHistoryButton'
 import { OrderRow } from './OrderRow'
 import { PositionRow } from './PositionRow'
 import { TradeHistory } from './TradeHistory'
@@ -215,7 +216,13 @@ export function PortfolioPanel({
           )}
         </TabsContent>
 
-        <TabsContent value="history">
+        <TabsContent value="history" className="flex flex-col gap-2">
+          <div className="flex items-center justify-between gap-2 px-1">
+            <span className="text-[0.65rem] text-muted-foreground">
+              Filled orders, newest first.
+            </span>
+            <ExportHistoryButton />
+          </div>
           <TradeHistory enabled={enabled} />
         </TabsContent>
       </Tabs>
