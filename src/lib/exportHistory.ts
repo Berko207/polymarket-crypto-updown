@@ -2,21 +2,23 @@ import { fetchTradeHistory, type Position, type TradeFill } from './api'
 import { coinSymbolFromTitle, marketWindowLabel } from './marketLabels'
 import { timeframeFromEventSlug } from './slugs'
 
-/** Deepest page the server allows (`/api/trade-history` clamps offsets to 10k). */
-const MAX_OFFSET = 10_000
-const PAGE_SIZE = 100
+/** Data API hard cap — offsets past 3000 are rejected upstream. */
+const MAX_OFFSET = 3_000
+/** Data API max page; bigger pages also reach deeper (the cap is on offset, not depth). */
+const PAGE_SIZE = 1_000
 /** Matches the Data-API dust threshold used by the portfolio views. */
 const DUST_SIZE = 0.01
 
 export interface FullTradeHistory {
   fills: TradeFill[]
-  /** True when the server's offset cap stopped pagination before the real end. */
+  /** True when the Data API's offset cap stopped pagination before the real end. */
   truncated: boolean
 }
 
 /**
- * Page through the whole filled-order ledger. ~100 requests worst case (10k fills
- * at 100/page), which stays under the endpoint's 120/min rate limit.
+ * Page through the whole filled-order ledger — 4 requests worst case (offsets
+ * 0/1k/2k/3k at 1000/page), reaching the ~4,000 most recent fills the Data API
+ * can serve at all.
  */
 export async function fetchAllTradeHistory(
   onProgress?: (count: number) => void,
@@ -25,7 +27,7 @@ export async function fetchAllTradeHistory(
   let offset: number | null = 0
   let truncated = false
   while (offset != null) {
-    // Past the server clamp every request re-reads the same page — stop, don't loop.
+    // Past the upstream cap every request would 400 — stop, don't loop.
     if (offset > MAX_OFFSET) {
       truncated = true
       break
@@ -33,6 +35,7 @@ export async function fetchAllTradeHistory(
     const page = await fetchTradeHistory(offset, PAGE_SIZE)
     fills.push(...page.trades)
     onProgress?.(fills.length)
+    if (page.capReached) truncated = true
     offset = page.nextOffset
   }
   return { fills, truncated }
