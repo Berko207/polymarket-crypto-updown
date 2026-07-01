@@ -54,6 +54,7 @@ export interface GammaEvent {
   volume?: number
   liquidity?: number
   volume24hr?: number
+  eventMetadata?: { priceToBeat?: number }
   markets?: GammaMarket[]
 }
 
@@ -93,4 +94,6 @@ export interface ParsedMarket {
   isLive: boolean
   /** Price measurement window is currently active */
   inWindow: boolean
+  /** Strike from gamma eventMetadata — authoritative when present. */
+  priceToBeat: number | null
 }

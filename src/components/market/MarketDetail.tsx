@@ -12,7 +12,11 @@ import { Button } from '@/components/ui/button'
 import { CoinBadge } from '@/components/common/CoinBadge'
 import { CountdownClock } from './CountdownClock'
 import { OddsGauge } from './OddsGauge'
+import { SpotPriceBar } from './SpotPriceBar'
 import { TradePanel } from './TradePanel'
+import { ProbabilityBar } from '@/components/common/ProbabilityBar'
+import { spotOddsDiverge, useMarketSpot } from '@/hooks/useMarketSpot'
+import { timeframeFromEventSlug } from '@/lib/slugs'
 import { getCoin } from '@/lib/config'
 import type { CoinId, ParsedMarket, TimeframeId } from '@/lib/types'
 
@@ -26,6 +30,7 @@ export function MarketDetail({
   canTrade: boolean
 }) {
   const { market, isLoading, isError, error, rolling } = useLiveMarket(coin, timeframe)
+  const spot = useMarketSpot(market, coin, timeframe)
   const subtitle = market ? formatMarketHeading(market).subtitle : ''
 
   useEffect(() => {
@@ -38,6 +43,9 @@ export function MarketDetail({
   )
 
   if (isLoading && !market) return <DetailSkeleton />
+  if (market && timeframeFromEventSlug(market.eventSlug) !== timeframe) {
+    return <DetailSkeleton />
+  }
   if (isError && !market) {
     return (
       <Card>
@@ -59,7 +67,8 @@ export function MarketDetail({
 
   const heading = formatMarketHeading(market)
   const coinMeta = getCoin(market.coin)
-  const upPct = Math.round(market.upPrice * 100)
+  const oddsLagSpot = spotOddsDiverge(spot, market.upPrice)
+  const spotFavorsUp = spot.delta != null && spot.delta >= 0
 
   return (
     <Card>
@@ -85,15 +94,24 @@ export function MarketDetail({
           </div>
         </header>
 
+        <SpotPriceBar key={market.eventSlug} market={market} spot={spot} />
+
+        {oddsLagSpot && (
+          <p className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-center text-xs text-amber-200">
+            Order-book odds may lag — resolution price currently favors{' '}
+            <span className="font-semibold">{spotFavorsUp ? 'Up' : 'Down'}</span>.
+          </p>
+        )}
+
         <div className="flex flex-col items-center gap-5 sm:flex-row sm:justify-center sm:gap-10">
-          <OddsGauge value={market.upPrice} size={150} />
+          <OddsGauge value={market.upPrice} size={150} label="Market Up" />
           <div className="grid w-full max-w-xs grid-cols-2 gap-2 sm:w-52">
             <OutcomeStat label="Up" price={market.upPrice} side="up" />
             <OutcomeStat label="Down" price={market.downPrice} side="down" />
           </div>
         </div>
 
-        <ProbabilityBar upPct={upPct} />
+        <ProbabilityBar upPrice={market.upPrice} />
 
         {canTrade ? (
           <TradePanel
@@ -170,16 +188,6 @@ function OutcomeLink({ market, side }: { market: ParsedMarket; side: 'up' | 'dow
         {formatPercent(side === 'up' ? market.upPrice : market.downPrice)}
       </span>
     </a>
-  )
-}
-
-function ProbabilityBar({ upPct }: { upPct: number }) {
-  const up = Math.min(100, Math.max(0, upPct))
-  return (
-    <div className="flex h-1.5 overflow-hidden rounded-full bg-border" aria-hidden="true">
-      <div className="bg-up transition-[width] duration-200" style={{ width: `${up}%` }} />
-      <div className="bg-down transition-[width] duration-200" style={{ width: `${100 - up}%` }} />
-    </div>
   )
 }
 

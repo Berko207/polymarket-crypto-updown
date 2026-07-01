@@ -12,14 +12,15 @@ A React 19 + Vite 8 single-page app that displays Polymarket "crypto up/down" ma
 
 ```bash
 pnpm install
-pnpm dev          # vite only — api/ functions DON'T run, so /api/* (incl. gamma proxy) 404s
-pnpm dev:local    # vercel dev — runs Vite + api/ functions locally, loads .env.local
+pnpm dev          # Vite + local API — loads .env.local, no Vercel CLI
+pnpm dev:vercel   # optional: vercel dev (parity with production routing)
+pnpm dev:vite     # vite only (no /api — mostly broken)
 pnpm build        # tsc -b && vite build -> dist/
 pnpm lint         # oxlint (not ESLint)
 pnpm preview      # preview the production build
 ```
 
-**Use `pnpm dev:local` for almost all work.** Plain `vite` is mostly non-functional because even public market data is fetched through the `/api/gamma` proxy. There is no test runner. `tsc -b` uses project references: `tsconfig.app.json` (browser `src`), `tsconfig.node.json` (vite config), and `api/tsconfig.json` (the only one with `strict: true`).
+**Use `pnpm dev` for local work.** It runs the browser (Vite) and the same `api/` handlers on your machine, reading secrets from `.env.local`. Credentials never enter the browser bundle. There is no test runner. `tsc -b` uses project references: `tsconfig.app.json` (browser `src`), `tsconfig.node.json` (vite config), and `api/tsconfig.json` (the only one with `strict: true`).
 
 ## Architecture
 

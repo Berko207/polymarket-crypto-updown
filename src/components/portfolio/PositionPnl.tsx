@@ -26,15 +26,16 @@ export function PositionPnl({
   }
 
   const positive = (stats.pnl ?? 0) >= 0
+  const showPnl = stats.costBasis != null && stats.costBasis > 0 && stats.pnl != null
   return (
-    <div className={cn('flex items-baseline justify-between gap-2', compact && 'text-sm')}>
+    <div className={cn('flex flex-col items-end gap-0.5', !compact && 'gap-1')}>
       <span className={cn('font-extrabold tabular-nums', compact ? 'text-sm' : 'text-base')}>
         ${stats.liveValue.toFixed(2)}
       </span>
-      {stats.pnl != null && (
-        <span className={cn('font-bold tabular-nums', positive ? 'text-up' : 'text-down')}>
-          {formatPnlUsd(stats.pnl)}
-          {stats.pnlPct != null && <span className="ml-1 opacity-90">{formatPnlPct(stats.pnlPct)}</span>}
+      {showPnl && (
+        <span className={cn('text-xs font-bold tabular-nums', positive ? 'text-up' : 'text-down')}>
+          {formatPnlUsd(stats.pnl!)}
+          {stats.pnlPct != null && <span className="ml-1.5 opacity-90">{formatPnlPct(stats.pnlPct)}</span>}
         </span>
       )}
     </div>

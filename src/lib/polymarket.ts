@@ -1,4 +1,4 @@
-import { buildEventSlugCandidates } from './slugs'
+import { buildEventSlugCandidates, timeframeFromEventSlug } from './slugs'
 import type {
   CoinId,
   GammaEvent,
@@ -33,17 +33,18 @@ function parseJsonArray<T>(value: string | undefined, fallback: T[]): T[] {
   }
 }
 
-/** Actual price window start — never use startDate (that's market creation time). */
+/** Actual price window start — never use gamma startDate (that's market creation time). */
 function getWindowStart(
   event: GammaEvent,
   market: GammaMarket | undefined,
   timeframe: TimeframeId,
 ): Date | null {
-  if (event.startTime) return new Date(event.startTime)
-  if (market?.eventStartTime) return new Date(market.eventStartTime)
-
   const slugMatch = event.slug.match(/-(\d{10})$/)
   if (slugMatch) return new Date(Number(slugMatch[1]) * 1000)
+
+  // Hourly/daily: per-market eventStartTime is the Chainlink window anchor.
+  if (market?.eventStartTime) return new Date(market.eventStartTime)
+  if (event.startTime) return new Date(event.startTime)
 
   if (event.endDate) {
     return new Date(new Date(event.endDate).getTime() - WINDOW_MS[timeframe])
@@ -55,6 +56,13 @@ function getWindowStart(
 function isInWindow(start: Date | null, end: Date, now: number): boolean {
   if (!start) return false
   return start.getTime() <= now && end.getTime() > now
+}
+
+function parsePriceToBeat(event: GammaEvent): number | null {
+  const raw = event.eventMetadata?.priceToBeat
+  if (raw == null) return null
+  const n = Number(raw)
+  return Number.isFinite(n) ? n : null
 }
 
 function isTradeable(
@@ -89,6 +97,8 @@ function parseMarket(
   const now = Date.now()
   const endDate = new Date(event.endDate)
   const windowStart = getWindowStart(event, market, timeframe)
+  const slugTf = timeframeFromEventSlug(event.slug)
+  const effectiveTf = slugTf ?? timeframe
   const inWindow = isInWindow(windowStart, endDate, now)
   const isLive = isTradeable(event, market, endDate, now)
 
@@ -96,7 +106,7 @@ function parseMarket(
     eventSlug: event.slug,
     title: event.title,
     coin,
-    timeframe,
+    timeframe: effectiveTf,
     upPrice,
     downPrice,
     volume: market.volumeNum ?? Number(market.volume) ?? event.volume ?? 0,
@@ -115,12 +125,8 @@ function parseMarket(
     tickSize: market.orderPriceMinTickSize ?? null,
     isLive,
     inWindow,
+    priceToBeat: parsePriceToBeat(event),
   }
-}
-
-function rankCandidate(a: ParsedMarket, b: ParsedMarket): number {
-  if (a.inWindow !== b.inWindow) return a.inWindow ? -1 : 1
-  return a.endDate.getTime() - b.endDate.getTime()
 }
 
 async function fetchMarketForSlug(
@@ -132,6 +138,10 @@ async function fetchMarketForSlug(
     const events = await fetchJson<GammaEvent[]>(`/events?slug=${slug}`)
     const event = events[0]
     if (!event?.markets?.[0] || event.closed) return null
+    if (event.slug !== slug) return null
+
+    const slugTf = timeframeFromEventSlug(event.slug)
+    if (slugTf != null && slugTf !== timeframe) return null
 
     const parsed = parseMarket(event, event.markets[0], coin, timeframe)
     return parsed.isLive ? parsed : null
@@ -150,14 +160,11 @@ async function fetchMarketBySlugs(
     candidates.map((slug) => fetchMarketForSlug(slug, coin, timeframe)),
   )
 
-  let best: ParsedMarket | null = null
   for (const parsed of results) {
-    if (!parsed) continue
-    if (parsed.inWindow) return parsed
-    if (!best || rankCandidate(parsed, best) < 0) best = parsed
+    if (parsed?.inWindow) return parsed
   }
 
-  return best
+  return null
 }
 
 export async function fetchCurrentMarket(
@@ -182,6 +189,14 @@ export function formatPercent(value: number): string {
 
 export function formatPercentInt(value: number): string {
   return `${Math.round(value * 100)}%`
+}
+
+/** Polymarket share price as cents (0–100¢). */
+export function formatCents(value: number): string {
+  const cents = value * 100
+  const rounded = Math.round(cents)
+  if (Math.abs(cents - rounded) < 0.05) return `${rounded}¢`
+  return `${cents.toFixed(1)}¢`
 }
 
 export function formatCountdown(target: Date): string {

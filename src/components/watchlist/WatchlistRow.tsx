@@ -1,6 +1,8 @@
 import { getCoin } from '@/lib/config'
+import { formatPercent } from '@/lib/polymarket'
 import { cn } from '@/lib/utils'
 import { CoinBadge } from '@/components/common/CoinBadge'
+import { ProbabilityBar } from '@/components/common/ProbabilityBar'
 import type { CoinId } from '@/lib/types'
 
 export function WatchlistRow({
@@ -19,7 +21,6 @@ export function WatchlistRow({
   onSelect: (coin: CoinId) => void
 }) {
   const meta = getCoin(coin)
-  const pct = upPrice != null ? Math.round(upPrice * 100) : null
 
   return (
     <button
@@ -38,8 +39,8 @@ export function WatchlistRow({
           <span className="text-sm font-bold tabular-nums">
             {!available ? (
               <span className="text-muted-foreground">—</span>
-            ) : pct != null ? (
-              `${pct}%`
+            ) : upPrice != null ? (
+              formatPercent(upPrice)
             ) : isLoading ? (
               <span className="text-muted-foreground">··</span>
             ) : (
@@ -47,10 +48,9 @@ export function WatchlistRow({
             )}
           </span>
         </div>
-        {available && pct != null && (
-          <div className="mt-1.5 flex h-1.5 overflow-hidden rounded-full bg-border" aria-hidden="true">
-            <div className="bg-up" style={{ width: `${pct}%` }} />
-            <div className="bg-down" style={{ width: `${100 - pct}%` }} />
+        {available && upPrice != null && (
+          <div className="mt-1.5">
+            <ProbabilityBar upPrice={upPrice} />
           </div>
         )}
       </div>

@@ -1,6 +1,6 @@
-import { useWatchlistQuery, useWatchlistQuotes } from '@/queries/market'
+import { useWatchlistQuery, useWatchlistQuotes, withLiveQuotes } from '@/queries/market'
 import { useUpdateConfig } from '@/store/ui'
-import { midFromQuotes } from '@/lib/clobSocket'
+import { useNow } from '@/hooks/useNow'
 import { TimeframeTabs } from './TimeframeTabs'
 import { WatchlistRow } from './WatchlistRow'
 import type { CoinId, TimeframeId } from '@/lib/types'
@@ -17,16 +17,17 @@ export function WatchlistPanel({
   onSelectTimeframe: (timeframe: TimeframeId) => void
 }) {
   const config = useUpdateConfig()
-  const entries = useWatchlistQuery(timeframe, config.pollMs)
+  const now = useNow()
+  const entries = useWatchlistQuery(timeframe, config.pollMs, now)
   const { quotes } = useWatchlistQuotes(entries)
 
   return (
     <div className="flex flex-col gap-3">
-      <TimeframeTabs selected={timeframe} onChange={onSelectTimeframe} />
+      <TimeframeTabs selected={timeframe} coin={selectedCoin} onChange={onSelectTimeframe} />
       <ul className="flex flex-col gap-1">
         {entries.map((entry) => {
-          const live = entry.market?.upTokenId ? midFromQuotes(quotes, entry.market.upTokenId) : null
-          const upPrice = entry.available ? (live ?? entry.market?.upPrice ?? null) : null
+          const live = withLiveQuotes(entry.market, quotes, config.useWebSocket, now)
+          const upPrice = entry.available ? (live?.upPrice ?? null) : null
           return (
             <li key={entry.coin}>
               <WatchlistRow

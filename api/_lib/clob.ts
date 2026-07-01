@@ -119,6 +119,8 @@ async function prepareOrder(
   const [, params] = await Promise.all([
     usesDepositWalletAllowance(config) ? ensureCollateralAllowance(client) : Promise.resolve(),
     marketParams(client, tokenId, hint),
+    // Populates feeInfos so createMarketOrder skips _ensureMarketInfoCached round trips.
+    client.getFeeExponent(tokenId).catch(() => {}),
   ])
   return { client, ...params }
 }
@@ -144,12 +146,36 @@ export async function warmOrderPath(tokenIds: string[]): Promise<void> {
   ])
 }
 
-function unwrapOrderResult(response: unknown): PlaceOrderResult {
+/** Parse CLOB making/taking amounts (micro-units) into human fill price + size. */
+function parseOrderFill(
+  side: 'BUY' | 'SELL',
+  record: Record<string, unknown> | null,
+): Pick<PlaceOrderResult, 'fillPrice' | 'fillSize'> {
+  const make = Number(record?.makingAmount)
+  const take = Number(record?.takingAmount)
+  if (!Number.isFinite(make) || !Number.isFinite(take) || make <= 0 || take <= 0) return {}
+
+  const makeN = make / 1e6
+  const takeN = take / 1e6
+
+  if (side === 'BUY') {
+    const fillSize = takeN
+    const fillPrice = fillSize > 0 ? makeN / fillSize : undefined
+    return fillPrice != null && fillPrice > 0 && fillPrice < 1 ? { fillSize, fillPrice } : {}
+  }
+
+  const fillSize = makeN
+  const fillPrice = fillSize > 0 ? takeN / fillSize : undefined
+  return fillPrice != null && fillPrice > 0 && fillPrice < 1 ? { fillSize, fillPrice } : {}
+}
+
+function unwrapOrderResult(response: unknown, side?: 'BUY' | 'SELL'): PlaceOrderResult {
   const record = response as Record<string, unknown> | null
   return {
     success: true,
     orderId: typeof record?.orderID === 'string' ? record.orderID : undefined,
     status: typeof record?.status === 'string' ? record.status : undefined,
+    ...(side ? parseOrderFill(side, record) : {}),
   }
 }
 
@@ -194,16 +220,56 @@ export interface PlaceOrderResult {
   success: boolean
   orderId?: string
   status?: string
+  /** Actual average fill price from CLOB making/taking amounts. */
+  fillPrice?: number
+  /** Shares bought or sold. */
+  fillSize?: number
 }
 
 export const MIN_BUY_USD = 1
 
-/** Extra headroom on top of a fresh FOK book walk — books move between quote and submit. */
-export const MARKET_BUY_SLIPPAGE = 0.05
+/**
+ * Marketable-order price buffers. A market FOK/FAK fills at the *resting* book
+ * price, so these are only the order's limit ceiling (buy) / floor (sell) — they
+ * make it cross on the first shot (no slow "book moved" retry) WITHOUT changing
+ * the price you actually pay in a normal book. You only pay the buffer if a thin
+ * book makes the order sweep — and that's bounded by POLY_MAX_ORDER_COST / size.
+ * Whichever is larger wins: a few-cents absolute pad or a small percentage.
+ */
+export const MARKET_SLIPPAGE_PCT = 0.05
+export const MARKET_SLIPPAGE_ABS = 0.03
 
-export function bufferMarketBuyPrice(bookPrice: number): number {
-  const bumped = bookPrice * (1 + MARKET_BUY_SLIPPAGE)
-  return Math.min(0.99, Math.round(bumped * 100) / 100)
+function tickDecimals(tick: number): number {
+  return Math.max(0, Math.round(-Math.log10(tick)))
+}
+
+/** Snap to the tick grid (ceil for a buy ceiling, floor for a sell floor). */
+function snapToTick(price: number, tick: number, dir: 'up' | 'down'): number {
+  const units = dir === 'up' ? Math.ceil(price / tick) : Math.floor(price / tick)
+  return Number((units * tick).toFixed(tickDecimals(tick)))
+}
+
+function slippagePad(price: number, multiplier = 1): number {
+  return multiplier * Math.max(MARKET_SLIPPAGE_ABS, price * MARKET_SLIPPAGE_PCT)
+}
+
+/** BUY limit ceiling: best ask + pad, rounded UP to the tick, clamped to [tick, 1 - tick]. */
+export function bufferMarketBuyPrice(
+  bookPrice: number,
+  tickSize: TickSize = '0.01',
+  padMultiplier = 1,
+): number {
+  const tick = Number(tickSize)
+  const ceil = snapToTick(bookPrice + slippagePad(bookPrice, padMultiplier), tick, 'up')
+  return Math.min(1 - tick, Math.max(tick, ceil))
+}
+
+/** SELL limit floor: best bid - pad, rounded DOWN to the tick, clamped to [tick, 1 - tick].
+ * A FAK still fills at the top bids; the lower limit only lets it sweep deeper if needed. */
+export function bufferMarketSellPrice(bookPrice: number, tickSize: TickSize = '0.01'): number {
+  const tick = Number(tickSize)
+  const floor = snapToTick(bookPrice - slippagePad(bookPrice), tick, 'down')
+  return Math.max(tick, Math.min(1 - tick, floor))
 }
 
 function clientBuyHint(price: number | undefined): number | null {
@@ -211,9 +277,10 @@ function clientBuyHint(price: number | undefined): number | null {
   return price
 }
 
-async function resolveMarketBuyPrice(client: ClobClient, tokenId: string, amount: number): Promise<number> {
-  const fromBook = await client.calculateMarketPrice(tokenId, Side.BUY, amount, OrderType.FOK)
-  return bufferMarketBuyPrice(fromBook)
+/** Raw FAK book-walk price — buffered separately once tick size is known. FAK (not FOK)
+ * so thin books return the top ask instead of throwing "no match". */
+async function rawMarketBuyPrice(client: ClobClient, tokenId: string, amount: number): Promise<number> {
+  return client.calculateMarketPrice(tokenId, Side.BUY, amount, OrderType.FAK)
 }
 
 const DEPOSIT_WALLET_DOCS = 'https://docs.polymarket.com/trading/deposit-wallets'
@@ -269,17 +336,15 @@ export async function placeMarketOrder(params: PlaceOrderParams): Promise<PlaceO
   const [{ client, tickSize, negRisk }, bookPrice] = await Promise.all([
     prepareOrder(config, params.tokenId, metaHint),
     hint == null && params.side === 'BUY'
-      ? resolveMarketBuyPrice(clob, params.tokenId, amount)
+      ? rawMarketBuyPrice(clob, params.tokenId, amount)
       : Promise.resolve(null),
   ])
 
-  // SELL uses FAK (Fill-And-Kill): take whatever bids are resting right now and
-  // cancel the unfilled remainder. FOK (the BUY default) kills the WHOLE order if
-  // the book can't absorb the full position in one shot — which is exactly what
-  // happens when an up/down market consolidates and makers thin out the bids, so
-  // a position-close is rejected ("no match") until the book deepens, i.e. until
-  // the odds move against you. FAK lets you always offload what's actually there.
-  const marketOrderType = params.side === 'SELL' ? OrderType.FAK : OrderType.FOK
+  // FAK (Fill-And-Kill) for both sides: take whatever is resting now and cancel the
+  // remainder. FOK rejects the whole order when the book can't absorb the full size
+  // in one shot — common on thin crypto up/down books ("no match") and costs a slow
+  // retry. FAK fills instantly with whatever liquidity exists.
+  const marketOrderType = OrderType.FAK
 
   const orderArgs: Parameters<ClobClient['createAndPostMarketOrder']>[0] = {
     tokenID: params.tokenId,
@@ -289,10 +354,14 @@ export async function placeMarketOrder(params: PlaceOrderParams): Promise<PlaceO
   }
 
   if (params.side === 'BUY') {
-    // Live WS ask from the browser skips a CLOB book-walk on the hot path.
-    orderArgs.price = hint != null ? bufferMarketBuyPrice(hint) : bookPrice!
-  } else if (params.price != null) {
-    orderArgs.price = params.price
+    // Live WS ask from the browser skips a CLOB book-walk on the hot path; either way
+    // the limit is buffered above the touch so the FAK crosses on the first shot.
+    orderArgs.price = bufferMarketBuyPrice(hint ?? bookPrice!, tickSize)
+  } else if (params.price != null && Number.isFinite(params.price) && params.price > 0 && params.price < 1) {
+    // Live WS bid from the browser, buffered DOWN to the tick. Passing a price makes
+    // clob-client-v2 skip its own book-walk round trip (client.js:448); the FAK still
+    // fills at the top bids, so this only sets how deep it may sweep.
+    orderArgs.price = bufferMarketSellPrice(params.price, tickSize)
   }
 
   let response = await client.createAndPostMarketOrder(
@@ -301,11 +370,16 @@ export async function placeMarketOrder(params: PlaceOrderParams): Promise<PlaceO
     marketOrderType,
   )
 
-  let result = unwrapOrderResult(response)
-  if (params.side === 'BUY' && hint != null && (result.status ?? '').toLowerCase() === 'unmatched') {
-    orderArgs.price = await resolveMarketBuyPrice(client, params.tokenId, amount)
-    response = await client.createAndPostMarketOrder(orderArgs, { tickSize, negRisk }, marketOrderType)
-    result = unwrapOrderResult(response)
+  let result = unwrapOrderResult(response, params.side)
+  if (params.side === 'BUY' && (result.status ?? '').toLowerCase() === 'unmatched') {
+    // Book moved past the first ceiling — retry once with 2× slippage pad. No book-walk
+    // (that adds a round trip and throws "no match" on empty asks).
+    const base = hint ?? bookPrice
+    if (base != null) {
+      orderArgs.price = bufferMarketBuyPrice(base, tickSize, 2)
+      response = await client.createAndPostMarketOrder(orderArgs, { tickSize, negRisk }, marketOrderType)
+      result = unwrapOrderResult(response, params.side)
+    }
   }
 
   return result
@@ -340,11 +414,14 @@ export async function placeLimitOrder(params: PlaceOrderParams): Promise<PlaceOr
     OrderType.GTC,
   )
 
-  return unwrapOrderResult(response)
+  return unwrapOrderResult(response, params.side)
 }
 
 function enrichOrderErrorMessage(message: string): string {
   const lower = message.toLowerCase()
+  if (lower.includes('no match')) {
+    return 'No resting liquidity on the book — wait for live quotes, then try again'
+  }
   if (lower.includes('maker address not allowed') || lower.includes('deposit wallet')) {
     return (
       'Your account must use the deposit wallet flow. Set POLY_SIGNATURE_TYPE=3, ' +

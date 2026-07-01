@@ -48,9 +48,16 @@ export function computePositionLiveStats(
   if (liveValue != null && costBasis != null && costBasis > 0) {
     pnl = liveValue - costBasis
     pnlPct = (pnl / costBasis) * 100
-  } else if (position.cashPnl != null) {
+  } else if (
+    costBasis != null &&
+    costBasis > 0 &&
+    position.cashPnl != null &&
+    position.percentPnl != null &&
+    liveValue == null
+  ) {
+    // Polled snapshot only — no live bid yet.
     pnl = position.cashPnl
-    pnlPct = position.percentPnl ?? null
+    pnlPct = position.percentPnl
   }
 
   return { livePrice: price, liveValue, costBasis, pnl, pnlPct }

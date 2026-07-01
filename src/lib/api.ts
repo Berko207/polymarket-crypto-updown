@@ -15,6 +15,17 @@ export interface AccountStatusResponse {
   message?: string
 }
 
+import type { TimeframeId } from '@/lib/types'
+
+export interface PlaceOrderFillMeta {
+  outcome: string
+  eventSlug: string
+  title: string
+  timeframe: TimeframeId
+  upTokenId: string | null
+  downTokenId: string | null
+}
+
 export interface PlaceOrderRequest {
   tokenId: string
   side: 'BUY' | 'SELL'
@@ -26,6 +37,8 @@ export interface PlaceOrderRequest {
   /** Gamma order metadata, passed through so the server skips CLOB tick/neg-risk lookups. */
   tickSize?: number
   negRisk?: boolean
+  /** Client-only — instant portfolio row before chain/Data API catch up. */
+  fillMeta?: PlaceOrderFillMeta
 }
 
 export const MIN_BUY_USD = 1
@@ -35,6 +48,8 @@ export interface PlaceOrderResponse {
   orderId?: string
   status?: string
   error?: string
+  fillPrice?: number
+  fillSize?: number
 }
 
 export interface OpenOrder {
@@ -110,10 +125,11 @@ export async function cancelOrder(orderId: string): Promise<void> {
 }
 
 export async function placeOrder(body: PlaceOrderRequest): Promise<PlaceOrderResponse> {
+  const { fillMeta: _fillMeta, ...apiBody } = body
   const res = await authFetch('/api/orders', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
+    body: JSON.stringify(apiBody),
   })
 
   const data = (await res.json()) as PlaceOrderResponse

@@ -41,13 +41,17 @@ function normalize(row: DataApiPosition): PositionView | null {
   const size = Number(row.size)
   if (!Number.isFinite(size) || size <= 0) return null
 
+  const initialValue = Number(row.initialValue) || 0
+  let avgPrice = Number(row.avgPrice) || 0
+  if (avgPrice <= 0 && initialValue > 0) avgPrice = initialValue / size
+
   return {
     tokenId,
     outcome: typeof row.outcome === 'string' ? row.outcome : '—',
     size,
-    avgPrice: Number(row.avgPrice) || 0,
+    avgPrice,
     currentPrice: Number(row.curPrice) || 0,
-    initialValue: Number(row.initialValue) || 0,
+    initialValue,
     currentValue: Number(row.currentValue) || 0,
     cashPnl: Number(row.cashPnl) || 0,
     percentPnl: Number(row.percentPnl) || 0,
@@ -116,14 +120,20 @@ export async function fetchMarketHoldings(
 
     const existing = byToken.get(tokenId)
     if (existing) {
-      // The on-chain conditional-token balance is authoritative for the CURRENT share
-      // count — in both directions. A recent buy raises it; a sell / partial sell lowers
-      // it; either way it's fresher than the Data API. When it diverges from the indexed
-      // size the aggregates (initial/current value, P&L) are stale for the new size, so
-      // drop them and let the client recompute cost basis from avgPrice × size.
+      // On-chain balance is authoritative for share count. Per-share avgPrice is unchanged
+      // by partial sells — rescale dollar aggregates from it instead of zeroing them.
       if (Math.abs(existing.size - balance) > 1e-6) {
+        const priorSize = existing.size
         existing.size = balance
-        existing.initialValue = 0
+        if (existing.avgPrice > 0) {
+          existing.initialValue = balance * existing.avgPrice
+        } else if (existing.initialValue > 0 && priorSize > 0) {
+          const implied = existing.initialValue / priorSize
+          existing.avgPrice = implied
+          existing.initialValue = balance * implied
+        } else {
+          existing.initialValue = 0
+        }
         existing.currentValue = 0
         existing.cashPnl = 0
         existing.percentPnl = 0

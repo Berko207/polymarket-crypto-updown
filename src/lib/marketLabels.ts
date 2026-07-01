@@ -109,6 +109,30 @@ export function coinSymbolFromPosition(position: Position): string {
   return known[word] ?? word.slice(0, 4).toUpperCase()
 }
 
+/** Timeframe bucket for a position (from event slug or stored buy label). */
+export function positionTimeframe(position: Position): TimeframeId | null {
+  return formatPositionLabel(position).timeframe
+}
+
+export function filterPositionsByTimeframe(
+  rows: Position[],
+  timeframe: TimeframeId,
+): Position[] {
+  return rows.filter((p) => positionTimeframe(p) === timeframe)
+}
+
+/** Group positions by coin symbol (BTC, ETH, …) within a timeframe tab. */
+export function groupPositionsByCoin(positions: Position[]): Map<string, Position[]> {
+  const groups = new Map<string, Position[]>()
+  for (const p of positions) {
+    const sym = coinSymbolFromPosition(p)
+    const list = groups.get(sym) ?? []
+    list.push(p)
+    groups.set(sym, list)
+  }
+  return groups
+}
+
 /** Label for an open order (uses position title, event slug, or remembered market window). */
 export function formatOrderLabel(
   order: OpenOrder,

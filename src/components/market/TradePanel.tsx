@@ -12,8 +12,13 @@ import type { ParsedMarket } from '@/lib/types'
 
 type SizeMode = 'usdc' | 'shares'
 
-function buyPrice(market: ParsedMarket, outcome: OutcomeSide): number | null {
-  return outcome === 'up' ? (market.bestAskUp ?? market.upPrice) : (market.bestAskDown ?? market.downPrice)
+/** Best ask only — midpoint is below the touch and poisons the server's buy ceiling. */
+function buyAsk(market: ParsedMarket, outcome: OutcomeSide): number | null {
+  return outcome === 'up' ? market.bestAskUp : market.bestAskDown
+}
+
+function buyPrice(market: ParsedMarket, outcome: OutcomeSide): number {
+  return buyAsk(market, outcome) ?? (outcome === 'up' ? market.upPrice : market.downPrice) ?? 0.5
 }
 
 export function TradePanel({
@@ -42,7 +47,7 @@ export function TradePanel({
     [market.upTokenId, market.downTokenId],
   )
 
-  const refPrice = buyPrice(market, 'up') || market.upPrice || 0.5
+  const refPrice = buyPrice(market, 'up')
 
   const orderUsd = (outcome: OutcomeSide): number => {
     const price = buyPrice(market, outcome)
@@ -61,9 +66,11 @@ export function TradePanel({
   const buy = async (outcome: OutcomeSide) => {
     if (disabled || placing) return
     const tokenId = outcome === 'up' ? market.upTokenId : market.downTokenId
-    const ask = buyPrice(market, outcome)
+    const ask = buyAsk(market, outcome)
     if (!tokenId) return toast.error('Token ID unavailable for this outcome')
-    if (ask == null || !Number.isFinite(ask)) return toast.error('No price available to quote this order')
+    if (ask == null || !Number.isFinite(ask)) {
+      return toast.error('No ask on the book — wait for live quotes')
+    }
     if (!market.isLive) return toast.error('Market is not open for trading')
 
     const label = `${coinSymbol} ${outcome === 'up' ? 'Up' : 'Down'}`
@@ -75,9 +82,16 @@ export function TradePanel({
         amountUsd: orderUsd(outcome),
         price: ask,
         label,
-        // Authoritative gamma metadata → server skips CLOB tick/neg-risk lookups.
         tickSize: market.tickSize ?? undefined,
         negRisk: market.negRisk ?? undefined,
+        fillMeta: {
+          outcome: outcome === 'up' ? 'Up' : 'Down',
+          eventSlug: market.eventSlug,
+          title: market.title,
+          timeframe: market.timeframe,
+          upTokenId: market.upTokenId,
+          downTokenId: market.downTokenId,
+        },
       })
     } catch {
       // toast surfaced in useOrderActions
@@ -86,7 +100,10 @@ export function TradePanel({
     }
   }
 
-  const estShares = (usdcAmount / refPrice).toFixed(2)
+  const upMid = market.upPrice > 0 ? market.upPrice : null
+  const downMid = market.downPrice > 0 ? market.downPrice : null
+  const estUp = upMid != null ? usdcAmount / upMid : null
+  const estDown = downMid != null ? usdcAmount / downMid : null
 
   return (
     <div className="flex flex-col gap-3">
@@ -121,7 +138,9 @@ export function TradePanel({
       </div>
       <p className="text-right text-xs text-muted-foreground">
         {sizeMode === 'usdc'
-          ? `≈ ${estShares} shares · min $${MIN_BUY_USD}`
+          ? estUp != null && estDown != null
+            ? `≈ ${estUp.toFixed(2)} Up · ${estDown.toFixed(2)} Down shares @ mid · min $${MIN_BUY_USD}`
+            : `min $${MIN_BUY_USD}`
           : `Est. $${Math.max(MIN_BUY_USD, refPrice * size).toFixed(2)} per side`}
       </p>
 

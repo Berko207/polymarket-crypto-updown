@@ -1,27 +1,63 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useQueries, useQuery } from '@tanstack/react-query'
-import { fetchCurrentMarket } from '@/lib/polymarket'
 import { COINS, getAvailableTimeframes } from '@/lib/config'
-import { quoteToPrice, type TokenQuoteMap } from '@/lib/clobSocket'
+import { marketMatchesScope, isCurrentWindow } from '@/lib/marketScope'
+import { marketQueryOptions } from '@/queries/marketOptions'
+import { quoteToPrice, quoteHasBook, type TokenQuoteMap } from '@/lib/clobSocket'
 import { useTokenQuotes } from '@/hooks/useTokenQuotes'
+import { useNow } from '@/hooks/useNow'
 import { useUpdateConfig } from '@/store/ui'
 import type { CoinId, ParsedMarket, TimeframeId } from '@/lib/types'
-import { qk } from './keys'
+
+/** Drop ended windows even if TanStack hasn't refetched yet. */
+function freshMarket(market: ParsedMarket | null, now: number): ParsedMarket | null {
+  if (!market) return null
+  return isCurrentWindow(market, now) ? market : null
+}
+
+/** Polled market with live WS overlay when the window is still tradeable. */
+export function withLiveQuotes(
+  market: ParsedMarket | null,
+  quotes: TokenQuoteMap,
+  useWebSocket: boolean,
+  now = Date.now(),
+  { allowEnded = false }: { allowEnded?: boolean } = {},
+): ParsedMarket | null {
+  if (!market) return null
+  if (!allowEnded && !isCurrentWindow(market, now)) return null
+  if (!useWebSocket || !market.isLive) return market
+  return mergeLiveQuotes(market, quotes)
+}
 
 /** Overlay live WS quotes on a polled market snapshot (matches the old useMarket merge). */
 export function mergeLiveQuotes(market: ParsedMarket, quotes: TokenQuoteMap): ParsedMarket {
   const up = market.upTokenId ? quotes[market.upTokenId] : undefined
   const down = market.downTokenId ? quotes[market.downTokenId] : undefined
 
-  const upPrice = quoteToPrice(up) ?? market.upPrice
-  const downPrice = quoteToPrice(down) ?? market.downPrice
+  const upLive = quoteToPrice(up)
+  const downLive = quoteToPrice(down)
+
+  let upPrice = upLive ?? market.upPrice
+  let downPrice = downLive ?? market.downPrice
+  // Thin books often update one side first — keep Up + Down ≈ 100%.
+  if (upLive != null && downLive == null) downPrice = 1 - upPrice
+  else if (downLive != null && upLive == null) upPrice = 1 - downPrice
   const bestBidUp = up?.bestBid ?? market.bestBidUp
   const bestAskUp = up?.bestAsk ?? market.bestAskUp
   const bestBidDown = down?.bestBid ?? market.bestBidDown
   const bestAskDown = down?.bestAsk ?? market.bestAskDown
 
-  const hasLive = up != null || down != null
+  const hasLive = quoteHasBook(up) || quoteHasBook(down)
   if (!hasLive) return market
+
+  // Stale socket rows from a prior window can sit at ~0 or ~1 — ignore wild drift.
+  const upDrift = upLive != null ? Math.abs(upLive - market.upPrice) : 0
+  const downDrift = downLive != null ? Math.abs(downLive - market.downPrice) : 0
+  const maxDrift = Math.max(upDrift, downDrift)
+  if (maxDrift > 0.35) {
+    return market
+  }
+
   if (
     upPrice === market.upPrice &&
     downPrice === market.downPrice &&
@@ -37,11 +73,7 @@ export function mergeLiveQuotes(market: ParsedMarket, quotes: TokenQuoteMap): Pa
 
 /** Single market poll (no live overlay). Shares its cache key with the watchlist row. */
 export function useMarketQuery(coin: CoinId, timeframe: TimeframeId, pollMs: number) {
-  return useQuery({
-    queryKey: qk.market(coin, timeframe),
-    queryFn: () => fetchCurrentMarket(coin, timeframe),
-    refetchInterval: pollMs,
-  })
+  return useQuery(marketQueryOptions(coin, timeframe, pollMs))
 }
 
 export interface LiveMarket {
@@ -107,40 +139,70 @@ function useMarketRollover(endMs: number | null, refetch: () => void): boolean {
   return rolling
 }
 
+/** True when polled market belongs to the selected coin + timeframe tab. */
+export { marketMatchesScope } from '@/lib/marketScope'
+
 /** Focused market: polled snapshot + live WS overlay, driven by the update-mode config. */
 export function useLiveMarket(coin: CoinId, timeframe: TimeframeId): LiveMarket {
   const config = useUpdateConfig()
+  const now = useNow()
+  const scopeKey = `${coin}:${timeframe}`
   const query = useMarketQuery(coin, timeframe, config.pollMs)
 
-  // Retain the last resolved market so a transient empty fetch during rollover
-  // (the brief gap while the next window goes live) doesn't blank the card.
-  const lastMarketRef = useRef<ParsedMarket | null>(null)
-  if (query.data) lastMarketRef.current = query.data
-  const market = query.data ?? lastMarketRef.current
+  // Retain the last window only during rollover fetches so the card doesn't blank.
+  const lastMarketRef = useRef<{ scope: string; market: ParsedMarket | null }>({
+    scope: '',
+    market: null,
+  })
+  if (lastMarketRef.current.scope !== scopeKey) {
+    lastMarketRef.current = { scope: scopeKey, market: null }
+  }
+
+  const queryMarket = freshMarket(query.data ?? null, now)
+  if (queryMarket && marketMatchesScope(queryMarket, coin, timeframe)) {
+    lastMarketRef.current = { scope: scopeKey, market: queryMarket }
+  }
+
+  const refetchRef = useRef<() => void>(() => {})
+  refetchRef.current = () => void query.refetch()
+  const refetch = useCallback(() => refetchRef.current(), [])
+
+  const sameScope = lastMarketRef.current.scope === scopeKey
+  const rolloverSource = queryMarket ?? (sameScope ? lastMarketRef.current.market : null)
+  const rolling = useMarketRollover(
+    rolloverSource ? rolloverSource.endDate.getTime() : null,
+    refetch,
+  )
+
+  const retained =
+    !queryMarket && rolling && sameScope ? lastMarketRef.current.market : null
+  const market =
+    queryMarket ??
+    (retained && marketMatchesScope(retained, coin, timeframe) ? retained : null)
 
   const tokenIds = useMemo(
     () => [market?.upTokenId, market?.downTokenId].filter(Boolean) as string[],
     [market?.upTokenId, market?.downTokenId],
   )
   const { quotes, connected } = useTokenQuotes(tokenIds, {
-    enabled: config.useWebSocket,
-    throttleMs: config.throttleMs,
+    enabled: tokenIds.length > 0,
+    throttleMs: 0,
   })
 
-  const displayMarket = useMemo(
-    () => (market && config.useWebSocket ? mergeLiveQuotes(market, quotes) : market),
-    [market, config.useWebSocket, quotes],
-  )
+  const displayMarket = useMemo(() => {
+    const live = withLiveQuotes(market, quotes, true, now, { allowEnded: rolling })
+    if (!live || !marketMatchesScope(live, coin, timeframe)) return null
+    return live
+  }, [market, coin, timeframe, quotes, now, rolling])
 
-  // Stable refetch identity so the rollover effect only re-arms when the window changes.
-  const refetchRef = useRef<() => void>(() => {})
-  refetchRef.current = () => void query.refetch()
-  const refetch = useCallback(() => refetchRef.current(), [])
-  const rolling = useMarketRollover(market ? market.endDate.getTime() : null, refetch)
+  const switching =
+    !displayMarket &&
+    (query.isLoading || query.isFetching || (queryMarket == null && query.isFetched && !rolling))
+  const isLoading = switching
 
   return {
     market: displayMarket,
-    isLoading: query.isLoading,
+    isLoading,
     isError: query.isError,
     error: query.error,
     connected,
@@ -159,7 +221,11 @@ export interface WatchlistEntry {
 
 /** Every coin's current market for a timeframe — the overview list (no live overlay here;
  * the watchlist component applies live odds via {@link useWatchlistQuotes}). */
-export function useWatchlistQuery(timeframe: TimeframeId, pollMs: number): WatchlistEntry[] {
+export function useWatchlistQuery(
+  timeframe: TimeframeId,
+  pollMs: number,
+  now: number,
+): WatchlistEntry[] {
   const coins = useMemo(
     () => COINS.map((c) => ({ coin: c.id, available: getAvailableTimeframes(c.id).includes(timeframe) })),
     [timeframe],
@@ -167,25 +233,32 @@ export function useWatchlistQuery(timeframe: TimeframeId, pollMs: number): Watch
 
   const results = useQueries({
     queries: coins.map(({ coin, available }) => ({
-      queryKey: qk.market(coin, timeframe),
-      queryFn: () => fetchCurrentMarket(coin, timeframe),
+      ...marketQueryOptions(coin, timeframe, pollMs),
       enabled: available,
-      refetchInterval: pollMs,
     })),
   })
 
-  return coins.map((c, i) => ({
-    coin: c.coin,
-    available: c.available,
-    market: results[i].data ?? null,
-    isLoading: c.available && results[i].isLoading,
-    isError: results[i].isError,
-  }))
+  return coins.map((c, i) => {
+    const raw = freshMarket(results[i].data ?? null, now)
+    const market =
+      raw && marketMatchesScope(raw, c.coin, timeframe) ? raw : null
+    return {
+      coin: c.coin,
+      available: c.available,
+      market,
+      isLoading: c.available && (results[i].isLoading || results[i].isFetching) && !market,
+      isError: results[i].isError,
+    }
+  })
 }
 
 /** Subscribe every watchlist outcome token to the shared socket and return live quotes. */
 export function useWatchlistQuotes(entries: WatchlistEntry[]) {
   const config = useUpdateConfig()
+  const entriesKey = entries
+    .map((e) => `${e.coin}:${e.market?.eventSlug ?? ''}:${e.market?.upTokenId ?? ''}`)
+    .join('|')
+
   const tokenIds = useMemo(() => {
     const ids: string[] = []
     for (const e of entries) {
@@ -193,7 +266,7 @@ export function useWatchlistQuotes(entries: WatchlistEntry[]) {
       if (e.market?.downTokenId) ids.push(e.market.downTokenId)
     }
     return ids
-  }, [entries])
+  }, [entriesKey])
 
   return useTokenQuotes(tokenIds, { enabled: config.useWebSocket, throttleMs: config.throttleMs })
 }

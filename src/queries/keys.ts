@@ -4,6 +4,20 @@ import type { CoinId, TimeframeId } from '@/lib/types'
  * key, so they dedupe into one cache entry / one network request. */
 export const qk = {
   market: (coin: CoinId, timeframe: TimeframeId) => ['market', coin, timeframe] as const,
+  cryptoWindow: (
+    coin: CoinId,
+    timeframe: TimeframeId,
+    eventSlug: string,
+    eventStartTime: string,
+    endDate: string,
+  ) => ['cryptoWindow', coin, timeframe, eventSlug, eventStartTime, endDate] as const,
+  cryptoWindowPrev: (
+    coin: CoinId,
+    timeframe: TimeframeId,
+    eventSlug: string,
+    eventStartTime: string,
+    endDate: string,
+  ) => ['cryptoWindowPrev', coin, timeframe, eventSlug, eventStartTime, endDate] as const,
   account: ['account'] as const,
   orders: ['orders'] as const,
   positions: ['positions'] as const,

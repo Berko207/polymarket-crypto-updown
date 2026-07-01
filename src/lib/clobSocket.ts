@@ -43,6 +43,12 @@ export function quoteToPrice(quote: TokenQuote | undefined): number | null {
   return null
 }
 
+/** True when the socket has real book data for this token (not just an empty snapshot slot). */
+export function quoteHasBook(quote: TokenQuote | undefined): boolean {
+  if (!quote) return false
+  return quote.bestBid != null || quote.bestAsk != null || quote.lastTrade != null
+}
+
 export function bestBidFromQuotes(quotes: TokenQuoteMap, tokenId: string | null | undefined): number | null {
   if (!tokenId) return null
   return quotes[tokenId]?.bestBid ?? null
@@ -174,6 +180,10 @@ class ClobSocket {
 
   private reconcile() {
     const next = this.union()
+    const keep = new Set(next)
+    for (const id of Object.keys(this.quotes)) {
+      if (!keep.has(id)) delete this.quotes[id]
+    }
     if (next.length === 0) {
       this.teardown()
       return
@@ -274,6 +284,7 @@ class ClobSocket {
       this.ws = null
     }
     this.subscribedIds = []
+    this.quotes = {}
     this.setConnected(false)
   }
 }

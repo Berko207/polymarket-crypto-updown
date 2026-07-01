@@ -1,9 +1,11 @@
 import { useEffect, useState } from 'react'
 import { fetchAuthConfig, getStoredApiSecret } from '@/lib/apiAuth'
-import { COINS, getAvailableTimeframes } from '@/lib/config'
+import { getAvailableTimeframes } from '@/lib/config'
+import { queryClient } from '@/lib/queryClient'
 import { useUiStore } from '@/store/ui'
 import { useAccountQuery } from '@/queries/account'
 import { useThemeSync } from '@/hooks/useThemeSync'
+import { useChainlinkWarmup } from '@/hooks/useChainlinkWarmup'
 import { Header } from '@/components/layout/Header'
 import { WatchlistPanel } from '@/components/watchlist/WatchlistPanel'
 import { MarketDetail } from '@/components/market/MarketDetail'
@@ -26,6 +28,7 @@ function PanelCard({ title, children }: { title: string; children: React.ReactNo
 
 export function AppShell() {
   useThemeSync()
+  useChainlinkWarmup()
 
   const coin = useUiStore((s) => s.selectedCoin)
   const timeframe = useUiStore((s) => s.selectedTimeframe)
@@ -64,12 +67,21 @@ export function AppShell() {
   }
 
   const handleTimeframe = (tf: TimeframeId) => {
+    if (!getAvailableTimeframes(coin).includes(tf)) return
+    if (tf === timeframe) return
     setTimeframe(tf)
-    if (!getAvailableTimeframes(coin).includes(tf)) {
-      const firstCoin = COINS.find((c) => getAvailableTimeframes(c.id).includes(tf))
-      if (firstCoin) setCoin(firstCoin.id)
-    }
+    void queryClient.resetQueries({
+      predicate: (q) =>
+        Array.isArray(q.queryKey) && q.queryKey[0] === 'market' && q.queryKey[2] === tf,
+    })
   }
+
+  // Drop spot/strike cache when switching coin or timeframe — keys include slug but
+  // stale rows were bleeding across tabs.
+  useEffect(() => {
+    void queryClient.removeQueries({ queryKey: ['cryptoWindow'] })
+    void queryClient.removeQueries({ queryKey: ['cryptoWindowPrev'] })
+  }, [coin, timeframe])
 
   if (authRequired === null) {
     return (
@@ -83,7 +95,7 @@ export function AppShell() {
     return (
       <>
         <ApiUnlock onUnlocked={() => setAuthReady(true)} />
-        <Toaster position="top-center" />
+        <Toaster position="top-center" duration={6000} closeButton />
       </>
     )
   }
@@ -113,9 +125,9 @@ export function AppShell() {
           />
         </main>
 
-        <aside className="order-3">
+        <aside className="order-3 min-w-0">
           <PanelCard title="Portfolio">
-            <PortfolioPanel enabled={canTrade} coin={coin} timeframe={timeframe} />
+            <PortfolioPanel enabled={canTrade} timeframe={timeframe} selectedCoin={coin} />
           </PanelCard>
         </aside>
       </div>
@@ -124,7 +136,7 @@ export function AppShell() {
         Data from Polymarket · Not financial advice
       </footer>
 
-      <Toaster position="top-center" />
+      <Toaster position="top-center" duration={6000} closeButton />
     </div>
   )
 }

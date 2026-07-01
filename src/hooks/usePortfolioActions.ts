@@ -1,46 +1,38 @@
 import { useState } from 'react'
 import { useOrderActions } from './useOrderActions'
-import { coinSymbolFromPosition } from '@/lib/marketLabels'
+import { coinSymbolFromPosition, positionTimeframe } from '@/lib/marketLabels'
+import { timeframeFromEventSlug } from '@/lib/slugs'
+import type { TimeframeId } from '@/lib/types'
 import { outcomeSide } from '@/components/common/OutcomeBadge'
-import type { OrderConfirm } from '@/components/dialogs/OrderConfirmDialog'
 import type { Position } from '@/lib/api'
 
-export interface PendingSell {
-  confirm: OrderConfirm
-  tokenId: string
-  label: string
-}
-
-/** Sell-with-confirmation flow for the portfolio panel. */
+/** One-click market sell for the portfolio panel. */
 export function useSellFlow() {
   const actions = useOrderActions()
   const [sellingId, setSellingId] = useState<string | null>(null)
-  const [pending, setPending] = useState<PendingSell | null>(null)
 
-  const request = (position: Position, sellPrice: number, symbol?: string) => {
+  const sell = async (position: Position, sellPrice: number, symbol?: string) => {
     const side = outcomeSide(position.outcome)
     const coinSymbol = symbol ?? coinSymbolFromPosition(position)
-    setPending({
-      tokenId: position.tokenId,
-      label: `${coinSymbol} ${side === 'up' ? 'Up' : 'Down'}`,
-      confirm: {
-        side: 'SELL',
-        outcome: side,
-        coinSymbol,
-        price: sellPrice,
-        size: position.size,
-        estCost: sellPrice * position.size,
-      },
-    })
-  }
-
-  const submit = async () => {
-    if (!pending) return
-    const { tokenId, confirm, label } = pending
-    setPending(null)
-    setSellingId(tokenId)
+    const label = `${coinSymbol} ${side === 'up' ? 'Up' : 'Down'}`
+    setSellingId(position.tokenId)
     try {
-      await actions.sell({ tokenId, size: confirm.size, label })
+      const tf: TimeframeId =
+        positionTimeframe(position) ?? timeframeFromEventSlug(position.eventSlug) ?? '5m'
+      await actions.sell({
+        tokenId: position.tokenId,
+        size: position.size,
+        label,
+        price: sellPrice,
+        fillMeta: {
+          outcome: position.outcome,
+          eventSlug: position.eventSlug,
+          title: position.title,
+          timeframe: tf,
+          upTokenId: null,
+          downTokenId: null,
+        },
+      })
     } catch {
       // toast surfaced in useOrderActions
     } finally {
@@ -48,7 +40,7 @@ export function useSellFlow() {
     }
   }
 
-  return { pending, sellingId, request, submit, close: () => setPending(null), placing: actions.isPlacing }
+  return { sellingId, sell, placing: actions.isPlacing }
 }
 
 /** Cancel-an-open-order flow with per-row pending state. */
