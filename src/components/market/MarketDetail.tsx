@@ -106,9 +106,11 @@ export function MarketDetail({
         )}
 
         {/* Keyed per window: rollover swaps markets in place (useLiveMarket bridges the
-            gap), and the odds jump (e.g. 0.97 → 0.50) must not read as a price flash. */}
+            gap), and the odds jump (e.g. 0.97 → 0.50) must not read as a price flash.
+            Prefixed — SpotPriceBar above already uses the bare eventSlug as its key,
+            and duplicate sibling keys corrupt React reconciliation. */}
         <div
-          key={market.eventSlug}
+          key={`odds-${market.eventSlug}`}
           className="flex flex-col items-center gap-5 sm:flex-row sm:justify-center sm:gap-10"
         >
           <OddsGauge value={market.upPrice} size={150} label="Market Up" />
