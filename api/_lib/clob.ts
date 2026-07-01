@@ -380,6 +380,21 @@ export async function placeMarketOrder(params: PlaceOrderParams): Promise<PlaceO
       response = await client.createAndPostMarketOrder(orderArgs, { tickSize, negRisk }, marketOrderType)
       result = unwrapOrderResult(response, params.side)
     }
+  } else if (
+    params.side === 'SELL' &&
+    (result.status ?? '').toLowerCase() === 'unmatched' &&
+    orderArgs.price != null
+  ) {
+    // The client mark can be a mid/last-trade or polled fallback sitting above every
+    // resting bid, pricing the buffered floor out of the book. Retry once WITHOUT a
+    // price so clob-client-v2 walks the live book and floors off real bids.
+    delete orderArgs.price
+    try {
+      response = await client.createAndPostMarketOrder(orderArgs, { tickSize, negRisk }, marketOrderType)
+      result = unwrapOrderResult(response, params.side)
+    } catch {
+      // Book-walk threw (no bids at all) — keep the original unmatched result.
+    }
   }
 
   return result

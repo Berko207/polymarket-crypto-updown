@@ -14,6 +14,7 @@ import gamma from '../api/gamma/[...path].js'
 import openOrders from '../api/open-orders.js'
 import orders from '../api/orders.js'
 import positions from '../api/positions.js'
+import tradeHistory from '../api/trade-history.js'
 import warm from '../api/warm.js'
 import cryptoPrice from '../api/crypto-price.js'
 
@@ -28,6 +29,7 @@ const routes: Route[] = [
   { test: (p) => p === '/api/orders', handler: orders },
   { test: (p) => p === '/api/open-orders', handler: openOrders },
   { test: (p) => p === '/api/positions', handler: positions },
+  { test: (p) => p === '/api/trade-history', handler: tradeHistory },
   { test: (p) => p === '/api/warm', handler: warm },
   { test: (p) => p === '/api/crypto-price', handler: cryptoPrice },
   { test: (p) => p.startsWith('/api/gamma/'), handler: gamma },

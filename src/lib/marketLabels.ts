@@ -94,8 +94,9 @@ export function formatMarketGroupLabel(positions: Position[]): string {
   return primary.short
 }
 
-export function coinSymbolFromPosition(position: Position): string {
-  const { asset } = formatPositionLabel(position)
+/** Coin ticker from a market title / asset heading ("Ethereum Up or Down - …" → ETH). */
+export function coinSymbolFromTitle(title: string): string {
+  const asset = parseTitle(title).asset
   const match = asset.match(/^(\w+)/)
   if (!match) return asset.slice(0, 8)
   const word = match[1].toLowerCase()
@@ -105,8 +106,14 @@ export function coinSymbolFromPosition(position: Position): string {
     solana: 'SOL',
     dogecoin: 'DOGE',
     doge: 'DOGE',
+    xrp: 'XRP',
   }
   return known[word] ?? word.slice(0, 4).toUpperCase()
+}
+
+export function coinSymbolFromPosition(position: Position): string {
+  const { asset } = formatPositionLabel(position)
+  return coinSymbolFromTitle(asset)
 }
 
 /** Timeframe bucket for a position (from event slug or stored buy label). */
@@ -118,7 +125,12 @@ export function filterPositionsByTimeframe(
   rows: Position[],
   timeframe: TimeframeId,
 ): Position[] {
-  return rows.filter((p) => positionTimeframe(p) === timeframe)
+  // Unparseable timeframes (foreign slug conventions, positions bought outside the
+  // app) show in every tab — a strict match would make them reachable in none.
+  return rows.filter((p) => {
+    const tf = positionTimeframe(p)
+    return tf === null || tf === timeframe
+  })
 }
 
 /** Group positions by coin symbol (BTC, ETH, …) within a timeframe tab. */

@@ -1,9 +1,10 @@
 import { formatPercent } from '@/lib/polymarket'
 import { cn } from '@/lib/utils'
+import { usePriceFlash, flashColor } from '@/hooks/usePriceFlash'
 
 const CIRCUMFERENCE = 327 // 2πr with r=52
 
-/** Circular gauge showing the "Up" probability. Steady layout — no scaling/flash. */
+/** Circular gauge showing the "Up" probability. Steady layout; the number flashes on tick. */
 export function OddsGauge({
   value,
   label = 'Up chance',
@@ -16,11 +17,19 @@ export function OddsGauge({
   className?: string
 }) {
   const pct = Math.min(1, Math.max(0, value))
+  const flash = usePriceFlash(value)
   return (
     <div className={cn('relative shrink-0', className)} style={{ width: size, height: size }}>
       <div className="absolute inset-0 flex flex-col items-center justify-center">
         <span className="text-[0.65rem] uppercase tracking-wide text-muted-foreground">{label}</span>
-        <span className="text-3xl font-extrabold leading-none tabular-nums">{formatPercent(value)}</span>
+        <span
+          className={cn(
+            'text-3xl font-extrabold leading-none tabular-nums transition-colors duration-500',
+            flashColor(flash),
+          )}
+        >
+          {formatPercent(value)}
+        </span>
       </div>
       <svg viewBox="0 0 120 120" className="size-full -rotate-90" aria-hidden="true">
         <circle cx="60" cy="60" r="52" fill="none" stroke="var(--border)" strokeWidth="8" />

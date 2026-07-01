@@ -6,10 +6,12 @@ import { formatMarketHeading } from '@/lib/marketLabels'
 import { rememberMarketTokens } from '@/lib/tokenLabels'
 import { formatPercent, formatVolume } from '@/lib/polymarket'
 import { cn } from '@/lib/utils'
+import { usePriceFlash, flashColor } from '@/hooks/usePriceFlash'
 import { Card, CardContent } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Button } from '@/components/ui/button'
 import { CoinBadge } from '@/components/common/CoinBadge'
+import { LiveStatusBadge } from '@/components/common/LiveStatusBadge'
 import { CountdownClock } from './CountdownClock'
 import { OddsGauge } from './OddsGauge'
 import { SpotPriceBar } from './SpotPriceBar'
@@ -29,7 +31,7 @@ export function MarketDetail({
   timeframe: TimeframeId
   canTrade: boolean
 }) {
-  const { market, isLoading, isError, error, rolling } = useLiveMarket(coin, timeframe)
+  const { market, isLoading, isError, error, rolling, connected } = useLiveMarket(coin, timeframe)
   const spot = useMarketSpot(market, coin, timeframe)
   const subtitle = market ? formatMarketHeading(market).subtitle : ''
 
@@ -90,7 +92,7 @@ export function MarketDetail({
           </div>
           <div className="flex flex-col items-end gap-2">
             <CountdownClock market={market} />
-            <LiveBadge isLive={market.isLive} />
+            <LiveStatusBadge active={market.isLive} connected={connected} idleLabel="Closed" />
           </div>
         </header>
 
@@ -103,7 +105,12 @@ export function MarketDetail({
           </p>
         )}
 
-        <div className="flex flex-col items-center gap-5 sm:flex-row sm:justify-center sm:gap-10">
+        {/* Keyed per window: rollover swaps markets in place (useLiveMarket bridges the
+            gap), and the odds jump (e.g. 0.97 → 0.50) must not read as a price flash. */}
+        <div
+          key={market.eventSlug}
+          className="flex flex-col items-center gap-5 sm:flex-row sm:justify-center sm:gap-10"
+        >
           <OddsGauge value={market.upPrice} size={150} label="Market Up" />
           <div className="grid w-full max-w-xs grid-cols-2 gap-2 sm:w-52">
             <OutcomeStat label="Up" price={market.upPrice} side="up" />
@@ -149,25 +156,19 @@ export function MarketDetail({
   )
 }
 
-function LiveBadge({ isLive }: { isLive: boolean }) {
-  return (
-    <span
-      className={cn(
-        'inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[0.7rem] font-bold uppercase tracking-wide',
-        isLive ? 'bg-up-soft text-up' : 'bg-primary/15 text-primary',
-      )}
-    >
-      <span className={cn('size-1.5 rounded-full bg-current', isLive && 'animate-pulse')} />
-      {isLive ? 'Live' : 'Closed'}
-    </span>
-  )
-}
-
 function OutcomeStat({ label, price, side }: { label: string; price: number; side: 'up' | 'down' }) {
+  const flash = usePriceFlash(price)
   return (
     <div className={cn('flex flex-col items-center rounded-lg px-3 py-2.5', side === 'up' ? 'bg-up-soft' : 'bg-down-soft')}>
       <span className={cn('text-xs font-semibold uppercase', side === 'up' ? 'text-up' : 'text-down')}>{label}</span>
-      <span className="text-xl font-extrabold tabular-nums">{formatPercent(price)}</span>
+      <span
+        className={cn(
+          'text-xl font-extrabold tabular-nums transition-colors duration-500',
+          flashColor(flash),
+        )}
+      >
+        {formatPercent(price)}
+      </span>
     </div>
   )
 }

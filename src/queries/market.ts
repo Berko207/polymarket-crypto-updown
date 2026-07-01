@@ -147,7 +147,11 @@ export function useLiveMarket(coin: CoinId, timeframe: TimeframeId): LiveMarket 
   const config = useUpdateConfig()
   const now = useNow()
   const scopeKey = `${coin}:${timeframe}`
-  const query = useMarketQuery(coin, timeframe, config.pollMs)
+  // The CLOB WS is snapshot-then-sparse for these markets, so the focused card can sit
+  // stale between ticks. Poll the (edge-cached ~5s) gamma snapshot faster when streaming so
+  // the center refreshes even while the book is quiet. Saver keeps its low-data 30s cadence.
+  const focusedPollMs = config.useWebSocket ? Math.min(config.pollMs, 6_000) : config.pollMs
+  const query = useMarketQuery(coin, timeframe, focusedPollMs)
 
   // Retain the last window only during rollover fetches so the card doesn't blank.
   const lastMarketRef = useRef<{ scope: string; market: ParsedMarket | null }>({

@@ -11,7 +11,12 @@ export function useSellFlow() {
   const actions = useOrderActions()
   const [sellingId, setSellingId] = useState<string | null>(null)
 
-  const sell = async (position: Position, sellPrice: number, symbol?: string) => {
+  const sell = async (
+    position: Position,
+    sellPrice: number,
+    symbol?: string,
+    marketTokens?: { upTokenId: string | null; downTokenId: string | null },
+  ) => {
     const side = outcomeSide(position.outcome)
     const coinSymbol = symbol ?? coinSymbolFromPosition(position)
     const label = `${coinSymbol} ${side === 'up' ? 'Up' : 'Down'}`
@@ -29,8 +34,8 @@ export function useSellFlow() {
           eventSlug: position.eventSlug,
           title: position.title,
           timeframe: tf,
-          upTokenId: null,
-          downTokenId: null,
+          upTokenId: marketTokens?.upTokenId ?? null,
+          downTokenId: marketTokens?.downTokenId ?? null,
         },
       })
     } catch {

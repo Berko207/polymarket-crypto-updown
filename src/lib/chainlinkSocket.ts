@@ -96,12 +96,29 @@ class ChainlinkSocket {
     return this.prices[pair] ?? null
   }
 
+  // A resolved strike is immutable (first tick at/after a past boundary never changes),
+  // and callers ask per render — cache hits keep this O(1) instead of a history scan.
+  private strikeCache = new Map<string, number>()
+
   /**
    * Chainlink price at window open — first tick at/after the boundary.
    * Rolling windows use a wider slop because ticks may be sparse.
    */
   strikeAtBoundary(pair: string, boundaryMs: number, rolling = false): number | null {
-    return this.firstPriceAtOrAfter(pair, boundaryMs, rolling ? 120_000 : 60_000)
+    const key = `${pair}:${boundaryMs}:${rolling ? 1 : 0}`
+    const cached = this.strikeCache.get(key)
+    if (cached != null) return cached
+
+    const value = this.firstPriceAtOrAfter(pair, boundaryMs, rolling ? 120_000 : 60_000)
+    if (value != null) {
+      this.strikeCache.set(key, value)
+      // Insertion-ordered trim — old windows' strikes are never asked for again.
+      if (this.strikeCache.size > 256) {
+        const oldest = this.strikeCache.keys().next().value
+        if (oldest != null) this.strikeCache.delete(oldest)
+      }
+    }
+    return value
   }
 
   /**

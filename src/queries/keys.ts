@@ -21,4 +21,5 @@ export const qk = {
   account: ['account'] as const,
   orders: ['orders'] as const,
   positions: ['positions'] as const,
+  tradeHistory: ['tradeHistory'] as const,
 }
