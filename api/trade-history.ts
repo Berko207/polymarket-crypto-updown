@@ -4,8 +4,11 @@ import { requireConfigured } from './_lib/guards.js'
 import { getPolyConfig } from './_lib/env.js'
 
 const DATA_API = 'https://data-api.polymarket.com/trades'
-const MAX_LIMIT = 100
+/** Data API silently clamps limit to 1000. */
+const MAX_LIMIT = 1000
 const DEFAULT_LIMIT = 40
+/** Data API 400s past this: "max historical activity offset of 3000 exceeded". */
+const MAX_UPSTREAM_OFFSET = 3000
 
 interface DataApiTrade {
   asset?: string
@@ -79,7 +82,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (!config) return res.status(503).json({ error: 'Polymarket credentials not configured' })
 
   const limit = clampInt(req.query.limit, DEFAULT_LIMIT, 1, MAX_LIMIT)
-  const offset = clampInt(req.query.offset, 0, 0, 10_000)
+  const offset = clampInt(req.query.offset, 0, 0, MAX_UPSTREAM_OFFSET)
 
   try {
     const url = `${DATA_API}?user=${encodeURIComponent(config.funderAddress)}&limit=${limit}&offset=${offset}`
@@ -95,10 +98,15 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     // Account data — keep it out of shared edge caches.
     res.setHeader('Cache-Control', 'no-store')
+    const fullPage = trades.length === limit
+    const nextPageReachable = offset + limit <= MAX_UPSTREAM_OFFSET
     return res.status(200).json({
       trades,
-      // Data API pages by offset; a full page means there may be more.
-      nextOffset: trades.length === limit ? offset + limit : null,
+      // Data API pages by offset; a full page means there may be more — but never
+      // hand out an offset the upstream would 400 on.
+      nextOffset: fullPage && nextPageReachable ? offset + limit : null,
+      // Older fills exist upstream but sit beyond the Data API's offset cap.
+      capReached: fullPage && !nextPageReachable,
     })
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Could not load trade history'

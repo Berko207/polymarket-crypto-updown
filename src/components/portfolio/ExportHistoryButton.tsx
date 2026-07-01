@@ -69,7 +69,7 @@ export function ExportHistoryButton() {
 
       toast.success(
         `Exported ${fills.length} fill${fills.length === 1 ? '' : 's'}${
-          truncated ? ' (server caps history at 10,000)' : ''
+          truncated ? ' — older fills exist but the Data API only serves the most recent ~4,000' : ''
         }.`,
       )
     } catch (error) {

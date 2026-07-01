@@ -132,6 +132,8 @@ export interface TradeHistoryPage {
   trades: TradeFill[]
   /** Offset of the next page, or null when this page was the last. */
   nextOffset: number | null
+  /** True when older fills exist but sit beyond the Data API's offset cap. */
+  capReached?: boolean
 }
 
 export async function fetchTradeHistory(offset: number, limit = 40): Promise<TradeHistoryPage> {
