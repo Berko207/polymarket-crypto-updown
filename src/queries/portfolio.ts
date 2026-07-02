@@ -16,7 +16,7 @@ import {
   type PlaceOrderResponse,
   type Position,
 } from '@/lib/api'
-import { recentFillPrice, recentFillSize, recentFillAgeMs, hasRecentFill, rememberRecentFill, rememberRecentSell, clearRecentFill, clearRecentSell, recentFillPositions, isRecentlySold } from '@/lib/recentFills'
+import { recentFillPrice, recentFillSize, recentFillAgeMs, hasRecentFill, rememberRecentFill, rememberRecentSell, clearRecentFill, recentFillPositions, isRecentlySold } from '@/lib/recentFills'
 import { timeframeFromEventSlug } from '@/lib/slugs'
 import { getTokenMarketLabel } from '@/lib/tokenLabels'
 import { qk } from './keys'
@@ -493,16 +493,15 @@ function patchGlobalPositionsCache(
   )
 }
 
+/** Overlay a buy the instant it's submitted. Buys only: sells are confirmation-gated
+ * in onSuccess — the row must stay visible (PositionRow's "Selling…" state) until the
+ * exchange confirms the fill, so they never touch the caches before the response. */
 function applyFillOptimistic(
   qc: ReturnType<typeof useQueryClient>,
   body: PlaceOrderRequest,
   fill: ResolvedFill,
 ) {
-  if (body.side === 'BUY') {
-    rememberRecentFill(body.tokenId, fill.price, fill.size, body.fillMeta)
-  } else {
-    rememberRecentSell(body.tokenId)
-  }
+  rememberRecentFill(body.tokenId, fill.price, fill.size, body.fillMeta)
   patchMarketHoldingsCache(qc, body.tokenId, body.side, fill, body.fillMeta)
   patchGlobalPositionsCache(qc, body.tokenId, body.side, fill, body.fillMeta)
 }
@@ -539,8 +538,8 @@ function rollbackFillOptimistic(
   snapshot: FillRollbackSnapshot,
   body: PlaceOrderRequest,
 ) {
-  if (body.side === 'SELL') clearRecentSell(body.tokenId)
-  else clearRecentFill(body.tokenId)
+  // Snapshots only exist for buys — sells never apply an optimistic patch.
+  clearRecentFill(body.tokenId)
   rollbackFillCaches(qc, snapshot)
 }
 
@@ -565,6 +564,10 @@ export function usePlaceOrder() {
   return useMutation({
     mutationFn: (body: PlaceOrderRequest) => placeOrder(body),
     onMutate: (body) => {
+      // Confirmation-gated sells: the position row stays in the panel (button
+      // flips to "Selling…") until the exchange responds — nothing is hidden or
+      // patched on click, so a failed sell never blinks the row out and back.
+      if (body.side === 'SELL') return undefined
       const estimate = resolveFillFromRequest(body)
       if (!estimate) return undefined
       const snapshot = captureFillSnapshot(qc)
@@ -575,6 +578,10 @@ export function usePlaceOrder() {
       const fill = resolveFill(body, data) ?? resolveFillFromRequest(body)
       const status = (data.status ?? '').toLowerCase()
       const filled = status !== 'unmatched' && status !== 'rejected'
+      // "delayed" = accepted but not matched yet, NOT a confirmed fill. Sell
+      // row-hides gate on this; buys keep treating delayed as filled (optimistic,
+      // reconciled by the refetch burst either way).
+      const confirmed = filled && status !== 'delayed'
 
       if (!filled) {
         if (snapshot) rollbackFillOptimistic(qc, snapshot, body)
@@ -591,18 +598,22 @@ export function usePlaceOrder() {
           patchMarketHoldingsCache(qc, body.tokenId, body.side, fill, body.fillMeta)
           patchGlobalPositionsCache(qc, body.tokenId, body.side, fill, body.fillMeta)
           rememberRecentFill(body.tokenId, fill.price, fill.size, body.fillMeta)
-        } else if (isFullSellFill(body, fill, filled)) {
+        } else if (!confirmed) {
+          // Delayed sell — leave the row visible (nothing was patched on click);
+          // the refetch burst + holdings poll drop it once the order actually
+          // matches on-chain, or it stays if the match never lands.
+        } else if (isFullSellFill(body, fill, confirmed)) {
+          // Confirmed full-close: hide the row now and keep stale Data-API rows
+          // from resurrecting it (rememberRecentSell TTL).
           rememberRecentSell(body.tokenId)
           patchMarketHoldingsCache(qc, body.tokenId, body.side, fill, body.fillMeta)
           patchGlobalPositionsCache(qc, body.tokenId, body.side, fill, body.fillMeta)
-        } else if (body.side === 'SELL') {
-          // Partial sell — show reduced size, don't hide the row.
-          clearRecentSell(body.tokenId)
-          if (snapshot) rollbackFillOptimistic(qc, snapshot, body)
+        } else {
+          // Confirmed partial limit sell — show reduced size, don't hide the row.
           patchMarketHoldingsCache(qc, body.tokenId, 'SELL', fill, body.fillMeta)
           patchGlobalPositionsCache(qc, body.tokenId, 'SELL', fill, body.fillMeta)
         }
-      } else if (body.side === 'SELL' && filled) {
+      } else if (body.side === 'SELL' && confirmed) {
         // Defensive only — sells always carry a size, so `fill` can't resolve null.
         // If it ever does, hide the row (portfolio sells are full-close intents);
         // don't patch caches with a fabricated fill.
