@@ -1,5 +1,5 @@
 import { getCoin, getTimeframe, TIMEFRAMES } from './config'
-import { timeframeFromEventSlug } from './slugs'
+import { timeframeFromEventSlug, windowEndFromEventSlug } from './slugs'
 import type { OpenOrder, Position } from './api'
 import type { ParsedMarket, TimeframeId } from './types'
 import { getTokenMarketLabel } from './tokenLabels'
@@ -119,6 +119,16 @@ export function coinSymbolFromPosition(position: Position): string {
 /** Timeframe bucket for a position (from event slug or stored buy label). */
 export function positionTimeframe(position: Position): TimeframeId | null {
   return formatPositionLabel(position).timeframe
+}
+
+/**
+ * True once the position's market window has ended — the market is settling but the
+ * Data API hasn't flipped `redeemable` yet. Unknown windows (foreign slugs, positions
+ * bought outside the app) return false and stay in the open list.
+ */
+export function positionWindowEnded(position: Position, nowMs: number): boolean {
+  const end = windowEndFromEventSlug(position.eventSlug)
+  return end != null && end.getTime() <= nowMs
 }
 
 export function filterPositionsByTimeframe(

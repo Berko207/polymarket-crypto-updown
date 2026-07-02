@@ -112,6 +112,55 @@ export function timeframeFromEventSlug(slug: string): TimeframeId | null {
   return null
 }
 
+/** ET wall-clock hour → UTC instant (tries EDT then EST offsets, verified via Intl). */
+function etWallTimeToUtc(year: number, month: number, day: number, hour: number): Date {
+  for (const offset of [4, 5]) {
+    const guess = new Date(Date.UTC(year, month - 1, day, hour + offset))
+    const p = getEtParts(guess)
+    if (p.year === year && p.month === month && p.day === day && p.hour === hour) return guess
+  }
+  return new Date(Date.UTC(year, month - 1, day, hour + 5))
+}
+
+/**
+ * Window end derived from the event slug — the only end-time source for positions,
+ * which carry no endDate. Rolling slugs embed the window-start unix ts; hourly slugs
+ * name the ET hour; daily windows settle at NOON ET on the slug's date, not midnight
+ * (verified against gamma endDate across every live coin×timeframe combo).
+ */
+export function windowEndFromEventSlug(slug: string): Date | null {
+  if (!slug) return null
+  const lower = slug.toLowerCase()
+
+  const rolling = lower.match(/-updown-(5m|15m|4h)-(\d{10})$/)
+  if (rolling) {
+    const interval = INTERVAL_SEC[rolling[1] as TimeframeId]
+    if (!interval) return null
+    return new Date((Number(rolling[2]) + interval) * 1000)
+  }
+
+  const months = MONTHS as readonly string[]
+
+  const hourly = lower.match(/-up-or-down-([a-z]+)-(\d{1,2})-(\d{4})-(\d{1,2})(am|pm)-et$/)
+  if (hourly) {
+    const month = months.indexOf(hourly[1]) + 1
+    if (month < 1) return null
+    let hour = Number(hourly[4]) % 12
+    if (hourly[5] === 'pm') hour += 12
+    const start = etWallTimeToUtc(Number(hourly[3]), month, Number(hourly[2]), hour)
+    return new Date(start.getTime() + 3_600_000)
+  }
+
+  const daily = lower.match(/-up-or-down-on-([a-z]+)-(\d{1,2})-(\d{4})$/)
+  if (daily) {
+    const month = months.indexOf(daily[1]) + 1
+    if (month < 1) return null
+    return etWallTimeToUtc(Number(daily[3]), month, Number(daily[2]), 12)
+  }
+
+  return null
+}
+
 /** Candidate event slugs to try, most likely first. */
 export function buildEventSlugCandidates(coin: CoinId, timeframe: TimeframeId): string[] {
   const now = new Date()

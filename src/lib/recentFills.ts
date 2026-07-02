@@ -29,8 +29,58 @@ const soldTokens = new Map<string, number>()
 let version = 0
 const listeners = new Set<() => void>()
 
+// Both maps survive a reload/HMR via localStorage: they bridge Data-API indexing lag
+// (~1 min), so losing them mid-lag made a just-sold row reappear on the next portfolio
+// load — and a just-bought one vanish — until the API caught up.
+const STORAGE_KEY = 'crypto-updown.recent-fills.v1'
+
+interface PersistedFills {
+  fills?: [string, RecentFillEntry][]
+  sold?: [string, number][]
+}
+
+function hydrate(): void {
+  if (typeof localStorage === 'undefined') return
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY)
+    if (!raw) return
+    const data = JSON.parse(raw) as PersistedFills
+    const now = Date.now()
+    for (const [tokenId, entry] of data.fills ?? []) {
+      if (
+        tokenId &&
+        entry &&
+        typeof entry.at === 'number' &&
+        typeof entry.price === 'number' &&
+        now - entry.at <= FILL_TTL_MS
+      ) {
+        fills.set(tokenId, entry)
+      }
+    }
+    for (const [tokenId, at] of data.sold ?? []) {
+      if (tokenId && typeof at === 'number' && now - at <= SOLD_TTL_MS) {
+        soldTokens.set(tokenId, at)
+      }
+    }
+  } catch {
+    // Corrupt or blocked storage — start clean; overlays degrade to in-memory only.
+  }
+}
+
+function persist(): void {
+  if (typeof localStorage === 'undefined') return
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ fills: [...fills], sold: [...soldTokens] }))
+  } catch {
+    // Quota/blocked — in-memory overlay still works for this session.
+  }
+}
+
+hydrate()
+
 function bump(): void {
   version += 1
+  persist()
   listeners.forEach((l) => l())
 }
 
