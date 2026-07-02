@@ -1,14 +1,17 @@
 import { useQuery } from '@tanstack/react-query'
 import { Download } from 'lucide-react'
 import { formatPercent } from '@/lib/polymarket'
+import { chainlinkPair } from '@/lib/cryptoPrice'
 import { downloadFile } from '@/lib/exportHistory'
 import { exportPredictionLog, getCalibration } from '@/lib/predictionLog'
+import { VOL_LOOKBACK_MS, volSeries, type FairValueConfidence } from '@/lib/fairValue'
 import { cn } from '@/lib/utils'
 import { qk } from '@/queries/keys'
 import { Button } from '@/components/ui/button'
+import { useChainlinkHistory } from '@/hooks/useChainlinkHistory'
 import type { FairValue } from '@/hooks/useFairValue'
 import type { MarketSpot } from '@/hooks/useMarketSpot'
-import type { FairValueConfidence } from '@/lib/fairValue'
+import type { ParsedMarket } from '@/lib/types'
 
 const CONFIDENCE_BADGE: Record<
   Exclude<FairValueConfidence, 'no-data'>,
@@ -30,7 +33,15 @@ function formatVolPct(value: number): string {
  * wide enough to matter. Hidden for coins without a Chainlink stream and
  * outside the measurement window.
  */
-export function FairValuePanel({ fv, spot }: { fv: FairValue; spot: MarketSpot }) {
+export function FairValuePanel({
+  market,
+  fv,
+  spot,
+}: {
+  market: ParsedMarket
+  fv: FairValue
+  spot: MarketSpot
+}) {
   const calibration = useQuery({
     queryKey: qk.predictionCalibration,
     queryFn: getCalibration,
@@ -38,9 +49,18 @@ export function FairValuePanel({ fv, spot }: { fv: FairValue; spot: MarketSpot }
     staleTime: 55_000,
   })
 
+  const pair = chainlinkPair(market.coin)
+  const active = fv.confidence !== 'no-data' && !spot.completed && spot.strikePhase === 'locked'
+  const ticks = useChainlinkHistory(
+    active ? pair : null,
+    Date.now() - VOL_LOOKBACK_MS[market.timeframe],
+  )
+
   if (fv.confidence === 'no-data' || spot.completed || spot.strikePhase !== 'locked') {
     return null
   }
+
+  const sigmaSeries = volSeries(ticks)
 
   const badge = CONFIDENCE_BADGE[fv.confidence]
   const edgePts = fv.edge != null ? fv.edge * 100 : null
@@ -87,7 +107,8 @@ export function FairValuePanel({ fv, spot }: { fv: FairValue; spot: MarketSpot }
       )}
 
       <div className="flex items-center justify-between gap-2 text-[0.65rem] text-muted-foreground">
-        <span>
+        <span className="flex items-center gap-2">
+          <VolSparkline values={sigmaSeries} />
           {fv.volPerMinPct != null ? (
             <>
               σ {formatVolPct(fv.volPerMinPct)}/min · window σ {fv.sigmaWindowPct != null ? formatVolPct(fv.sigmaWindowPct) : '—'}
@@ -114,6 +135,32 @@ export function FairValuePanel({ fv, spot }: { fv: FairValue; spot: MarketSpot }
         </span>
       </div>
     </div>
+  )
+}
+
+/** Passive per-minute σ trend — "is vol spiking right now vs. ten minutes ago". */
+function VolSparkline({ values }: { values: number[] }) {
+  if (values.length < 3) return null
+  const w = 84
+  const h = 20
+  const lo = Math.min(...values)
+  const hi = Math.max(...values)
+  const span = hi - lo || hi || 1
+  const px = (i: number) => 1 + (i / (values.length - 1)) * (w - 5)
+  const py = (v: number) => h - 2 - ((v - lo) / span) * (h - 4)
+  const points = values.map((v, i) => `${px(i).toFixed(1)},${py(v).toFixed(1)}`).join(' ')
+  const last = values[values.length - 1]
+  return (
+    <svg
+      width={w}
+      height={h}
+      className="shrink-0"
+      role="img"
+      aria-label="Per-minute realized volatility trend"
+    >
+      <polyline points={points} fill="none" stroke="var(--muted-foreground)" strokeWidth="1.5" opacity="0.7" />
+      <circle cx={px(values.length - 1)} cy={py(last)} r="2" fill="var(--primary)" />
+    </svg>
   )
 }
 

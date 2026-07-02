@@ -17,6 +17,7 @@ import { FairValuePanel } from './FairValuePanel'
 import { OddsGauge } from './OddsGauge'
 import { SpotPriceBar } from './SpotPriceBar'
 import { TradePanel } from './TradePanel'
+import { WindowPriceChart } from './WindowPriceChart'
 import { ProbabilityBar } from '@/components/common/ProbabilityBar'
 import { spotOddsDiverge, useMarketSpot } from '@/hooks/useMarketSpot'
 import { useFairValue } from '@/hooks/useFairValue'
@@ -101,6 +102,8 @@ export function MarketDetail({
 
         <SpotPriceBar key={market.eventSlug} market={market} spot={spot} />
 
+        <WindowPriceChart key={`chart-${market.eventSlug}`} market={market} spot={spot} />
+
         {oddsLagSpot && (
           <p className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-center text-xs text-amber-200">
             Order-book odds may lag — resolution price currently favors{' '}
@@ -125,7 +128,7 @@ export function MarketDetail({
 
         <ProbabilityBar upPrice={market.upPrice} />
 
-        <FairValuePanel fv={fairValue} spot={spot} />
+        <FairValuePanel market={market} fv={fairValue} spot={spot} />
 
         {canTrade ? (
           <TradePanel
