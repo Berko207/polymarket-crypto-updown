@@ -13,11 +13,13 @@ import { Button } from '@/components/ui/button'
 import { CoinBadge } from '@/components/common/CoinBadge'
 import { LiveStatusBadge } from '@/components/common/LiveStatusBadge'
 import { CountdownClock } from './CountdownClock'
+import { FairValuePanel } from './FairValuePanel'
 import { OddsGauge } from './OddsGauge'
 import { SpotPriceBar } from './SpotPriceBar'
 import { TradePanel } from './TradePanel'
 import { ProbabilityBar } from '@/components/common/ProbabilityBar'
 import { spotOddsDiverge, useMarketSpot } from '@/hooks/useMarketSpot'
+import { useFairValue } from '@/hooks/useFairValue'
 import { timeframeFromEventSlug } from '@/lib/slugs'
 import { getCoin } from '@/lib/config'
 import type { CoinId, ParsedMarket, TimeframeId } from '@/lib/types'
@@ -33,6 +35,7 @@ export function MarketDetail({
 }) {
   const { market, isLoading, isError, error, rolling, connected } = useLiveMarket(coin, timeframe)
   const spot = useMarketSpot(market, coin, timeframe)
+  const fairValue = useFairValue(market, spot)
   const subtitle = market ? formatMarketHeading(market).subtitle : ''
 
   useEffect(() => {
@@ -121,6 +124,8 @@ export function MarketDetail({
         </div>
 
         <ProbabilityBar upPrice={market.upPrice} />
+
+        <FairValuePanel fv={fairValue} spot={spot} />
 
         {canTrade ? (
           <TradePanel
