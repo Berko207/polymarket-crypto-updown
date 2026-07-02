@@ -64,12 +64,15 @@ export function PositionRow({
   quote,
   selling = false,
   sellFirst = false,
+  settling = false,
   onSell,
 }: {
   position: Position
   quote?: TokenQuote
   selling?: boolean
   sellFirst?: boolean
+  /** Market window ended, resolution not yet indexed — frozen, nothing to sell into. */
+  settling?: boolean
   onSell: (position: Position, sellPrice: number) => void
 }) {
   const { short, timeframeLabel, asset, window } = formatPositionLabel(position)
@@ -116,16 +119,24 @@ export function PositionRow({
           size="xs"
           variant="ghost"
           className={cn('h-6 px-2', side === 'up' ? 'text-up' : 'text-down')}
-          disabled={selling || sellMark == null || position.redeemable || position.size < MIN_POSITION_SIZE}
+          disabled={
+            selling ||
+            settling ||
+            sellMark == null ||
+            position.redeemable ||
+            position.size < MIN_POSITION_SIZE
+          }
           onClick={() => sellMark != null && onSell(position, sellMark)}
         >
           {selling
             ? 'Selling…'
-            : position.redeemable
-              ? 'Resolved'
-              : proceeds != null
-                ? `Sell ≈$${proceeds.toFixed(2)}`
-                : 'Sell'}
+            : settling
+              ? 'Resolving…'
+              : position.redeemable
+                ? 'Resolved'
+                : proceeds != null
+                  ? `Sell ≈$${proceeds.toFixed(2)}`
+                  : 'Sell'}
         </Button>
       </div>
     </li>

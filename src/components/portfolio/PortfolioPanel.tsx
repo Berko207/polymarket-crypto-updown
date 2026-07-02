@@ -22,6 +22,7 @@ import {
   filterPositionsByTimeframe,
   formatPositionLabel,
   groupPositionsByCoin,
+  positionWindowEnded,
 } from '@/lib/marketLabels'
 import { formatPnlPct, formatPnlUsd } from '@/lib/positionPnl'
 import {
@@ -99,10 +100,15 @@ export function PortfolioPanel({
   )
   const pending = mergePendingFillPositions(merged, chainCheckedTokenIds)
   const visible = filterRecentlySoldPositions(pending)
-  const positions = filterPositionsByTimeframe(visible, timeframe)
-  // `visible` is every crypto up/down position across all timeframes; the tab only shows
+  // A position whose window has ended is settling, not live — pull it out of the open
+  // list right away (frozen P&L + dead book would masquerade as a tradeable holding)
+  // and park it under Resolved until the Data API flips `redeemable`.
+  const settling = visible.filter((p) => positionWindowEnded(p, now))
+  const open = visible.filter((p) => !positionWindowEnded(p, now))
+  const positions = filterPositionsByTimeframe(open, timeframe)
+  // `open` is every live crypto up/down position across all timeframes; the tab only shows
   // the selected one. Surface the rest so they never look "missing" (they're one tab away).
-  const otherTimeframeCount = Math.max(0, visible.length - positions.length)
+  const otherTimeframeCount = Math.max(0, open.length - positions.length)
 
   const sell = useSellFlow()
   const tokenPairById = useMemo(() => {
@@ -193,7 +199,7 @@ export function PortfolioPanel({
                   )}
                 </>
               )}
-              <ResolvedPositionsSection positions={resolvedPositions} />
+              <ResolvedPositionsSection positions={resolvedPositions} settling={settling} />
             </div>
           )}
         </TabsContent>
@@ -299,8 +305,19 @@ function PortfolioSummary({
   )
 }
 
-/** Collapsible backlog of resolved (redeemable) positions across all timeframes. */
-function ResolvedPositionsSection({ positions }: { positions: Position[] }) {
+/**
+ * Collapsible backlog of resolved (redeemable) positions across all timeframes, plus
+ * "settling" ones — window ended, resolution not yet indexed. Settling rows show first
+ * (they're the freshest) and disappear on their own: winners re-enter as redeemable,
+ * losers drop off entirely once the Data API marks the market resolved.
+ */
+function ResolvedPositionsSection({
+  positions,
+  settling,
+}: {
+  positions: Position[]
+  settling: Position[]
+}) {
   const [open, setOpen] = useState(false)
 
   const sorted = useMemo(
@@ -312,7 +329,7 @@ function ResolvedPositionsSection({ positions }: { positions: Position[] }) {
     [positions],
   )
 
-  if (positions.length === 0) return null
+  if (positions.length === 0 && settling.length === 0) return null
 
   const CAP = 50
   const shown = sorted.slice(0, CAP)
@@ -330,23 +347,45 @@ function ResolvedPositionsSection({ positions }: { positions: Position[] }) {
           <ChevronRightIcon className={cn('size-3.5 transition-transform', open && 'rotate-90')} />
           Resolved
           <span className="rounded-full bg-muted px-1.5 py-0.5 text-[0.6rem] font-bold tabular-nums">
-            {positions.length}
+            {positions.length + settling.length}
           </span>
         </span>
         <span className="shrink-0 text-xs font-bold tabular-nums text-muted-foreground">
+          {settling.length > 0 && (
+            <span className="mr-1.5 font-semibold text-amber-500/90">
+              {settling.length} settling ·
+            </span>
+          )}
           ~${totalValue.toFixed(2)} to redeem
         </span>
       </button>
       {open && (
         <div className="flex flex-col gap-2 px-2 pb-2">
-          <p className="px-1 text-[0.65rem] leading-snug text-muted-foreground">
-            Resolved across all timeframes. Redeem on Polymarket to claim winnings.
-          </p>
-          <ul className="flex flex-col gap-2">
-            {shown.map((p) => (
-              <PositionRow key={p.tokenId} position={p} onSell={() => {}} />
-            ))}
-          </ul>
+          {settling.length > 0 && (
+            <>
+              <p className="px-1 text-[0.65rem] leading-snug text-muted-foreground">
+                Window ended — waiting for Polymarket to resolve. Winners turn redeemable,
+                losers drop off.
+              </p>
+              <ul className="flex flex-col gap-2">
+                {settling.map((p) => (
+                  <PositionRow key={p.tokenId} position={p} settling onSell={() => {}} />
+                ))}
+              </ul>
+            </>
+          )}
+          {shown.length > 0 && (
+            <>
+              <p className="px-1 text-[0.65rem] leading-snug text-muted-foreground">
+                Resolved across all timeframes. Redeem on Polymarket to claim winnings.
+              </p>
+              <ul className="flex flex-col gap-2">
+                {shown.map((p) => (
+                  <PositionRow key={p.tokenId} position={p} onSell={() => {}} />
+                ))}
+              </ul>
+            </>
+          )}
           {hidden > 0 && (
             <p className="px-1 text-center text-[0.65rem] text-muted-foreground">
               + {hidden} more resolved
