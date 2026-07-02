@@ -65,6 +65,7 @@ export function PositionRow({
   selling = false,
   sellFirst = false,
   settling = false,
+  markOverride = null,
   onSell,
 }: {
   position: Position
@@ -73,12 +74,14 @@ export function PositionRow({
   sellFirst?: boolean
   /** Market window ended, resolution not yet indexed — frozen, nothing to sell into. */
   settling?: boolean
+  /** Known resolved mark (1 won / 0 lost) — replaces the stale book/snapshot price. */
+  markOverride?: number | null
   onSell: (position: Position, sellPrice: number) => void
 }) {
   const { short, timeframeLabel, asset, window } = formatPositionLabel(position)
   const detail = [asset, window].filter(Boolean).join(' · ') || short
   const side = outcomeSide(position.outcome)
-  const live = livePositionMark(position, quote)
+  const live = markOverride ?? livePositionMark(position, quote)
   // Sell mark is the best available price (live bid → mid/last → polled snapshot), not
   // just the WS bid: it's only a server hint (the book is walked anyway), so gating the
   // Sell button on a live bid needlessly blocks selling in saver mode / before first quote.
@@ -114,7 +117,7 @@ export function PositionRow({
         </div>
       </div>
       <div className="flex shrink-0 flex-col items-end gap-1">
-        <PositionPnl position={position} quote={quote} compact />
+        <PositionPnl position={position} quote={quote} markOverride={markOverride} compact />
         <Button
           size="xs"
           variant="ghost"
@@ -131,7 +134,11 @@ export function PositionRow({
           {selling
             ? 'Selling…'
             : settling
-              ? 'Resolving…'
+              ? markOverride != null
+                ? markOverride >= 1
+                  ? 'Won · resolving…'
+                  : 'Lost'
+                : 'Resolving…'
               : position.redeemable
                 ? 'Resolved'
                 : proceeds != null

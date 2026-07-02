@@ -12,13 +12,16 @@ import type { Position } from '@/lib/api'
 export function PositionPnl({
   position,
   quote,
+  markOverride = null,
   compact = false,
 }: {
   position: Position
   quote?: TokenQuote
+  /** Known resolved mark (1 won / 0 lost) — replaces the stale book/snapshot price. */
+  markOverride?: number | null
   compact?: boolean
 }) {
-  const livePrice = livePositionMark(position, quote)
+  const livePrice = markOverride ?? livePositionMark(position, quote)
   const stats = computePositionLiveStats(position, livePrice)
 
   if (stats.liveValue == null) {
