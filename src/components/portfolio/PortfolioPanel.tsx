@@ -15,6 +15,7 @@ import { useWatchlistQuery } from '@/queries/market'
 import { useRecentFillVersion } from '@/hooks/useRecentFillVersion'
 import { useNow } from '@/hooks/useNow'
 import { useSellFlow, useCancelFlow } from '@/hooks/usePortfolioActions'
+import { useAutoSell } from '@/hooks/useAutoSell'
 import { useTokenQuotes } from '@/hooks/useTokenQuotes'
 import { useUpdateConfig } from '@/store/ui'
 import { getTimeframe } from '@/lib/config'
@@ -112,10 +113,6 @@ export function PortfolioPanel({
     return map
   }, [watchlistMarkets])
 
-  const handleSell = (position: Position, sellPrice: number) => {
-    const pair = tokenPairById.get(position.tokenId)
-    return sell.sell(position, sellPrice, undefined, pair)
-  }
   const { cancellingId, cancel } = useCancelFlow()
 
   const positionTokenIds = useMemo(
@@ -130,6 +127,21 @@ export function PortfolioPanel({
   const quoteOpts = { enabled: enabled && config.useWebSocket, throttleMs: config.throttleMs }
   const { quotes: positionQuotes } = useTokenQuotes(positionTokenIds, quoteOpts)
   const { quotes: orderQuotes } = useTokenQuotes(orderTokenIds, quoteOpts)
+
+  const autoSell = useAutoSell({
+    positions,
+    quotes: positionQuotes,
+    tokenPairById,
+    sell: sell.sell,
+  })
+  const handleSell = async (position: Position, sellPrice: number) => {
+    const result = await sell.sell(position, sellPrice, undefined, tokenPairById.get(position.tokenId))
+    // Empty book (nothing to hit) → watch for a bid to reappear and retry automatically.
+    if (result && (result.status ?? '').toLowerCase() === 'unmatched') autoSell.arm(position)
+    return result
+  }
+  const handleSellLimit = (position: Position, limitPrice: number) =>
+    sell.sellLimit(position, limitPrice, undefined, tokenPairById.get(position.tokenId))
 
   if (!enabled) {
     return (
@@ -181,6 +193,7 @@ export function PortfolioPanel({
                     quotes={positionQuotes}
                     sell={sell}
                     onSell={handleSell}
+                    onSellLimit={handleSellLimit}
                     selectedCoin={selectedCoin}
                   />
                   {otherTimeframeCount > 0 && (
@@ -360,12 +373,14 @@ function PositionGroupsByCoin({
   quotes,
   sell,
   onSell,
+  onSellLimit,
   selectedCoin,
 }: {
   positions: Position[]
   quotes: Record<string, import('@/lib/clobSocket').TokenQuote>
   sell: ReturnType<typeof useSellFlow>
   onSell: (position: Position, sellPrice: number) => void
+  onSellLimit: (position: Position, limitPrice: number) => void
   selectedCoin?: CoinId
 }) {
   const selectedSymbol = selectedCoin?.toUpperCase()
@@ -441,6 +456,7 @@ function PositionGroupsByCoin({
                   selling={sell.sellingId === p.tokenId}
                   sellFirst={recommendation.first === outcomeSide(p.outcome)}
                   onSell={onSell}
+                  onSellLimit={onSellLimit}
                 />
               ))}
             </ul>

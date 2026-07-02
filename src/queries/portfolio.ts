@@ -311,20 +311,31 @@ export function useMarketHoldingsQuery(
   })
 }
 
-function refetchPortfolio(qc: ReturnType<typeof useQueryClient>) {
+/** Balance + open orders index server-side immediately and don't touch the positions
+ * caches, so we can refetch them aggressively without clobbering an optimistic fill. */
+function refetchAccountFast(qc: ReturnType<typeof useQueryClient>) {
   void qc.refetchQueries({ queryKey: qk.orders })
-  void qc.refetchQueries({ queryKey: qk.positions })
-  void qc.refetchQueries({ queryKey: ['positions', 'market'] })
   void qc.refetchQueries({ queryKey: qk.account })
 }
 
-const REFETCH_AFTER_FILL_MS = [0, 100, 250, 500, 1_000, 2_000, 4_000] as const
+/** Positions/holdings lag behind a fill (Data-API + chain indexing), so refetching them
+ * early only overwrites the freshly-patched row with not-yet-indexed data — the churn
+ * that made a fresh buy flicker. Fire once, late, after indexing is plausible; the
+ * 1.5s/3s query polls plus the recentFills overlay hold the row in the meantime. */
+function refetchPositions(qc: ReturnType<typeof useQueryClient>) {
+  void qc.refetchQueries({ queryKey: qk.positions })
+  void qc.refetchQueries({ queryKey: ['positions', 'market'] })
+}
+
+const REFETCH_ACCOUNT_MS = [0, 400, 1_200] as const
+const REFETCH_POSITIONS_MS = 2_500
 
 function schedulePortfolioRefetches(qc: ReturnType<typeof useQueryClient>) {
-  for (const delay of REFETCH_AFTER_FILL_MS) {
-    if (delay === 0) refetchPortfolio(qc)
-    else setTimeout(() => refetchPortfolio(qc), delay)
+  for (const delay of REFETCH_ACCOUNT_MS) {
+    if (delay === 0) refetchAccountFast(qc)
+    else setTimeout(() => refetchAccountFast(qc), delay)
   }
+  setTimeout(() => refetchPositions(qc), REFETCH_POSITIONS_MS)
 }
 
 interface ResolvedFill {
@@ -466,6 +477,21 @@ function captureFillSnapshot(qc: ReturnType<typeof useQueryClient>): FillRollbac
   }
 }
 
+/** Restore the pre-fill positions caches WITHOUT touching the recentFills overlay.
+ * Used to undo the optimistic estimate before re-patching with a confirmed fill, so
+ * mergeBuyIntoPosition doesn't stack the confirmed size onto the estimate (doubling
+ * size / blending avgPrice). Leaving the overlay entry alone means the row never
+ * blinks out — PortfolioPanel re-renders synchronously on that store. */
+function rollbackFillCaches(
+  qc: ReturnType<typeof useQueryClient>,
+  snapshot: FillRollbackSnapshot,
+) {
+  qc.setQueryData(qk.positions, snapshot.global)
+  for (const [key, data] of snapshot.markets) {
+    qc.setQueryData(key, data)
+  }
+}
+
 function rollbackFillOptimistic(
   qc: ReturnType<typeof useQueryClient>,
   snapshot: FillRollbackSnapshot,
@@ -473,10 +499,7 @@ function rollbackFillOptimistic(
 ) {
   if (body.side === 'SELL') clearRecentSell(body.tokenId)
   else clearRecentFill(body.tokenId)
-  qc.setQueryData(qk.positions, snapshot.global)
-  for (const [key, data] of snapshot.markets) {
-    qc.setQueryData(key, data)
-  }
+  rollbackFillCaches(qc, snapshot)
 }
 
 /** True when a sell fully closed the position (not unmatched / partial zero-fill). */
@@ -500,6 +523,11 @@ export function usePlaceOrder() {
   return useMutation({
     mutationFn: (body: PlaceOrderRequest) => placeOrder(body),
     onMutate: (body) => {
+      // A resting limit order must NOT be patched optimistically: a limit SELL leaves the
+      // shares held until a buyer crosses it, and a limit BUY adds nothing until it fills.
+      // Any real fill (a marketable limit that crosses immediately) is reconciled from the
+      // server result in onSuccess.
+      if (body.orderType === 'limit') return undefined
       const estimate = resolveFillFromRequest(body)
       if (!estimate) return undefined
       const snapshot = captureFillSnapshot(qc)
@@ -507,17 +535,38 @@ export function usePlaceOrder() {
       return snapshot
     },
     onSuccess: (data, body, snapshot) => {
-      const fill = resolveFill(body, data) ?? resolveFillFromRequest(body)
       const status = (data.status ?? '').toLowerCase()
+
+      // A GTC limit order that rests comes back with a status ('live') but no making/taking,
+      // so the server reports no fillSize. resolveFill would otherwise fabricate a full fill
+      // from the request and wrongly hide the position — so only reconcile a limit order when
+      // the server actually reports a matched size; a resting order just refreshes open orders.
+      const serverReportedFill = data.fillSize != null && data.fillSize > 0 && data.fillPrice != null
+      if (body.orderType === 'limit' && !serverReportedFill) {
+        void qc.invalidateQueries({ queryKey: qk.orders })
+        void qc.invalidateQueries({ queryKey: qk.account })
+        schedulePortfolioRefetches(qc)
+        return
+      }
+
+      const fill = resolveFill(body, data) ?? resolveFillFromRequest(body)
       const filled = status !== 'unmatched' && status !== 'rejected'
 
       if (!filled) {
         if (snapshot) rollbackFillOptimistic(qc, snapshot, body)
       } else if (fill) {
         if (body.side === 'BUY') {
-          rememberRecentFill(body.tokenId, fill.price, fill.size, body.fillMeta)
+          // Roll back the optimistic estimate from the CACHES only (not the overlay):
+          // patchGlobalPositionsCache below then applies the confirmed fill as a single
+          // row instead of stacking it onto the estimate (which doubles size and blends
+          // avgPrice, so the panel never matches the toast's fillPrice). The recentFills
+          // overlay entry is left in place and simply overwritten by rememberRecentFill
+          // last — so the row never blinks out (PortfolioPanel renders synchronously on
+          // that store, and a clear→re-remember would paint an empty frame between bumps).
+          if (snapshot) rollbackFillCaches(qc, snapshot)
           patchMarketHoldingsCache(qc, body.tokenId, body.side, fill, body.fillMeta)
           patchGlobalPositionsCache(qc, body.tokenId, body.side, fill, body.fillMeta)
+          rememberRecentFill(body.tokenId, fill.price, fill.size, body.fillMeta)
         } else if (isFullSellFill(body, fill, filled)) {
           rememberRecentSell(body.tokenId)
           patchMarketHoldingsCache(qc, body.tokenId, body.side, fill, body.fillMeta)
