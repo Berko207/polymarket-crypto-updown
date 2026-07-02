@@ -35,6 +35,7 @@ import { cn } from '@/lib/utils'
 import { ExportHistoryButton } from './ExportHistoryButton'
 import { OrderRow } from './OrderRow'
 import { PositionRow } from './PositionRow'
+import { SettlingPositionRow } from './SettlingPositionRow'
 import { TradeHistory } from './TradeHistory'
 import { outcomeSide } from '@/components/common/OutcomeBadge'
 import type { CoinId, TimeframeId } from '@/lib/types'
@@ -379,7 +380,7 @@ function ResolvedPositionsSection({
               </p>
               <ul className="flex flex-col gap-2">
                 {settling.map((p) => (
-                  <PositionRow key={p.tokenId} position={p} settling onSell={() => {}} />
+                  <SettlingPositionRow key={p.tokenId} position={p} />
                 ))}
               </ul>
             </>
