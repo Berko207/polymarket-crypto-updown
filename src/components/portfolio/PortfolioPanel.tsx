@@ -82,7 +82,10 @@ export function PortfolioPanel({
     return map
   }, [watchlistMarkets])
 
-  const { instant, authoritativeTokenIds } = useTimeframeHoldingsQuery(watchlistMarkets, enabled)
+  const { instant, authoritativeTokenIds, chainCheckedTokenIds } = useTimeframeHoldingsQuery(
+    watchlistMarkets,
+    enabled,
+  )
 
   const orders = ordersQuery.data ?? []
   // No useMemo — recentFills TTL prunes expire silently (no version bump), and
@@ -94,7 +97,7 @@ export function PortfolioPanel({
     authoritativeTokenIds,
     marketMetaByToken,
   )
-  const pending = mergePendingFillPositions(merged)
+  const pending = mergePendingFillPositions(merged, chainCheckedTokenIds)
   const visible = filterRecentlySoldPositions(pending)
   const positions = filterPositionsByTimeframe(visible, timeframe)
   // `visible` is every crypto up/down position across all timeframes; the tab only shows

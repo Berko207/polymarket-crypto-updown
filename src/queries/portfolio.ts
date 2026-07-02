@@ -16,7 +16,7 @@ import {
   type PlaceOrderResponse,
   type Position,
 } from '@/lib/api'
-import { recentFillPrice, recentFillSize, hasRecentFill, rememberRecentFill, rememberRecentSell, clearRecentFill, clearRecentSell, recentFillPositions, isRecentlySold } from '@/lib/recentFills'
+import { recentFillPrice, recentFillSize, recentFillAgeMs, hasRecentFill, rememberRecentFill, rememberRecentSell, clearRecentFill, clearRecentSell, recentFillPositions, isRecentlySold } from '@/lib/recentFills'
 import { timeframeFromEventSlug } from '@/lib/slugs'
 import { getTokenMarketLabel } from '@/lib/tokenLabels'
 import { qk } from './keys'
@@ -226,17 +226,39 @@ export function filterRecentlySoldPositions(positions: Position[]): Position[] {
   return positions.filter((p) => !isRecentlySold(p.tokenId))
 }
 
-/** Overlay in-flight fills (chain often lags 1–3s behind a market buy). */
-export function mergePendingFillPositions(positions: Position[]): Position[] {
+/** After this long, any fill has settled on-chain, so a checked balance beats the
+ * optimistic estimate. Market buys are FAK and can PARTIAL-fill; the estimate assumes
+ * the full amount filled, so letting it override chain truth for the whole fill TTL
+ * shows a phantom size — and selling that size bounces off the CLOB's balance check
+ * ("not enough balance / allowance"), making the position unsellable from the UI. */
+const TRUST_CHAIN_AFTER_MS = 15_000
+
+/**
+ * Overlay in-flight fills (chain often lags 1–3s behind a market buy).
+ *
+ * `chainCheckedTokenIds` are tokens whose on-chain balance the instant path has
+ * actually fetched. Once a pending fill is old enough that the chain must have
+ * settled it, those tokens trust the merged (chain-backed) row: the overlay no
+ * longer inflates the size and no longer resurrects a row the chain says is gone —
+ * it only backfills cost metadata the indexer hasn't produced yet.
+ */
+export function mergePendingFillPositions(
+  positions: Position[],
+  chainCheckedTokenIds?: ReadonlySet<string>,
+): Position[] {
   const byToken = new Map(positions.map((p) => [p.tokenId, p]))
   for (const pending of recentFillPositions()) {
+    const age = recentFillAgeMs(pending.tokenId) ?? 0
+    const chainTrusted =
+      age > TRUST_CHAIN_AFTER_MS && (chainCheckedTokenIds?.has(pending.tokenId) ?? false)
     const existing = byToken.get(pending.tokenId)
     if (!existing) {
-      byToken.set(pending.tokenId, pending)
+      if (!chainTrusted) byToken.set(pending.tokenId, pending)
       continue
     }
-    if (existing.size < pending.size || existing.avgPrice <= 0) {
-      const size = Math.max(existing.size, pending.size)
+    const inflate = !chainTrusted && existing.size < pending.size
+    if (inflate || existing.avgPrice <= 0) {
+      const size = inflate ? pending.size : existing.size
       const avgPrice = existing.avgPrice > 0 ? existing.avgPrice : pending.avgPrice
       byToken.set(pending.tokenId, {
         ...existing,
@@ -288,7 +310,20 @@ export function useTimeframeHoldingsQuery(
     return ids
   }, [markets, results])
 
-  return { instant, authoritativeTokenIds }
+  // Every token the instant path has fetched a chain balance for — including
+  // recently-filled ones (unlike `authoritativeTokenIds`). Lets the pending-fill
+  // overlay stop trusting its estimate once the chain has settled the buy.
+  const chainCheckedTokenIds = useMemo(() => {
+    const ids = new Set<string>()
+    markets.forEach((m, i) => {
+      if (results[i].data === undefined) return
+      if (m.upTokenId) ids.add(m.upTokenId)
+      if (m.downTokenId) ids.add(m.downTokenId)
+    })
+    return ids
+  }, [markets, results])
+
+  return { instant, authoritativeTokenIds, chainCheckedTokenIds }
 }
 
 /**

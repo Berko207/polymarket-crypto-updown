@@ -53,3 +53,29 @@ reappear. Selling behaves fine.
 
 Sells use the separate sold-hide path (`rememberRecentSell` / `soldTokens`), which master
 already has, and any filled market sell hides the row unconditionally (full-close intent).
+
+## Follow-up incident (2026-07-02): phantom size blocks the sell
+
+**Symptom:** selling XRP Up failed with CLOB error
+`not enough balance / allowance: balance: 1851850, order amount: 3700000`
+while the row showed "3.70 shares · $2.00 cost".
+
+**Mechanism:** market buys are FAK (`api/_lib/clob.ts`) and can **partial-fill**. A $2.00
+buy at 54¢ only found ~$1.00 of asks, so 1.85 shares filled and the rest was cancelled.
+The immediate CLOB response often omits/under-reports `fillSize`, so the client fell back
+to the assume-it-all-filled estimate ($2 ÷ 0.54 = 3.70) and `mergePendingFillPositions`
+kept `Math.max(chain 1.85, estimate 3.70)` for the 5-minute fill TTL. Selling the
+displayed 3.70 then bounced off the CLOB's balance check — position unsellable from the UI.
+
+**Fixes (this branch):**
+- `api/orders.ts` — market SELLs clamp to the live on-chain balance (portfolio sells are
+  full-close intents); a ~zero balance returns a clear 409 instead of a CLOB reject.
+- `mergePendingFillPositions` — once a pending fill is >15s old (`TRUST_CHAIN_AFTER_MS`)
+  and the token's chain balance has been fetched (`chainCheckedTokenIds` from
+  `useTimeframeHoldingsQuery`), the overlay stops inflating size / resurrecting rows and
+  only backfills cost metadata the indexer hasn't produced yet.
+- Buy toast shows `≈` before the share count when the CLOB didn't report a real fill size.
+
+**Known limitation:** a position bought on one timeframe tab isn't chain-checked while a
+different tab is focused, so the inflated size can persist there until the Data API row
+wins; the sell clamp still makes closing it work.

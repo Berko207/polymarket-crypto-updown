@@ -9,6 +9,7 @@ import {
 } from './_lib/clob.js'
 import { getMaxOrderCost, getMaxOrderSize, guardTradingApi, rateLimit } from './_lib/auth.js'
 import { requireCanPlaceOrders, requireConfigured, requireWalletReady } from './_lib/guards.js'
+import { fetchTokenBalance } from './_lib/positions.js'
 
 function readJsonBody(req: VercelRequest): Record<string, unknown> {
   if (req.body == null || req.body === '') return {}
@@ -111,16 +112,31 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       const marketPrice =
         Number.isFinite(price) && price > 0 && price < 1 ? price : undefined
 
+      // Portfolio sells are full-close intents, but the client's size can overstate the
+      // holding (FAK buys partial-fill while the optimistic row assumes the full amount
+      // filled). The CLOB rejects the whole oversized order ("not enough balance /
+      // allowance"), leaving the position unsellable — clamp to the live balance instead.
+      let orderAmount = marketAmount
+      if (side === 'SELL') {
+        const balance = await fetchTokenBalance(tokenId)
+        if (balance < 0.01) {
+          return res.status(409).json({
+            error: `no shares to sell — on-chain balance is ${balance.toFixed(4)} (position may already be closed)`,
+          })
+        }
+        if (balance < orderAmount) orderAmount = balance
+      }
+
       console.info('[orders] market', {
         side,
-        amount: marketAmount,
+        amount: orderAmount,
         price: marketPrice,
         tokenId: tokenId.slice(0, 12),
       })
       const result = await placeMarketOrder({
         tokenId,
         side,
-        amount: marketAmount,
+        amount: orderAmount,
         price: marketPrice,
         orderType: 'market',
         tickSize,
