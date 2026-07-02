@@ -22,4 +22,5 @@ export const qk = {
   orders: ['orders'] as const,
   positions: ['positions'] as const,
   tradeHistory: ['tradeHistory'] as const,
+  predictionCalibration: ['predictionCalibration'] as const,
 }

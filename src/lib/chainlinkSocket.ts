@@ -14,6 +14,8 @@ export interface ChainlinkTick {
   value: number
   /** Oracle measurement time (ms). */
   timestamp: number
+  /** RTDS re-emitted a stale print (`is_carried_forward`) — not a fresh oracle observation. */
+  carried?: boolean
 }
 
 export type ChainlinkPriceMap = Record<string, ChainlinkTick>
@@ -96,6 +98,21 @@ class ChainlinkSocket {
     return this.prices[pair] ?? null
   }
 
+  /** Retained ticks at/after `sinceMs`, oldest first (bounded by the 5h ring buffer). */
+  ticksSince(pair: string, sinceMs: number): ChainlinkTick[] {
+    const ticks = this.history[pair]
+    if (!ticks?.length) return []
+    // Ticks are append-ordered by timestamp — binary search the start.
+    let lo = 0
+    let hi = ticks.length
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1
+      if (ticks[mid].timestamp < sinceMs) lo = mid + 1
+      else hi = mid
+    }
+    return ticks.slice(lo)
+  }
+
   // A resolved strike is immutable (first tick at/after a past boundary never changes),
   // and callers ask per render — cache hits keep this O(1) instead of a history scan.
   private strikeCache = new Map<string, number>()
@@ -166,6 +183,7 @@ class ChainlinkSocket {
       value,
       timestamp: Number.isFinite(timestamp) ? timestamp : Date.now(),
     }
+    if (payload.is_carried_forward === true) tick.carried = true
 
     const prev = this.prices[symbol]
     if (prev?.value === tick.value && prev.timestamp === tick.timestamp) return false
