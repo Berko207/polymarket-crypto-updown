@@ -433,9 +433,16 @@ function patchMarketHoldingsCache(
 
   qc.setQueriesData<Position[]>({ queryKey: ['positions', 'market'] }, patch)
 
+  // setQueriesData only reaches queries already in the cache — seed the focused
+  // market's key when absent (portfolio panel not mounted yet). When it IS cached,
+  // the prefix pass above already patched it; patching again here would stack the
+  // same fill twice (mergeBuyIntoPosition treats the first patch as a prior holding,
+  // doubling the row's size and cost until the post-fill refetch lands).
   if (meta?.upTokenId || meta?.downTokenId) {
     const key = ['positions', 'market', meta.upTokenId ?? '', meta.downTokenId ?? ''] as const
-    qc.setQueryData<Position[]>(key, patch(qc.getQueryData<Position[]>(key)))
+    if (qc.getQueryData<Position[]>(key) === undefined) {
+      qc.setQueryData<Position[]>(key, patch(undefined))
+    }
   }
 }
 
