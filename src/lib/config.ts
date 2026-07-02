@@ -48,12 +48,16 @@ const SERIES_SLUGS: Record<CoinId, Partial<Record<TimeframeId, string>>> = {
   },
   doge: {
     '5m': 'doge-up-or-down-5m',
+    '15m': 'doge-up-or-down-15m',
     '1h': 'doge-up-or-down-hourly',
+    '4h': 'doge-up-or-down-4h',
     daily: 'doge-up-or-down-daily',
   },
   bnb: {
     '5m': 'bnb-up-or-down-5m',
+    '15m': 'bnb-up-or-down-15m',
     '1h': 'bnb-up-or-down-hourly',
+    '4h': 'bnb-up-or-down-4h',
     daily: 'bnb-up-or-down-daily',
   },
 }

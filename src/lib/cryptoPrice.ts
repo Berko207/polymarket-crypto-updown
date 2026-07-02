@@ -1,12 +1,14 @@
 import { getCoin } from './config'
 import type { CoinId, ParsedMarket } from './types'
 
-/** RTDS Chainlink symbols — doge/bnb have no Chainlink stream on Polymarket. */
+/** RTDS Chainlink symbols — all six coins stream on `crypto_prices_chainlink` (verified 2026-07). */
 export const CHAINLINK_PAIR: Partial<Record<CoinId, string>> = {
   btc: 'btc/usd',
   eth: 'eth/usd',
   sol: 'sol/usd',
   xrp: 'xrp/usd',
+  doge: 'doge/usd',
+  bnb: 'bnb/usd',
 }
 
 export function chainlinkPair(coin: CoinId): string | null {
