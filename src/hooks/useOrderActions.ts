@@ -119,6 +119,50 @@ export function useOrderActions() {
     }
   }
 
+  const sellLimit = async (opts: {
+    tokenId: string
+    size: number
+    /** Limit price the order rests at until a buyer crosses it. */
+    price: number
+    label: string
+    tickSize?: number
+    negRisk?: boolean
+    fillMeta?: PlaceOrderFillMeta
+  }) => {
+    const id = toast.loading(`Posting resting sell for ${opts.label}…`)
+    try {
+      const result = await place.mutateAsync({
+        tokenId: opts.tokenId,
+        side: 'SELL',
+        orderType: 'limit',
+        size: opts.size,
+        price: opts.price,
+        tickSize: opts.tickSize,
+        negRisk: opts.negRisk,
+        fillMeta: opts.fillMeta,
+      })
+      const status = (result.status ?? '').toLowerCase()
+      if (status === 'unmatched' || status === 'rejected') {
+        toast.error(`Resting sell for ${opts.label} was rejected`, { id, duration: ERROR_TOAST_MS })
+      } else if (result.fillSize != null && result.fillSize > 0) {
+        // Marketable limit crossed immediately (fully or partially).
+        toast.success(
+          `Sell ${opts.label} filled${fillSummary(result, { price: opts.price, size: opts.size })}${idSuffix(result)}`,
+          { id },
+        )
+      } else {
+        toast.success(
+          `Resting sell posted · ${opts.label} @ ${formatCents(opts.price)} · ${opts.size.toFixed(2)} sh${idSuffix(result)}`,
+          { id },
+        )
+      }
+      return result
+    } catch (e) {
+      toast.error(errText(e, 'Resting sell failed'), { id, duration: ERROR_TOAST_MS })
+      throw e
+    }
+  }
+
   const cancel = async (orderId: string) => {
     const id = toast.loading('Cancelling order…')
     try {
@@ -130,5 +174,5 @@ export function useOrderActions() {
     }
   }
 
-  return { buy, sell, cancel, isPlacing: place.isPending, isCancelling: cancelMut.isPending }
+  return { buy, sell, sellLimit, cancel, isPlacing: place.isPending, isCancelling: cancelMut.isPending }
 }

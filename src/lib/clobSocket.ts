@@ -13,16 +13,26 @@ const PING_MS = 10_000
 const RECONNECT_MS = 2_000
 const RECONCILE_DEBOUNCE_MS = 30
 
+/** One resting order-book price level. */
+export interface BookLevel {
+  price: number
+  size: number
+}
+
 export interface TokenQuote {
   bestBid: number | null
   bestAsk: number | null
   lastTrade: number | null
+  /** Bid ladder, best (highest) price first. Populated only from the WebSocket book. */
+  bids: BookLevel[]
+  /** Ask ladder, best (lowest) price first. Populated only from the WebSocket book. */
+  asks: BookLevel[]
 }
 
 export type TokenQuoteMap = Record<string, TokenQuote>
 
 function emptyQuote(): TokenQuote {
-  return { bestBid: null, bestAsk: null, lastTrade: null }
+  return { bestBid: null, bestAsk: null, lastTrade: null, bids: [], asks: [] }
 }
 
 function toNum(value: unknown): number | null {
@@ -59,18 +69,58 @@ export function midFromQuotes(quotes: TokenQuoteMap, tokenId: string | null | un
   return quoteToPrice(quotes[tokenId])
 }
 
-function bestFromBook(bids: Array<{ price: string }>, asks: Array<{ price: string }>) {
-  let bestBid: number | null = null
-  let bestAsk: number | null = null
+/** Parse a raw book side into a sorted {@link BookLevel} ladder (best price first). */
+function ladderFromRaw(raw: Array<{ price?: string; size?: string }>, side: 'bid' | 'ask'): BookLevel[] {
+  const out: BookLevel[] = []
+  for (const level of raw) {
+    const price = toNum(level.price)
+    const size = toNum(level.size)
+    if (price != null && size != null && size > 0) out.push({ price, size })
+  }
+  // Bids: highest price first. Asks: lowest price first.
+  out.sort((a, b) => (side === 'bid' ? b.price - a.price : a.price - b.price))
+  return out
+}
+
+/** Upsert one price level into a ladder, returning a NEW array (size 0 removes the level). */
+function upsertLevel(ladder: BookLevel[], side: 'bid' | 'ask', price: number, size: number): BookLevel[] {
+  const next = ladder.filter((l) => l.price !== price)
+  if (size > 0) next.push({ price, size })
+  next.sort((a, b) => (side === 'bid' ? b.price - a.price : a.price - b.price))
+  return next
+}
+
+export interface BidDepth {
+  /** Total shares resting across every bid level. */
+  sharesBid: number
+  /** Whether any bid is on the book at all. */
+  hasBid: boolean
+  /** Whether the bid ladder can absorb the requested size. */
+  coversSize: boolean
+  /** Worst (lowest) price a market sell of `shares` would reach, or null if depth can't cover it. */
+  fillsAllAtPrice: number | null
+}
+
+/**
+ * Walk the bid ladder to answer "if I market-sold `shares` right now, what's available?".
+ * Depth comes from the WebSocket book only (REST never fills it), so this is empty until a
+ * live `book`/`price_change` frame for the token arrives.
+ */
+export function bidDepthForSize(quote: TokenQuote | undefined, shares: number): BidDepth {
+  const bids = quote?.bids ?? []
+  let sharesBid = 0
+  let remaining = shares > 0 ? shares : 0
+  let coversSize = !(shares > 0) && bids.length > 0
+  let fillsAllAtPrice: number | null = null
   for (const level of bids) {
-    const p = toNum(level.price)
-    if (p != null && (bestBid == null || p > bestBid)) bestBid = p
+    sharesBid += level.size
+    if (!coversSize && remaining > 0) {
+      remaining -= level.size
+      fillsAllAtPrice = level.price
+      if (remaining <= 1e-9) coversSize = true
+    }
   }
-  for (const level of asks) {
-    const p = toNum(level.price)
-    if (p != null && (bestAsk == null || p < bestAsk)) bestAsk = p
-  }
-  return { bestBid, bestAsk }
+  return { sharesBid, hasBid: bids.length > 0, coversSize, fillsAllAtPrice: coversSize ? fillsAllAtPrice : null }
 }
 
 function patchQuote(map: TokenQuoteMap, assetId: string, patch: Partial<TokenQuote>) {
@@ -91,17 +141,45 @@ function applyFrame(raw: unknown, map: TokenQuoteMap): boolean {
     case 'book': {
       const assetId = msg.asset_id as string | undefined
       if (!assetId) return false
-      const { bestBid, bestAsk } = bestFromBook(
-        (msg.bids as Array<{ price: string }>) ?? [],
-        (msg.asks as Array<{ price: string }>) ?? [],
-      )
-      patchQuote(map, assetId, { bestBid, bestAsk })
+      const rawBids = (msg.bids as Array<{ price?: string; size?: string }>) ?? []
+      const rawAsks = (msg.asks as Array<{ price?: string; size?: string }>) ?? []
+      const bids = ladderFromRaw(rawBids, 'bid')
+      const asks = ladderFromRaw(rawAsks, 'ask')
+      // A full snapshot replaces both ladders; best prices come from the ladder tops.
+      patchQuote(map, assetId, {
+        bids,
+        asks,
+        bestBid: bids[0]?.price ?? null,
+        bestAsk: asks[0]?.price ?? null,
+      })
       return true
     }
     case 'price_change': {
-      const items = (msg.price_changes as Array<{ asset_id: string; best_bid?: string; best_ask?: string }>) ?? []
+      // Each item is one level delta for an asset (size 0 removes it) plus the resulting
+      // top-of-book. Sizes let us keep the depth ladder live between full `book` snapshots.
+      const items =
+        (msg.price_changes as Array<{
+          asset_id: string
+          price?: string
+          side?: string
+          size?: string
+          best_bid?: string
+          best_ask?: string
+        }>) ?? []
       for (const item of items) {
-        patchQuote(map, item.asset_id, { bestBid: toNum(item.best_bid), bestAsk: toNum(item.best_ask) })
+        const existing = map[item.asset_id] ?? emptyQuote()
+        const patch: Partial<TokenQuote> = {
+          bestBid: toNum(item.best_bid),
+          bestAsk: toNum(item.best_ask),
+        }
+        const price = toNum(item.price)
+        const size = toNum(item.size)
+        if (price != null && size != null) {
+          const side = (item.side ?? '').toUpperCase()
+          if (side === 'BUY') patch.bids = upsertLevel(existing.bids, 'bid', price, size)
+          else if (side === 'SELL') patch.asks = upsertLevel(existing.asks, 'ask', price, size)
+        }
+        patchQuote(map, item.asset_id, patch)
       }
       return items.length > 0
     }
