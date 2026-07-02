@@ -23,9 +23,12 @@ function fillSummary(
     (opts.amountUsd != null && price != null && price > 0
       ? opts.amountUsd / price
       : opts.size)
+  // Without a CLOB-reported fill size this is the assume-it-all-filled estimate; a
+  // FAK can partial-fill, so mark it as approximate instead of stating it as fact.
+  const estimated = result.fillSize == null
   const parts: string[] = []
   if (price != null && price > 0) parts.push(`@ ${formatCents(price)}`)
-  if (size != null && size > 0) parts.push(`${size.toFixed(2)} sh`)
+  if (size != null && size > 0) parts.push(`${estimated ? '≈' : ''}${size.toFixed(2)} sh`)
   return parts.length ? ` · ${parts.join(' · ')}` : ''
 }
 

@@ -16,7 +16,7 @@ import {
   type PlaceOrderResponse,
   type Position,
 } from '@/lib/api'
-import { recentFillPrice, recentFillSize, hasRecentFill, rememberRecentFill, rememberRecentSell, clearRecentFill, clearRecentSell, recentFillPositions, isRecentlySold } from '@/lib/recentFills'
+import { recentFillPrice, recentFillSize, recentFillAgeMs, hasRecentFill, rememberRecentFill, rememberRecentSell, clearRecentFill, clearRecentSell, recentFillPositions, isRecentlySold } from '@/lib/recentFills'
 import { timeframeFromEventSlug } from '@/lib/slugs'
 import { getTokenMarketLabel } from '@/lib/tokenLabels'
 import { qk } from './keys'
@@ -226,17 +226,39 @@ export function filterRecentlySoldPositions(positions: Position[]): Position[] {
   return positions.filter((p) => !isRecentlySold(p.tokenId))
 }
 
-/** Overlay in-flight fills (chain often lags 1–3s behind a market buy). */
-export function mergePendingFillPositions(positions: Position[]): Position[] {
+/** After this long, any fill has settled on-chain, so a checked balance beats the
+ * optimistic estimate. Market buys are FAK and can PARTIAL-fill; the estimate assumes
+ * the full amount filled, so letting it override chain truth for the whole fill TTL
+ * shows a phantom size — and selling that size bounces off the CLOB's balance check
+ * ("not enough balance / allowance"), making the position unsellable from the UI. */
+const TRUST_CHAIN_AFTER_MS = 15_000
+
+/**
+ * Overlay in-flight fills (chain often lags 1–3s behind a market buy).
+ *
+ * `chainCheckedTokenIds` are tokens whose on-chain balance the instant path has
+ * actually fetched. Once a pending fill is old enough that the chain must have
+ * settled it, those tokens trust the merged (chain-backed) row: the overlay no
+ * longer inflates the size and no longer resurrects a row the chain says is gone —
+ * it only backfills cost metadata the indexer hasn't produced yet.
+ */
+export function mergePendingFillPositions(
+  positions: Position[],
+  chainCheckedTokenIds?: ReadonlySet<string>,
+): Position[] {
   const byToken = new Map(positions.map((p) => [p.tokenId, p]))
   for (const pending of recentFillPositions()) {
+    const age = recentFillAgeMs(pending.tokenId) ?? 0
+    const chainTrusted =
+      age > TRUST_CHAIN_AFTER_MS && (chainCheckedTokenIds?.has(pending.tokenId) ?? false)
     const existing = byToken.get(pending.tokenId)
     if (!existing) {
-      byToken.set(pending.tokenId, pending)
+      if (!chainTrusted) byToken.set(pending.tokenId, pending)
       continue
     }
-    if (existing.size < pending.size || existing.avgPrice <= 0) {
-      const size = Math.max(existing.size, pending.size)
+    const inflate = !chainTrusted && existing.size < pending.size
+    if (inflate || existing.avgPrice <= 0) {
+      const size = inflate ? pending.size : existing.size
       const avgPrice = existing.avgPrice > 0 ? existing.avgPrice : pending.avgPrice
       byToken.set(pending.tokenId, {
         ...existing,
@@ -288,7 +310,20 @@ export function useTimeframeHoldingsQuery(
     return ids
   }, [markets, results])
 
-  return { instant, authoritativeTokenIds }
+  // Every token the instant path has fetched a chain balance for — including
+  // recently-filled ones (unlike `authoritativeTokenIds`). Lets the pending-fill
+  // overlay stop trusting its estimate once the chain has settled the buy.
+  const chainCheckedTokenIds = useMemo(() => {
+    const ids = new Set<string>()
+    markets.forEach((m, i) => {
+      if (results[i].data === undefined) return
+      if (m.upTokenId) ids.add(m.upTokenId)
+      if (m.downTokenId) ids.add(m.downTokenId)
+    })
+    return ids
+  }, [markets, results])
+
+  return { instant, authoritativeTokenIds, chainCheckedTokenIds }
 }
 
 /**
@@ -311,20 +346,31 @@ export function useMarketHoldingsQuery(
   })
 }
 
-function refetchPortfolio(qc: ReturnType<typeof useQueryClient>) {
+/** Balance + open orders index server-side immediately and don't touch the positions
+ * caches, so we can refetch them aggressively without clobbering an optimistic fill. */
+function refetchAccountFast(qc: ReturnType<typeof useQueryClient>) {
   void qc.refetchQueries({ queryKey: qk.orders })
-  void qc.refetchQueries({ queryKey: qk.positions })
-  void qc.refetchQueries({ queryKey: ['positions', 'market'] })
   void qc.refetchQueries({ queryKey: qk.account })
 }
 
-const REFETCH_AFTER_FILL_MS = [0, 100, 250, 500, 1_000, 2_000, 4_000] as const
+/** Positions/holdings lag behind a fill (Data-API + chain indexing), so refetching them
+ * early only overwrites the freshly-patched row with not-yet-indexed data — the churn
+ * that made a fresh buy flicker. Fire once, late, after indexing is plausible; the
+ * 1.5s/3s query polls plus the recentFills overlay hold the row in the meantime. */
+function refetchPositions(qc: ReturnType<typeof useQueryClient>) {
+  void qc.refetchQueries({ queryKey: qk.positions })
+  void qc.refetchQueries({ queryKey: ['positions', 'market'] })
+}
+
+const REFETCH_ACCOUNT_MS = [0, 400, 1_200] as const
+const REFETCH_POSITIONS_MS = 2_500
 
 function schedulePortfolioRefetches(qc: ReturnType<typeof useQueryClient>) {
-  for (const delay of REFETCH_AFTER_FILL_MS) {
-    if (delay === 0) refetchPortfolio(qc)
-    else setTimeout(() => refetchPortfolio(qc), delay)
+  for (const delay of REFETCH_ACCOUNT_MS) {
+    if (delay === 0) refetchAccountFast(qc)
+    else setTimeout(() => refetchAccountFast(qc), delay)
   }
+  setTimeout(() => refetchPositions(qc), REFETCH_POSITIONS_MS)
 }
 
 interface ResolvedFill {
@@ -422,9 +468,16 @@ function patchMarketHoldingsCache(
 
   qc.setQueriesData<Position[]>({ queryKey: ['positions', 'market'] }, patch)
 
+  // setQueriesData only reaches queries already in the cache — seed the focused
+  // market's key when absent (portfolio panel not mounted yet). When it IS cached,
+  // the prefix pass above already patched it; patching again here would stack the
+  // same fill twice (mergeBuyIntoPosition treats the first patch as a prior holding,
+  // doubling the row's size and cost until the post-fill refetch lands).
   if (meta?.upTokenId || meta?.downTokenId) {
     const key = ['positions', 'market', meta.upTokenId ?? '', meta.downTokenId ?? ''] as const
-    qc.setQueryData<Position[]>(key, patch(qc.getQueryData<Position[]>(key)))
+    if (qc.getQueryData<Position[]>(key) === undefined) {
+      qc.setQueryData<Position[]>(key, patch(undefined))
+    }
   }
 }
 
@@ -466,6 +519,21 @@ function captureFillSnapshot(qc: ReturnType<typeof useQueryClient>): FillRollbac
   }
 }
 
+/** Restore the pre-fill positions caches WITHOUT touching the recentFills overlay.
+ * Used to undo the optimistic estimate before re-patching with a confirmed fill, so
+ * mergeBuyIntoPosition doesn't stack the confirmed size onto the estimate (doubling
+ * size / blending avgPrice). Leaving the overlay entry alone means the row never
+ * blinks out — PortfolioPanel re-renders synchronously on that store. */
+function rollbackFillCaches(
+  qc: ReturnType<typeof useQueryClient>,
+  snapshot: FillRollbackSnapshot,
+) {
+  qc.setQueryData(qk.positions, snapshot.global)
+  for (const [key, data] of snapshot.markets) {
+    qc.setQueryData(key, data)
+  }
+}
+
 function rollbackFillOptimistic(
   qc: ReturnType<typeof useQueryClient>,
   snapshot: FillRollbackSnapshot,
@@ -473,10 +541,7 @@ function rollbackFillOptimistic(
 ) {
   if (body.side === 'SELL') clearRecentSell(body.tokenId)
   else clearRecentFill(body.tokenId)
-  qc.setQueryData(qk.positions, snapshot.global)
-  for (const [key, data] of snapshot.markets) {
-    qc.setQueryData(key, data)
-  }
+  rollbackFillCaches(qc, snapshot)
 }
 
 /** True when a sell fully closed the position (not unmatched / partial zero-fill). */
@@ -515,9 +580,17 @@ export function usePlaceOrder() {
         if (snapshot) rollbackFillOptimistic(qc, snapshot, body)
       } else if (fill) {
         if (body.side === 'BUY') {
-          rememberRecentFill(body.tokenId, fill.price, fill.size, body.fillMeta)
+          // Roll back the optimistic estimate from the CACHES only (not the overlay):
+          // patchGlobalPositionsCache below then applies the confirmed fill as a single
+          // row instead of stacking it onto the estimate (which doubles size and blends
+          // avgPrice, so the panel never matches the toast's fillPrice). The recentFills
+          // overlay entry is left in place and simply overwritten by rememberRecentFill
+          // last — so the row never blinks out (PortfolioPanel renders synchronously on
+          // that store, and a clear→re-remember would paint an empty frame between bumps).
+          if (snapshot) rollbackFillCaches(qc, snapshot)
           patchMarketHoldingsCache(qc, body.tokenId, body.side, fill, body.fillMeta)
           patchGlobalPositionsCache(qc, body.tokenId, body.side, fill, body.fillMeta)
+          rememberRecentFill(body.tokenId, fill.price, fill.size, body.fillMeta)
         } else if (isFullSellFill(body, fill, filled)) {
           rememberRecentSell(body.tokenId)
           patchMarketHoldingsCache(qc, body.tokenId, body.side, fill, body.fillMeta)
