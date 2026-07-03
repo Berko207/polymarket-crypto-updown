@@ -1,6 +1,6 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node'
 import { fetchAccountSnapshot } from './_lib/clob.js'
-import { authorizeApiRequest, rateLimit } from './_lib/auth.js'
+import { guardReadApi } from './_lib/auth.js'
 import { canPlaceOrders, getPolyConfig, getWalletSetupIssue, isPolyConfigured } from './_lib/env.js'
 import { resolveTradingWallet } from './_lib/wallet.js'
 
@@ -10,8 +10,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return res.status(405).json({ error: 'Method not allowed' })
   }
 
-  if (!authorizeApiRequest(req, res)) return
-  if (!rateLimit(req, res, { limit: 60, key: 'account' })) return
+  if (!guardReadApi(req, res, { key: 'account' })) return
 
   if (!isPolyConfigured()) {
     return res.status(200).json({

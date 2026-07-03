@@ -1,5 +1,5 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node'
-import { authorizeApiRequest, rateLimit } from './_lib/auth.js'
+import { guardReadApi } from './_lib/auth.js'
 import { requireConfigured } from './_lib/guards.js'
 import { fetchMarketHoldings, fetchPositions } from './_lib/positions.js'
 
@@ -19,8 +19,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return res.status(405).json({ error: 'Method not allowed' })
   }
 
-  if (!authorizeApiRequest(req, res)) return
-  if (!rateLimit(req, res, { limit: 60, key: 'positions' })) return
+  // 6 watchlist markets × 1.5s instant polls + the 3s global poll ≈ 260 req/min;
+  // 600 leaves headroom for a second tab and post-fill refetch bursts.
+  if (!guardReadApi(req, res, { key: 'positions', limit: 600 })) return
   if (!requireConfigured(res)) return
 
   try {

@@ -16,7 +16,7 @@ import {
   type PlaceOrderResponse,
   type Position,
 } from '@/lib/api'
-import { recentFillPrice, recentFillSize, recentFillAgeMs, hasRecentFill, rememberRecentFill, rememberRecentSell, clearRecentFill, clearRecentSell, recentFillPositions, isRecentlySold } from '@/lib/recentFills'
+import { recentFillPrice, recentFillSize, recentFillAt, hasRecentFill, rememberRecentFill, rememberRecentSell, clearRecentFill, clearRecentSell, recentFillPositions, isRecentlySold } from '@/lib/recentFills'
 import { timeframeFromEventSlug } from '@/lib/slugs'
 import { getTokenMarketLabel } from '@/lib/tokenLabels'
 import { qk } from './keys'
@@ -189,29 +189,32 @@ export function useTradeHistoryQuery(enabled: boolean) {
  * Overlay the focused market's instant on-chain holdings onto the Data-API global
  * list so a fill shows immediately, before the Data API indexes it.
  *
- * `focusedTokenIds` are the tokens the instant (on-chain balance) path actually
- * checked. For those, the chain is authoritative: we drop the (possibly stale)
- * Data-API rows and re-add only what the instant path returned — so a buy/partial
- * sell shows the right size at once, and a full sell disappears instead of lingering.
- * Pass `[]` while the instant query is still loading to avoid hiding a real position.
+ * `chainChecks` maps each token the instant (on-chain balance) path has actually
+ * fetched to the wall-clock time of its freshest fetch (see
+ * {@link useTimeframeHoldingsQuery}). Checked tokens are authoritative: we drop the
+ * (possibly stale) Data-API rows and re-add only what the instant path returned — so
+ * a buy/partial sell shows the right size at once, and a full sell disappears instead
+ * of lingering. Tokens with an in-flight fill are exempt — the chain lags the fill,
+ * and a pre-fill snapshot must not delete the fresh row.
  */
 export function mergeInstantHoldings(
   global: Position[],
   instant: Position[],
-  authoritativeTokenIds: string[] = [],
+  chainChecks?: ReadonlyMap<string, number>,
   marketMetaByToken?: Map<string, FocusedMarketMeta>,
 ): Position[] {
-  const authoritative = new Set(authoritativeTokenIds)
+  const authoritative = (tokenId: string) =>
+    (chainChecks?.has(tokenId) ?? false) && !hasRecentFill(tokenId)
   const globalByToken = new Map(global.map((p) => [p.tokenId, p]))
   const byToken = new Map(
     global
-      .filter((p) => !authoritative.has(p.tokenId) && !isRecentlySold(p.tokenId))
+      .filter((p) => !authoritative(p.tokenId) && !isRecentlySold(p.tokenId))
       .map((p) => [p.tokenId, enrichFromMeta(p, marketMetaByToken?.get(p.tokenId))]),
   )
   for (const raw of instant) {
     if (isRecentlySold(raw.tokenId)) continue
     if (!isMeaningfulPosition(raw)) continue
-    let p = authoritative.has(raw.tokenId)
+    let p = authoritative(raw.tokenId)
       ? mergeInstantWithIndexed(raw, globalByToken.get(raw.tokenId))
       : raw
     const meta = marketMetaByToken?.get(raw.tokenId)
@@ -226,31 +229,31 @@ export function filterRecentlySoldPositions(positions: Position[]): Position[] {
   return positions.filter((p) => !isRecentlySold(p.tokenId))
 }
 
-/** After this long, any fill has settled on-chain, so a checked balance beats the
- * optimistic estimate. Market buys are FAK and can PARTIAL-fill; the estimate assumes
- * the full amount filled, so letting it override chain truth for the whole fill TTL
- * shows a phantom size — and selling that size bounces off the CLOB's balance check
- * ("not enough balance / allowance"), making the position unsellable from the UI. */
-const TRUST_CHAIN_AFTER_MS = 15_000
+/** A chain read this long after the fill must include it (balance settles in ~1–3s). */
+const CHAIN_SETTLE_MS = 6_000
 
 /**
  * Overlay in-flight fills (chain often lags 1–3s behind a market buy).
  *
- * `chainCheckedTokenIds` are tokens whose on-chain balance the instant path has
- * actually fetched. Once a pending fill is old enough that the chain must have
- * settled it, those tokens trust the merged (chain-backed) row: the overlay no
- * longer inflates the size and no longer resurrects a row the chain says is gone —
- * it only backfills cost metadata the indexer hasn't produced yet.
+ * `chainChecks` maps each token the instant path has fetched to the time of its
+ * freshest fetch. The merged (chain-backed) row is trusted over the overlay only
+ * once a fetch has been OBSERVED at least {@link CHAIN_SETTLE_MS} after the fill —
+ * from then on the overlay no longer inflates the size (market buys are FAK and can
+ * partial-fill; a phantom size made positions unsellable) and no longer resurrects a
+ * row the chain says is gone; it only backfills cost metadata the indexer hasn't
+ * produced yet. Trust is an observation, not a timeout: the old "N seconds since the
+ * fill" timer expired even when every post-fill poll had failed (rate-limited) or
+ * returned a pre-settle snapshot, which made a freshly bought row vanish until a
+ * poll finally got through.
  */
 export function mergePendingFillPositions(
   positions: Position[],
-  chainCheckedTokenIds?: ReadonlySet<string>,
+  chainChecks?: ReadonlyMap<string, number>,
 ): Position[] {
   const byToken = new Map(positions.map((p) => [p.tokenId, p]))
   for (const pending of recentFillPositions()) {
-    const age = recentFillAgeMs(pending.tokenId) ?? 0
-    const chainTrusted =
-      age > TRUST_CHAIN_AFTER_MS && (chainCheckedTokenIds?.has(pending.tokenId) ?? false)
+    const fillAt = recentFillAt(pending.tokenId) ?? 0
+    const chainTrusted = (chainChecks?.get(pending.tokenId) ?? 0) >= fillAt + CHAIN_SETTLE_MS
     const existing = byToken.get(pending.tokenId)
     if (!existing) {
       if (!chainTrusted) byToken.set(pending.tokenId, pending)
@@ -300,50 +303,20 @@ export function useTimeframeHoldingsQuery(
 
   const instant = useMemo(() => results.flatMap((r) => r.data ?? []), [results])
 
-  const authoritativeTokenIds = useMemo(() => {
-    const ids: string[] = []
+  // tokenId -> wall-clock time of the freshest chain-backed fetch covering it.
+  // (setQueryData from the optimistic patches also bumps dataUpdatedAt, but patches
+  // happen AT the fill, so they can never satisfy the fill + CHAIN_SETTLE_MS bar.)
+  const chainChecks = useMemo(() => {
+    const map = new Map<string, number>()
     markets.forEach((m, i) => {
       if (results[i].data === undefined) return
-      if (m.upTokenId && !hasRecentFill(m.upTokenId)) ids.push(m.upTokenId)
-      if (m.downTokenId && !hasRecentFill(m.downTokenId)) ids.push(m.downTokenId)
+      if (m.upTokenId) map.set(m.upTokenId, results[i].dataUpdatedAt)
+      if (m.downTokenId) map.set(m.downTokenId, results[i].dataUpdatedAt)
     })
-    return ids
+    return map
   }, [markets, results])
 
-  // Every token the instant path has fetched a chain balance for — including
-  // recently-filled ones (unlike `authoritativeTokenIds`). Lets the pending-fill
-  // overlay stop trusting its estimate once the chain has settled the buy.
-  const chainCheckedTokenIds = useMemo(() => {
-    const ids = new Set<string>()
-    markets.forEach((m, i) => {
-      if (results[i].data === undefined) return
-      if (m.upTokenId) ids.add(m.upTokenId)
-      if (m.downTokenId) ids.add(m.downTokenId)
-    })
-    return ids
-  }, [markets, results])
-
-  return { instant, authoritativeTokenIds, chainCheckedTokenIds }
-}
-
-/**
- * Holdings for ONE market via the upToken/downToken path, which merges live CLOB
- * token balances — so a freshly-filled position shows immediately, before the
- * Data API (used by {@link usePositionsQuery}) indexes it. Keyed under
- * `['positions', …]` so the place-order mutation's invalidation refreshes it too.
- */
-export function useMarketHoldingsQuery(
-  upTokenId: string | null,
-  downTokenId: string | null,
-  enabled: boolean,
-) {
-  return useQuery({
-    queryKey: ['positions', 'market', upTokenId ?? '', downTokenId ?? ''],
-    queryFn: () => fetchPositions({ upTokenId, downTokenId }),
-    enabled: enabled && Boolean(upTokenId || downTokenId),
-    refetchInterval: PORTFOLIO_POLL_MS,
-    select: (rows) => rows.filter(isMeaningfulPosition),
-  })
+  return { instant, chainChecks }
 }
 
 /** Balance + open orders index server-side immediately and don't touch the positions
@@ -466,19 +439,19 @@ function patchMarketHoldingsCache(
 ) {
   const patch = (old: Position[] | undefined) => patchRows(old ?? [], tokenId, side, fill, meta)
 
-  qc.setQueriesData<Position[]>({ queryKey: ['positions', 'market'] }, patch)
-
-  // setQueriesData only reaches queries already in the cache — seed the focused
-  // market's key when absent (portfolio panel not mounted yet). When it IS cached,
-  // the prefix pass above already patched it; patching again here would stack the
-  // same fill twice (mergeBuyIntoPosition treats the first patch as a prior holding,
-  // doubling the row's size and cost until the post-fill refetch lands).
+  // Patch (and seed if absent) exactly the market this token belongs to. Patching
+  // the whole ['positions','market'] family used to append a buy to every
+  // watchlist market's cache.
   if (meta?.upTokenId || meta?.downTokenId) {
     const key = ['positions', 'market', meta.upTokenId ?? '', meta.downTokenId ?? ''] as const
-    if (qc.getQueryData<Position[]>(key) === undefined) {
-      qc.setQueryData<Position[]>(key, patch(undefined))
-    }
+    qc.setQueryData<Position[]>(key, patch)
+    return
   }
+
+  // No token-pair metadata (e.g. selling a position whose market left the
+  // watchlist): fall back to the prefix patch. Harmless for sells — patchRows only
+  // touches rows already holding this token.
+  qc.setQueriesData<Position[]>({ queryKey: ['positions', 'market'] }, patch)
 }
 
 function patchGlobalPositionsCache(

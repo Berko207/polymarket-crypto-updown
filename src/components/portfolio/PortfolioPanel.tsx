@@ -83,10 +83,7 @@ export function PortfolioPanel({
     return map
   }, [watchlistMarkets])
 
-  const { instant, authoritativeTokenIds, chainCheckedTokenIds } = useTimeframeHoldingsQuery(
-    watchlistMarkets,
-    enabled,
-  )
+  const { instant, chainChecks } = useTimeframeHoldingsQuery(watchlistMarkets, enabled)
 
   const orders = ordersQuery.data ?? []
   // No useMemo — recentFills TTL prunes expire silently (no version bump), and
@@ -95,10 +92,10 @@ export function PortfolioPanel({
   const merged = mergeInstantHoldings(
     positionsQuery.data ?? [],
     instant,
-    authoritativeTokenIds,
+    chainChecks,
     marketMetaByToken,
   )
-  const pending = mergePendingFillPositions(merged, chainCheckedTokenIds)
+  const pending = mergePendingFillPositions(merged, chainChecks)
   const visible = filterRecentlySoldPositions(pending)
   // A position whose window has ended is settling, not live — pull it out of the open
   // list right away (frozen P&L + dead book would masquerade as a tradeable holding)

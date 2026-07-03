@@ -87,3 +87,20 @@ export function guardTradingApi(req: VercelRequest, res: VercelResponse): boolea
   }
   return true
 }
+
+/**
+ * Guard for read/prefetch endpoints (positions, account, open orders, warm).
+ * Each gets its OWN bucket, sized for the dashboard's steady polling — the
+ * watchlist's instant-holdings path alone is ~260 req/min. Sharing a bucket with
+ * (or sizing below) that load blacks out /api/positions for most of every minute,
+ * which is what made freshly bought positions vanish from the portfolio; and warm
+ * prefetches must never spend the order-placement budget.
+ */
+export function guardReadApi(
+  req: VercelRequest,
+  res: VercelResponse,
+  { key, limit = 240 }: { key: string; limit?: number },
+): boolean {
+  if (!authorizeApiRequest(req, res)) return false
+  return rateLimit(req, res, { limit, key })
+}

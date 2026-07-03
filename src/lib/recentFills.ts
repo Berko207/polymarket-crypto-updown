@@ -156,11 +156,10 @@ export function recentFillSize(tokenId: string): number | undefined {
   return prune(tokenId)?.size
 }
 
-/** Milliseconds since the fill was remembered — lets callers stop trusting the
- * optimistic estimate once the chain has had time to settle. */
-export function recentFillAgeMs(tokenId: string): number | undefined {
-  const entry = prune(tokenId)
-  return entry ? Date.now() - entry.at : undefined
+/** Wall-clock time the fill was remembered — lets callers judge whether a chain
+ * read happened before or after the fill (undefined once the entry expires). */
+export function recentFillAt(tokenId: string): number | undefined {
+  return prune(tokenId)?.at
 }
 
 /** Synthetic positions from in-flight buys — shown before chain balance updates. */
