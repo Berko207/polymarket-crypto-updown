@@ -77,14 +77,12 @@ export function useMarketSpot(
     queryKey: window
       ? qk.cryptoWindow(coin, timeframe, market!.eventSlug, window.eventStartTime, window.endDate)
       : (['cryptoWindow', 'pending', windowKey] as const),
-    queryFn: () => fetchCryptoPrice(symbol, window!.eventStartTime, window!.endDate, window!.variant),
+    queryFn: () => fetchCryptoPrice(symbol, window!.eventStartTime, window!.endDate),
     enabled: inScope && window != null,
     refetchInterval: (q) => {
       if (q.state.status === 'error') return 10_000
       if (q.state.data?.completed) return false
-      // Chainlink WS carries the live price; this poll only tracks completion,
-      // so a 24h window doesn't need the 2s cadence of the short ones.
-      return timeframe === 'daily' ? 15_000 : 2_000
+      return 2_000
     },
     staleTime: 0,
     gcTime: 0,
