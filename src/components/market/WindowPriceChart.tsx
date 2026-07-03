@@ -1,6 +1,15 @@
 import { useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { useQuery } from '@tanstack/react-query'
 import { useChainlinkHistory } from '@/hooks/useChainlinkHistory'
-import { chainlinkPair, formatSpotDelta, formatSpotUsd } from '@/lib/cryptoPrice'
+import {
+  chainlinkPair,
+  coinSymbol,
+  cryptoPriceVariant,
+  fetchCryptoPriceHistory,
+  formatSpotDelta,
+  formatSpotUsd,
+} from '@/lib/cryptoPrice'
+import { qk } from '@/queries/keys'
 import { cn } from '@/lib/utils'
 import type { MarketSpot } from '@/hooks/useMarketSpot'
 import type { ChainlinkTick } from '@/lib/chainlinkSocket'
@@ -52,8 +61,10 @@ function downsample(ticks: ChainlinkTick[], buckets: number): Point[] {
   return out
 }
 
-function timeLabel(ms: number): string {
-  return new Date(ms).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
+function timeLabel(ms: number, withDay = false): string {
+  const d = new Date(ms)
+  const time = d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
+  return withDay ? `${d.toLocaleDateString([], { weekday: 'short' })} ${time}` : time
 }
 
 /**
@@ -77,7 +88,36 @@ export function WindowPriceChart({ market, spot }: { market: ParsedMarket; spot:
     return () => ro.disconnect()
   }, [])
 
-  const ticks = useChainlinkHistory(startMs > 0 ? pair : null, startMs)
+  const liveTicks = useChainlinkHistory(startMs > 0 ? pair : null, startMs)
+
+  // The live ring buffer only reaches back ~5h (and only since page load) — for
+  // anything but a fresh short window, backfill the elapsed path from Polymarket.
+  const backfill = useQuery({
+    queryKey: qk.cryptoPriceHistory(market.eventSlug, startMs),
+    queryFn: () =>
+      fetchCryptoPriceHistory(
+        coinSymbol(market.coin),
+        new Date(startMs).toISOString(),
+        cryptoPriceVariant(market),
+      ),
+    enabled: pair != null && startMs > 0,
+    staleTime: Infinity,
+    retry: 2,
+  })
+
+  const ticks = useMemo(() => {
+    const hist = backfill.data
+    if (!hist?.length) return liveTicks
+    const firstLive = liveTicks.length ? liveTicks[0].timestamp : Infinity
+    const merged: ChainlinkTick[] = []
+    for (const p of hist) {
+      if (p.timestamp >= startMs && p.timestamp < firstLive) {
+        merged.push({ timestamp: p.timestamp, value: p.value })
+      }
+    }
+    return merged.length ? [...merged, ...liveTicks] : liveTicks
+  }, [backfill.data, liveTicks, startMs])
+
   const [hover, setHover] = useState<Point | null>(null)
 
   const chart = useMemo(() => {
@@ -227,11 +267,11 @@ export function WindowPriceChart({ market, spot }: { market: ParsedMarket; spot:
       )}
 
       <div className="flex items-center justify-between px-3 pb-2 text-[0.6rem] text-muted-foreground">
-        {/* Buffer may not reach back to window open (fresh page load) — label the
-            domain the path actually covers, not the window's nominal start. */}
-        <span>{timeLabel(chart?.x0 ?? startMs)}</span>
+        {/* History backfill normally anchors x0 at window open; if it hasn't loaded,
+            label the domain the path actually covers, not the window's nominal start. */}
+        <span>{timeLabel(chart?.x0 ?? startMs, endMs - startMs > 12 * 3_600_000)}</span>
         <span>spot vs strike · Chainlink</span>
-        <span>{timeLabel(endMs)}</span>
+        <span>{timeLabel(endMs, endMs - startMs > 12 * 3_600_000)}</span>
       </div>
     </div>
   )

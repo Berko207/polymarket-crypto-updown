@@ -17,6 +17,7 @@ import positions from '../api/positions.js'
 import tradeHistory from '../api/trade-history.js'
 import warm from '../api/warm.js'
 import cryptoPrice from '../api/crypto-price.js'
+import cryptoPriceHistory from '../api/crypto-price-history.js'
 
 const API_PORT = Number(process.env.API_PORT || 8787)
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
@@ -32,6 +33,7 @@ const routes: Route[] = [
   { test: (p) => p === '/api/trade-history', handler: tradeHistory },
   { test: (p) => p === '/api/warm', handler: warm },
   { test: (p) => p === '/api/crypto-price', handler: cryptoPrice },
+  { test: (p) => p === '/api/crypto-price-history', handler: cryptoPriceHistory },
   { test: (p) => p.startsWith('/api/gamma/'), handler: gamma },
 ]
 
