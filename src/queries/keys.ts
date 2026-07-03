@@ -18,6 +18,8 @@ export const qk = {
     eventStartTime: string,
     endDate: string,
   ) => ['cryptoWindowPrev', coin, timeframe, eventSlug, eventStartTime, endDate] as const,
+  cryptoPriceHistory: (eventSlug: string, startMs: number) =>
+    ['cryptoPriceHistory', eventSlug, startMs] as const,
   account: ['account'] as const,
   orders: ['orders'] as const,
   positions: ['positions'] as const,
