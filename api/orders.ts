@@ -7,7 +7,7 @@ import {
   warmOrderPath,
   MIN_BUY_USD,
 } from './_lib/clob.js'
-import { getMaxOrderCost, getMaxOrderSize, guardTradingApi, rateLimit } from './_lib/auth.js'
+import { getMaxOrderCost, getMaxOrderSize, guardReadApi, guardTradingApi, rateLimit } from './_lib/auth.js'
 import { requireCanPlaceOrders, requireConfigured, requireWalletReady } from './_lib/guards.js'
 import { fetchTokenBalance } from './_lib/positions.js'
 
@@ -42,14 +42,15 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return res.status(405).json({ error: 'Method not allowed' })
   }
 
-  if (!guardTradingApi(req, res)) return
-  if (!requireConfigured(res)) return
-
   // Warm requests share this function so the prefetched CLOB metadata (tick size,
   // neg-risk, fee, allowance) populates the SAME Lambda instance's in-memory cache
   // that will place the order. /api/warm is a different Lambda whose cache the order
-  // path never sees. warmOrderPath no-ops when the wallet isn't ready.
+  // path never sees. warmOrderPath no-ops when the wallet isn't ready. Guarded by
+  // the read bucket, not the trading one — hover-triggered prefetches must never
+  // spend the budget that places real orders.
   if (req.query.warm === '1' || req.query.warm === 'true') {
+    if (!guardReadApi(req, res, { key: 'warm' })) return
+    if (!requireConfigured(res)) return
     try {
       const ids = readTokenIds(readJsonBody(req).tokenIds ?? req.query.tokenIds)
       if (ids.length) await warmOrderPath(ids)
@@ -60,6 +61,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
   }
 
+  if (!guardTradingApi(req, res)) return
+  if (!requireConfigured(res)) return
   if (!requireCanPlaceOrders(res)) return
   if (!requireWalletReady(res)) return
   if (!rateLimit(req, res, { limit: 20, key: 'place-order' })) return

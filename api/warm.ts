@@ -1,6 +1,6 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node'
 import { warmOrderPath } from './_lib/clob.js'
-import { guardTradingApi } from './_lib/auth.js'
+import { guardReadApi } from './_lib/auth.js'
 import { requireConfigured } from './_lib/guards.js'
 
 function parseTokenIds(req: VercelRequest): string[] {
@@ -46,7 +46,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return res.status(405).json({ error: 'Method not allowed' })
   }
 
-  if (!guardTradingApi(req, res)) return
+  // Prefetch only — read bucket, so warm spam can't starve order placement.
+  if (!guardReadApi(req, res, { key: 'warm' })) return
   if (!requireConfigured(res)) return
 
   try {

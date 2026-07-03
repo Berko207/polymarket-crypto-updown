@@ -1,6 +1,6 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node'
 import { cancelOpenOrder, fetchOpenOrders, formatOrderError } from './_lib/clob.js'
-import { guardTradingApi } from './_lib/auth.js'
+import { guardReadApi, guardTradingApi } from './_lib/auth.js'
 import { requireCanPlaceOrders, requireConfigured } from './_lib/guards.js'
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
@@ -9,7 +9,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return res.status(405).json({ error: 'Method not allowed' })
   }
 
-  if (!guardTradingApi(req, res)) return
+  // Listing is a poll (own read bucket); cancelling is a trading action.
+  if (req.method === 'GET') {
+    if (!guardReadApi(req, res, { key: 'open-orders' })) return
+  } else {
+    if (!guardTradingApi(req, res)) return
+  }
   if (!requireConfigured(res)) return
   if (!requireCanPlaceOrders(res, 'manage orders')) return
 
