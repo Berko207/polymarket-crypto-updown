@@ -27,3 +27,7 @@ dist
 
 # Claude
 .claude
+
+bot/data.db
+bot/data.db-*
+bot/STOP

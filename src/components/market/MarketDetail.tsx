@@ -6,7 +6,6 @@ import { formatMarketHeading } from '@/lib/marketLabels'
 import { rememberMarketTokens } from '@/lib/tokenLabels'
 import { formatPercent, formatVolume } from '@/lib/polymarket'
 import { cn } from '@/lib/utils'
-import { usePriceFlash, flashColor } from '@/hooks/usePriceFlash'
 import { Card, CardContent } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Button } from '@/components/ui/button'
@@ -14,6 +13,7 @@ import { CoinBadge } from '@/components/common/CoinBadge'
 import { LiveStatusBadge } from '@/components/common/LiveStatusBadge'
 import { CountdownClock } from './CountdownClock'
 import { FairValuePanel } from './FairValuePanel'
+import { RegimePanel } from './RegimePanel'
 import { OddsGauge } from './OddsGauge'
 import { SpotPriceBar } from './SpotPriceBar'
 import { TradePanel } from './TradePanel'
@@ -115,20 +115,15 @@ export function MarketDetail({
             gap), and the odds jump (e.g. 0.97 → 0.50) must not read as a price flash.
             Prefixed — SpotPriceBar above already uses the bare eventSlug as its key,
             and duplicate sibling keys corrupt React reconciliation. */}
-        <div
-          key={`odds-${market.eventSlug}`}
-          className="flex flex-col items-center gap-5 sm:flex-row sm:justify-center sm:gap-10"
-        >
+        <div key={`odds-${market.eventSlug}`} className="flex justify-center">
           <OddsGauge value={market.upPrice} size={150} label="Market Up" />
-          <div className="grid w-full max-w-xs grid-cols-2 gap-2 sm:w-52">
-            <OutcomeStat label="Up" price={market.upPrice} side="up" />
-            <OutcomeStat label="Down" price={market.downPrice} side="down" />
-          </div>
         </div>
 
         <ProbabilityBar upPrice={market.upPrice} />
 
         <FairValuePanel market={market} fv={fairValue} spot={spot} />
+
+        <RegimePanel market={market} fv={fairValue} spot={spot} />
 
         {canTrade ? (
           <TradePanel
@@ -136,6 +131,8 @@ export function MarketDetail({
             coinSymbol={coinMeta.symbol}
             subtitle={heading.subtitle}
             quotesLive={connected}
+            regime={fairValue.regime}
+            regimeRatio={fairValue.regimeRatio}
           />
         ) : (
           <div className="grid grid-cols-2 gap-2.5">
@@ -164,23 +161,6 @@ export function MarketDetail({
         </Button>
       </CardContent>
     </Card>
-  )
-}
-
-function OutcomeStat({ label, price, side }: { label: string; price: number; side: 'up' | 'down' }) {
-  const flash = usePriceFlash(price)
-  return (
-    <div className={cn('flex flex-col items-center rounded-lg px-3 py-2.5', side === 'up' ? 'bg-up-soft' : 'bg-down-soft')}>
-      <span className={cn('text-xs font-semibold uppercase', side === 'up' ? 'text-up' : 'text-down')}>{label}</span>
-      <span
-        className={cn(
-          'text-xl font-extrabold tabular-nums transition-colors duration-500',
-          flashColor(flash),
-        )}
-      >
-        {formatPercent(price)}
-      </span>
-    </div>
   )
 }
 

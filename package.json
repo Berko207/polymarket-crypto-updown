@@ -9,12 +9,19 @@
     "dev:vercel": "vercel dev",
     "build": "tsc -b && vite build",
     "lint": "oxlint",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "bot:record": "tsx bot/index.ts record",
+    "bot:dry": "tsx bot/index.ts dry",
+    "bot:live": "tsx bot/index.ts live",
+    "bot:report": "tsx bot/report.ts",
+    "bot:backtest": "tsx bot/backtest.ts",
+    "bot:check": "tsc -p bot/tsconfig.json"
   },
   "dependencies": {
     "@polymarket/clob-client-v2": "^1.0.6",
     "@tailwindcss/vite": "^4.3.1",
     "@tanstack/react-query": "^5.101.2",
+    "better-sqlite3": "^12.11.1",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "lucide-react": "^1.22.0",
@@ -30,6 +37,7 @@
     "zustand": "^5.0.14"
   },
   "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^24.13.2",
     "@types/react": "^19.2.17",
     "@types/react-dom": "^19.2.3",

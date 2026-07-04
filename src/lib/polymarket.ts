@@ -77,7 +77,7 @@ function isTradeable(
   return true
 }
 
-function parseMarket(
+export function parseMarket(
   event: GammaEvent,
   market: GammaMarket,
   coin: CoinId,

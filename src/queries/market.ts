@@ -26,11 +26,18 @@ export function withLiveQuotes(
   if (!market) return null
   if (!allowEnded && !isCurrentWindow(market, now)) return null
   if (!useWebSocket || !market.isLive) return market
-  return mergeLiveQuotes(market, quotes)
+  // Only guard against wild drift during rollover (allowEnded) — that's the only
+  // time a settling prior-window book can leak in. Mid-window, a big live-vs-gamma
+  // gap is a real fast move (e.g. racing to 0/1 near expiry), so let it through.
+  return mergeLiveQuotes(market, quotes, { clampDrift: allowEnded })
 }
 
 /** Overlay live WS quotes on a polled market snapshot (matches the old useMarket merge). */
-export function mergeLiveQuotes(market: ParsedMarket, quotes: TokenQuoteMap): ParsedMarket {
+export function mergeLiveQuotes(
+  market: ParsedMarket,
+  quotes: TokenQuoteMap,
+  { clampDrift = false }: { clampDrift?: boolean } = {},
+): ParsedMarket {
   const up = market.upTokenId ? quotes[market.upTokenId] : undefined
   const down = market.downTokenId ? quotes[market.downTokenId] : undefined
 
@@ -50,12 +57,13 @@ export function mergeLiveQuotes(market: ParsedMarket, quotes: TokenQuoteMap): Pa
   const hasLive = quoteHasBook(up) || quoteHasBook(down)
   if (!hasLive) return market
 
-  // Stale socket rows from a prior window can sit at ~0 or ~1 — ignore wild drift.
-  const upDrift = upLive != null ? Math.abs(upLive - market.upPrice) : 0
-  const downDrift = downLive != null ? Math.abs(downLive - market.downPrice) : 0
-  const maxDrift = Math.max(upDrift, downDrift)
-  if (maxDrift > 0.35) {
-    return market
+  // Stale socket rows from a prior window can sit at ~0 or ~1. Only reject wild
+  // drift during rollover (clampDrift) — mid-window, a >0.35 gap vs the laggy
+  // gamma poll is a genuine fast move and must be shown, not discarded.
+  if (clampDrift) {
+    const upDrift = upLive != null ? Math.abs(upLive - market.upPrice) : 0
+    const downDrift = downLive != null ? Math.abs(downLive - market.downPrice) : 0
+    if (Math.max(upDrift, downDrift) > 0.35) return market
   }
 
   if (

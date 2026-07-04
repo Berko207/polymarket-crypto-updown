@@ -7,13 +7,17 @@
 
 import type { CoinId, TimeframeId } from './types'
 import type { FairValueConfidence } from './fairValue'
+import type { VolRegime } from './regime'
 
 const DB_NAME = 'pm-prediction-log'
 const DB_VERSION = 1
 const SAMPLES = 'samples'
 const OUTCOMES = 'outcomes'
-const MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000
-const MAX_SAMPLES = 100_000
+// Retention favors span over raw count — the regime A/B hinges on rare
+// elevated/panic samples, so keeping ~2 months of history matters more than a
+// tight cap. ~500k samples ≈ 125MB in IndexedDB, comfortable on desktop.
+const MAX_AGE_MS = 60 * 24 * 60 * 60 * 1000
+const MAX_SAMPLES = 500_000
 
 export interface PredictionSample {
   windowKey: string
@@ -25,8 +29,13 @@ export interface PredictionSample {
   msRemaining: number
   spot: number
   strike: number
-  /** Model P(Up). */
+  /** Model P(Up) — flat-window realized σ. */
   modelP: number
+  /** Model P(Up) — regime-conditional (EWMA) σ. Null on pre-regime samples or
+   * when the regime estimate was unavailable. */
+  regimeP: number | null
+  /** Vol regime label at sample time. */
+  regime: VolRegime | null
   /** Order-book P(Up) (mid). */
   marketP: number
   upBid: number | null
@@ -48,6 +57,14 @@ export interface WindowOutcome {
   recordedAt: number
 }
 
+/** Matched flat/regime/market Brier within one regime bucket. */
+export interface RegimeBucketStats {
+  samples: number
+  brierModel: number | null
+  brierRegime: number | null
+  brierMarket: number | null
+}
+
 export interface CalibrationStats {
   /** Outcomes recorded. */
   windows: number
@@ -55,8 +72,35 @@ export interface CalibrationStats {
   scoredWindows: number
   /** Samples scored (sample-weighted Brier — long windows weigh more). */
   samples: number
+  /** Samples carrying a regime prediction (subset of `samples`). */
+  regimeSamples: number
+  /** Flat/market Brier over ALL scored samples (the standing headline). */
   brierModel: number | null
   brierMarket: number | null
+  brierRegime: number | null
+  /** Flat/market Brier over the SAME regime-carrying subset as `brierRegime` —
+   * the matched A/B, so regime-vs-flat is apples-to-apples. Null until regime
+   * samples accrue. */
+  brierModelPaired: number | null
+  brierMarketPaired: number | null
+  /** Matched flat/regime/market Brier per regime bucket — shows whether the
+   * regime model only helps/hurts in specific states (it can only differ from
+   * flat in elevated/panic). */
+  byRegime: Record<VolRegime, RegimeBucketStats>
+  /** Wall-clock span covered by the stored samples (oldest→newest). */
+  spanMs: number
+}
+
+const REGIME_BUCKETS: VolRegime[] = ['calm', 'normal', 'elevated', 'panic']
+
+function emptyByRegime(): Record<VolRegime, RegimeBucketStats> {
+  const zero = (): RegimeBucketStats => ({
+    samples: 0,
+    brierModel: null,
+    brierRegime: null,
+    brierMarket: null,
+  })
+  return { calm: zero(), normal: zero(), elevated: zero(), panic: zero() }
 }
 
 let dbPromise: Promise<IDBDatabase> | null = null
@@ -168,8 +212,14 @@ export async function getCalibration(): Promise<CalibrationStats> {
     windows: 0,
     scoredWindows: 0,
     samples: 0,
+    regimeSamples: 0,
     brierModel: null,
     brierMarket: null,
+    brierRegime: null,
+    brierModelPaired: null,
+    brierMarketPaired: null,
+    byRegime: emptyByRegime(),
+    spanMs: 0,
   }
 
   let db: IDBDatabase
@@ -185,11 +235,27 @@ export async function getCalibration(): Promise<CalibrationStats> {
   ])
   if (outcomes.length === 0) return empty
 
+  // Collection span across all stored samples (not just scored ones).
+  let minT = Infinity
+  let maxT = 0
+  for (const s of samples) {
+    if (s.t < minT) minT = s.t
+    if (s.t > maxT) maxT = s.t
+  }
+  const spanMs = samples.length > 0 ? maxT - minT : 0
+
   const outcomeByWindow = new Map(outcomes.map((o) => [o.windowKey, o]))
   const scored = new Set<string>()
   let n = 0
+  let nRegime = 0
   let sumModel = 0
   let sumMarket = 0
+  let sumRegime = 0
+  // Flat/market scored over the regime subset only — the matched comparison.
+  let sumModelPaired = 0
+  let sumMarketPaired = 0
+  // Matched flat-vs-regime sums per regime bucket.
+  const perRegime = new Map(REGIME_BUCKETS.map((r) => [r, { n: 0, sm: 0, sr: 0, sk: 0 }]))
 
   for (const s of samples) {
     const outcome = outcomeByWindow.get(s.windowKey)
@@ -199,14 +265,47 @@ export async function getCalibration(): Promise<CalibrationStats> {
     sumMarket += (s.marketP - y) ** 2
     n += 1
     scored.add(s.windowKey)
+    // The regime model only scores where it produced a prediction. Flat and
+    // market are re-scored over that same subset so reg-vs-flat is apples-to-
+    // apples and old (pre-regime) samples don't skew the head-to-head.
+    if (s.regimeP != null) {
+      sumRegime += (s.regimeP - y) ** 2
+      sumModelPaired += (s.modelP - y) ** 2
+      sumMarketPaired += (s.marketP - y) ** 2
+      nRegime += 1
+      const bucket = s.regime ? perRegime.get(s.regime) : undefined
+      if (bucket) {
+        bucket.n += 1
+        bucket.sm += (s.modelP - y) ** 2
+        bucket.sr += (s.regimeP - y) ** 2
+        bucket.sk += (s.marketP - y) ** 2
+      }
+    }
+  }
+
+  const byRegime = emptyByRegime()
+  for (const r of REGIME_BUCKETS) {
+    const b = perRegime.get(r)!
+    byRegime[r] = {
+      samples: b.n,
+      brierModel: b.n > 0 ? b.sm / b.n : null,
+      brierRegime: b.n > 0 ? b.sr / b.n : null,
+      brierMarket: b.n > 0 ? b.sk / b.n : null,
+    }
   }
 
   return {
     windows: outcomes.length,
     scoredWindows: scored.size,
     samples: n,
+    regimeSamples: nRegime,
     brierModel: n > 0 ? sumModel / n : null,
     brierMarket: n > 0 ? sumMarket / n : null,
+    brierRegime: nRegime > 0 ? sumRegime / nRegime : null,
+    brierModelPaired: nRegime > 0 ? sumModelPaired / nRegime : null,
+    brierMarketPaired: nRegime > 0 ? sumMarketPaired / nRegime : null,
+    byRegime,
+    spanMs,
   }
 }
 
