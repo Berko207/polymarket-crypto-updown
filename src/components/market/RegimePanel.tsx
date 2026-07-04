@@ -162,19 +162,26 @@ export function RegimePanel({
         )}
       </div>
 
-      {/* Per-regime breakdown */}
+      {/* Per-regime breakdown: flat / regime / market Brier within each state */}
       {matched && (
         <div className="flex flex-col gap-0.5">
-          <div className="grid grid-cols-[1fr_auto_auto_auto] gap-x-3 text-[0.6rem] uppercase tracking-wide text-muted-foreground">
+          <div className="grid grid-cols-[1fr_auto_auto_auto_auto] gap-x-3 text-[0.6rem] uppercase tracking-wide text-muted-foreground">
             <span>Regime</span>
             <span className="text-right">n</span>
             <span className="text-right">flat</span>
             <span className="text-right">reg</span>
+            <span className="text-right">mkt</span>
           </div>
           {REGIME_ORDER.map((r) => (
             <RegimeRow key={r} regime={r} stats={stats!.byRegime[r]} />
           ))}
         </div>
+      )}
+
+      {stats && stats.samples > 0 && (
+        <p className="text-right text-[0.6rem] text-muted-foreground">
+          {stats.samples.toLocaleString()} samples · {(stats.spanMs / 86_400_000).toFixed(1)}d span
+        </p>
       )}
     </div>
   )
@@ -185,7 +192,7 @@ function RegimeRow({ regime, stats }: { regime: VolRegime; stats: RegimeBucketSt
   const has = stats.samples > 0 && stats.brierModel != null && stats.brierRegime != null
   const regWins = has && stats.brierRegime! < stats.brierModel!
   return (
-    <div className="grid grid-cols-[1fr_auto_auto_auto] items-center gap-x-3 text-xs tabular-nums">
+    <div className="grid grid-cols-[1fr_auto_auto_auto_auto] items-center gap-x-3 text-xs tabular-nums">
       <span className={cn('flex items-center gap-1.5', !has && 'opacity-45')}>
         <span className={cn('size-2 rounded-full', meta.cell)} />
         <span className={meta.text}>{meta.label}</span>
@@ -201,6 +208,9 @@ function RegimeRow({ regime, stats }: { regime: VolRegime; stats: RegimeBucketSt
         )}
       >
         {stats.brierRegime != null ? stats.brierRegime.toFixed(3) : '—'}
+      </span>
+      <span className="text-right text-muted-foreground/70">
+        {stats.brierMarket != null ? stats.brierMarket.toFixed(3) : '—'}
       </span>
     </div>
   )

@@ -13,8 +13,11 @@ const DB_NAME = 'pm-prediction-log'
 const DB_VERSION = 1
 const SAMPLES = 'samples'
 const OUTCOMES = 'outcomes'
-const MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000
-const MAX_SAMPLES = 100_000
+// Retention favors span over raw count — the regime A/B hinges on rare
+// elevated/panic samples, so keeping ~2 months of history matters more than a
+// tight cap. ~500k samples ≈ 125MB in IndexedDB, comfortable on desktop.
+const MAX_AGE_MS = 60 * 24 * 60 * 60 * 1000
+const MAX_SAMPLES = 500_000
 
 export interface PredictionSample {
   windowKey: string
@@ -54,11 +57,12 @@ export interface WindowOutcome {
   recordedAt: number
 }
 
-/** Matched flat-vs-regime Brier within one regime bucket. */
+/** Matched flat/regime/market Brier within one regime bucket. */
 export interface RegimeBucketStats {
   samples: number
   brierModel: number | null
   brierRegime: number | null
+  brierMarket: number | null
 }
 
 export interface CalibrationStats {
@@ -79,21 +83,24 @@ export interface CalibrationStats {
    * samples accrue. */
   brierModelPaired: number | null
   brierMarketPaired: number | null
-  /** Matched flat-vs-regime Brier per regime bucket — shows whether the regime
-   * model only helps/hurts in specific states (it can only differ from flat in
-   * elevated/panic). */
+  /** Matched flat/regime/market Brier per regime bucket — shows whether the
+   * regime model only helps/hurts in specific states (it can only differ from
+   * flat in elevated/panic). */
   byRegime: Record<VolRegime, RegimeBucketStats>
+  /** Wall-clock span covered by the stored samples (oldest→newest). */
+  spanMs: number
 }
 
 const REGIME_BUCKETS: VolRegime[] = ['calm', 'normal', 'elevated', 'panic']
 
 function emptyByRegime(): Record<VolRegime, RegimeBucketStats> {
-  return {
-    calm: { samples: 0, brierModel: null, brierRegime: null },
-    normal: { samples: 0, brierModel: null, brierRegime: null },
-    elevated: { samples: 0, brierModel: null, brierRegime: null },
-    panic: { samples: 0, brierModel: null, brierRegime: null },
-  }
+  const zero = (): RegimeBucketStats => ({
+    samples: 0,
+    brierModel: null,
+    brierRegime: null,
+    brierMarket: null,
+  })
+  return { calm: zero(), normal: zero(), elevated: zero(), panic: zero() }
 }
 
 let dbPromise: Promise<IDBDatabase> | null = null
@@ -212,6 +219,7 @@ export async function getCalibration(): Promise<CalibrationStats> {
     brierModelPaired: null,
     brierMarketPaired: null,
     byRegime: emptyByRegime(),
+    spanMs: 0,
   }
 
   let db: IDBDatabase
@@ -227,6 +235,15 @@ export async function getCalibration(): Promise<CalibrationStats> {
   ])
   if (outcomes.length === 0) return empty
 
+  // Collection span across all stored samples (not just scored ones).
+  let minT = Infinity
+  let maxT = 0
+  for (const s of samples) {
+    if (s.t < minT) minT = s.t
+    if (s.t > maxT) maxT = s.t
+  }
+  const spanMs = samples.length > 0 ? maxT - minT : 0
+
   const outcomeByWindow = new Map(outcomes.map((o) => [o.windowKey, o]))
   const scored = new Set<string>()
   let n = 0
@@ -238,7 +255,7 @@ export async function getCalibration(): Promise<CalibrationStats> {
   let sumModelPaired = 0
   let sumMarketPaired = 0
   // Matched flat-vs-regime sums per regime bucket.
-  const perRegime = new Map(REGIME_BUCKETS.map((r) => [r, { n: 0, sm: 0, sr: 0 }]))
+  const perRegime = new Map(REGIME_BUCKETS.map((r) => [r, { n: 0, sm: 0, sr: 0, sk: 0 }]))
 
   for (const s of samples) {
     const outcome = outcomeByWindow.get(s.windowKey)
@@ -261,6 +278,7 @@ export async function getCalibration(): Promise<CalibrationStats> {
         bucket.n += 1
         bucket.sm += (s.modelP - y) ** 2
         bucket.sr += (s.regimeP - y) ** 2
+        bucket.sk += (s.marketP - y) ** 2
       }
     }
   }
@@ -272,6 +290,7 @@ export async function getCalibration(): Promise<CalibrationStats> {
       samples: b.n,
       brierModel: b.n > 0 ? b.sm / b.n : null,
       brierRegime: b.n > 0 ? b.sr / b.n : null,
+      brierMarket: b.n > 0 ? b.sk / b.n : null,
     }
   }
 
@@ -286,6 +305,7 @@ export async function getCalibration(): Promise<CalibrationStats> {
     brierModelPaired: nRegime > 0 ? sumModelPaired / nRegime : null,
     brierMarketPaired: nRegime > 0 ? sumMarketPaired / nRegime : null,
     byRegime,
+    spanMs,
   }
 }
 
