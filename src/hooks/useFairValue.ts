@@ -13,6 +13,7 @@ import {
   type FairValueConfidence,
 } from '@/lib/fairValue'
 import { logOutcome, logSample } from '@/lib/predictionLog'
+import { regimeHalfLives, regimeVol, type VolRegime } from '@/lib/regime'
 import { marketWindowKey } from '@/lib/marketScope'
 import { useNow } from '@/hooks/useNow'
 import type { MarketSpot } from '@/hooks/useMarketSpot'
@@ -22,8 +23,14 @@ import type { CoinId, ParsedMarket, TimeframeId } from '@/lib/types'
 const SAMPLE_EVERY_MS = 10_000
 
 export interface FairValue {
-  /** Model P(Up) — Φ(d₂) from realized Chainlink vol. */
+  /** Model P(Up) — Φ(d₂) from flat-window realized Chainlink vol. */
   modelP: number | null
+  /** Model P(Up) — Φ(d₂) from regime-conditional (EWMA) σ. */
+  regimeP: number | null
+  /** Current vol regime label (calm → panic), or null when unestimable. */
+  regime: VolRegime | null
+  /** σ_fast / σ_slow ratio behind the regime label. */
+  regimeRatio: number | null
   /** Order-book P(Up) (live mid). */
   marketP: number | null
   /** modelP − marketP; positive means the book underprices Up. */
@@ -39,6 +46,9 @@ export interface FairValue {
 
 const EMPTY: FairValue = {
   modelP: null,
+  regimeP: null,
+  regime: null,
+  regimeRatio: null,
   marketP: null,
   edge: null,
   volPerMinPct: null,
@@ -78,8 +88,11 @@ export function useFairValue(market: ParsedMarket | null, spot: MarketSpot): Fai
 
   let value = EMPTY
   if (market && pair) {
-    const ticks = chainlinkSocket.ticksSince(pair, now - VOL_LOOKBACK_MS[market.timeframe])
+    const lookbackMs = VOL_LOOKBACK_MS[market.timeframe]
+    const ticks = chainlinkSocket.ticksSince(pair, now - lookbackMs)
     const rv = realizedVol(ticks)
+    const hl = regimeHalfLives(lookbackMs)
+    const rvRegime = regimeVol(ticks, hl.fast, hl.slow)
 
     const marketP = Number.isFinite(market.upPrice) ? market.upPrice : null
     const spread =
@@ -87,9 +100,13 @@ export function useFairValue(market: ParsedMarket | null, spot: MarketSpot): Fai
         ? market.bestAskUp - market.bestBidUp
         : null
 
+    const tradeable =
+      locked && !spot.completed && spot.strike != null && spot.current != null
     const modelP =
-      locked && !spot.completed && spot.strike != null && spot.current != null && rv
-        ? probabilityUp(spot.current, spot.strike, rv.varPerMs, msRemaining)
+      tradeable && rv ? probabilityUp(spot.current!, spot.strike!, rv.varPerMs, msRemaining) : null
+    const regimeP =
+      tradeable && rvRegime
+        ? probabilityUp(spot.current!, spot.strike!, rvRegime.varPerMs, msRemaining)
         : null
 
     let confidence: FairValueConfidence
@@ -116,6 +133,9 @@ export function useFairValue(market: ParsedMarket | null, spot: MarketSpot): Fai
 
     value = {
       modelP,
+      regimeP,
+      regime: rvRegime?.regime ?? null,
+      regimeRatio: rvRegime?.ratio ?? null,
       marketP,
       edge,
       volPerMinPct: rv ? Math.sqrt(rv.varPerMs * 60_000) * 100 : null,
@@ -216,6 +236,8 @@ export function useFairValue(market: ParsedMarket | null, spot: MarketSpot): Fai
       spot: spot.current,
       strike: spot.strike,
       modelP: value.modelP,
+      regimeP: value.regimeP,
+      regime: value.regime,
       marketP: value.marketP,
       upBid: market.bestBidUp,
       upAsk: market.bestAskUp,

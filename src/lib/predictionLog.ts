@@ -7,6 +7,7 @@
 
 import type { CoinId, TimeframeId } from './types'
 import type { FairValueConfidence } from './fairValue'
+import type { VolRegime } from './regime'
 
 const DB_NAME = 'pm-prediction-log'
 const DB_VERSION = 1
@@ -25,8 +26,13 @@ export interface PredictionSample {
   msRemaining: number
   spot: number
   strike: number
-  /** Model P(Up). */
+  /** Model P(Up) — flat-window realized σ. */
   modelP: number
+  /** Model P(Up) — regime-conditional (EWMA) σ. Null on pre-regime samples or
+   * when the regime estimate was unavailable. */
+  regimeP: number | null
+  /** Vol regime label at sample time. */
+  regime: VolRegime | null
   /** Order-book P(Up) (mid). */
   marketP: number
   upBid: number | null
@@ -55,7 +61,10 @@ export interface CalibrationStats {
   scoredWindows: number
   /** Samples scored (sample-weighted Brier — long windows weigh more). */
   samples: number
+  /** Samples carrying a regime prediction (subset of `samples`). */
+  regimeSamples: number
   brierModel: number | null
+  brierRegime: number | null
   brierMarket: number | null
 }
 
@@ -168,7 +177,9 @@ export async function getCalibration(): Promise<CalibrationStats> {
     windows: 0,
     scoredWindows: 0,
     samples: 0,
+    regimeSamples: 0,
     brierModel: null,
+    brierRegime: null,
     brierMarket: null,
   }
 
@@ -188,7 +199,9 @@ export async function getCalibration(): Promise<CalibrationStats> {
   const outcomeByWindow = new Map(outcomes.map((o) => [o.windowKey, o]))
   const scored = new Set<string>()
   let n = 0
+  let nRegime = 0
   let sumModel = 0
+  let sumRegime = 0
   let sumMarket = 0
 
   for (const s of samples) {
@@ -199,13 +212,21 @@ export async function getCalibration(): Promise<CalibrationStats> {
     sumMarket += (s.marketP - y) ** 2
     n += 1
     scored.add(s.windowKey)
+    // Regime model only scores where it produced a prediction, so the A/B stays
+    // apples-to-apples and old (pre-regime) samples don't skew it.
+    if (s.regimeP != null) {
+      sumRegime += (s.regimeP - y) ** 2
+      nRegime += 1
+    }
   }
 
   return {
     windows: outcomes.length,
     scoredWindows: scored.size,
     samples: n,
+    regimeSamples: nRegime,
     brierModel: n > 0 ? sumModel / n : null,
+    brierRegime: nRegime > 0 ? sumRegime / nRegime : null,
     brierMarket: n > 0 ? sumMarket / n : null,
   }
 }

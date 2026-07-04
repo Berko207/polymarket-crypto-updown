@@ -5,6 +5,7 @@ import { chainlinkPair } from '@/lib/cryptoPrice'
 import { downloadFile } from '@/lib/exportHistory'
 import { exportPredictionLog, getCalibration } from '@/lib/predictionLog'
 import { VOL_LOOKBACK_MS, volSeries, type FairValueConfidence } from '@/lib/fairValue'
+import type { VolRegime } from '@/lib/regime'
 import { cn } from '@/lib/utils'
 import { qk } from '@/queries/keys'
 import { Button } from '@/components/ui/button'
@@ -21,6 +22,13 @@ const CONFIDENCE_BADGE: Record<
   'low-sample': { label: 'Warming up', className: 'bg-secondary text-muted-foreground' },
   stale: { label: 'Feed stale', className: 'bg-amber-500/10 text-amber-300' },
   'wide-spread': { label: 'Wide spread', className: 'bg-amber-500/10 text-amber-300' },
+}
+
+const REGIME_BADGE: Record<VolRegime, { label: string; className: string }> = {
+  calm: { label: 'Calm', className: 'bg-up-soft text-up' },
+  normal: { label: 'Normal', className: 'bg-secondary text-muted-foreground' },
+  elevated: { label: 'Elevated', className: 'bg-amber-500/10 text-amber-300' },
+  panic: { label: 'Panic', className: 'bg-down-soft text-down' },
 }
 
 function formatVolPct(value: number): string {
@@ -81,8 +89,25 @@ export function FairValuePanel({
         <p className="text-[0.65rem] font-semibold uppercase tracking-wide text-muted-foreground">
           Fair value model
         </p>
-        <span className={cn('rounded-md px-1.5 py-0.5 text-[0.65rem] font-semibold', badge.className)}>
-          {badge.label}
+        <span className="flex items-center gap-1.5">
+          {fv.regime && (
+            <span
+              className={cn(
+                'rounded-md px-1.5 py-0.5 text-[0.65rem] font-semibold',
+                REGIME_BADGE[fv.regime].className,
+              )}
+              title={
+                fv.regimeRatio != null
+                  ? `Vol regime — fast σ is ${fv.regimeRatio.toFixed(2)}× its baseline`
+                  : 'Vol regime'
+              }
+            >
+              {REGIME_BADGE[fv.regime].label}
+            </span>
+          )}
+          <span className={cn('rounded-md px-1.5 py-0.5 text-[0.65rem] font-semibold', badge.className)}>
+            {badge.label}
+          </span>
         </span>
       </div>
 
@@ -97,6 +122,15 @@ export function FairValuePanel({
           }
         />
       </div>
+
+      {fv.regimeP != null && fv.modelP != null && (
+        <p className="text-center text-[0.65rem] text-muted-foreground">
+          Regime σ model:{' '}
+          <span className="font-semibold tabular-nums text-foreground">{formatPercent(fv.regimeP)}</span> Up
+          {fv.regime ? ` · ${REGIME_BADGE[fv.regime].label.toLowerCase()}` : ''} · flat{' '}
+          <span className="tabular-nums">{formatPercent(fv.modelP)}</span>
+        </p>
+      )}
 
       {fv.signal && (
         <p className="rounded-lg bg-primary/10 px-3 py-2 text-center text-xs font-medium text-primary">
@@ -119,8 +153,14 @@ export function FairValuePanel({
         </span>
         <span className="flex items-center gap-1.5">
           {stats && stats.samples > 0 && stats.brierModel != null && stats.brierMarket != null && (
-            <span title={`${stats.scoredWindows} scored windows · ${stats.samples} samples · lower is better`}>
-              Brier {stats.brierModel.toFixed(3)} vs mkt {stats.brierMarket.toFixed(3)}
+            <span
+              title={`${stats.scoredWindows} scored windows · ${stats.samples} samples${
+                stats.regimeSamples > 0 ? ` · ${stats.regimeSamples} regime` : ''
+              } · lower is better`}
+            >
+              Brier {stats.brierModel.toFixed(3)}
+              {stats.brierRegime != null && <> · reg {stats.brierRegime.toFixed(3)}</>} · mkt{' '}
+              {stats.brierMarket.toFixed(3)}
             </span>
           )}
           <Button
