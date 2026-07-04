@@ -136,6 +136,8 @@ export function MarketDetail({
             coinSymbol={coinMeta.symbol}
             subtitle={heading.subtitle}
             quotesLive={connected}
+            regime={fairValue.regime}
+            regimeRatio={fairValue.regimeRatio}
           />
         ) : (
           <div className="grid grid-cols-2 gap-2.5">

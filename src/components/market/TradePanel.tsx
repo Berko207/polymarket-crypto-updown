@@ -1,5 +1,6 @@
-import { useState, useCallback } from 'react'
+import { useState, useCallback, useEffect, useRef } from 'react'
 import { toast } from 'sonner'
+import { TriangleAlert } from 'lucide-react'
 import { MIN_BUY_USD, warmTradingPath } from '@/lib/api'
 import { formatPercent } from '@/lib/polymarket'
 import { rememberMarketTokens } from '@/lib/tokenLabels'
@@ -8,7 +9,11 @@ import { Input } from '@/components/ui/input'
 import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group'
 import { useOrderActions } from '@/hooks/useOrderActions'
 import { type OutcomeSide } from '@/components/common/OutcomeBadge'
+import type { VolRegime } from '@/lib/regime'
 import type { ParsedMarket } from '@/lib/types'
+
+/** How long a panic-regime buy stays armed before the confirm resets. */
+const PANIC_ARM_MS = 5_000
 
 type SizeMode = 'usdc' | 'shares'
 
@@ -27,6 +32,8 @@ export function TradePanel({
   subtitle,
   disabled = false,
   quotesLive = false,
+  regime = null,
+  regimeRatio = null,
 }: {
   market: ParsedMarket
   coinSymbol: string
@@ -35,6 +42,10 @@ export function TradePanel({
   disabled?: boolean
   /** True when the CLOB socket is streaming this market — a null ask then means the book really is empty. */
   quotesLive?: boolean
+  /** Live vol regime — 'panic' arms a confirm-to-trade gate on buys. */
+  regime?: VolRegime | null
+  /** σ_fast / σ_slow behind the regime label, for the gate message. */
+  regimeRatio?: number | null
 }) {
   const actions = useOrderActions()
   const [sizeMode, setSizeMode] = useState<SizeMode>('usdc')
@@ -52,6 +63,26 @@ export function TradePanel({
     setThinBook((s) => ({ ...s, [outcome]: true }))
     setTimeout(() => setThinBook((s) => ({ ...s, [outcome]: false })), 8_000)
   }
+
+  // Panic-regime risk gate: when realized vol spikes, a market buy can fill
+  // adversely as the book gaps, so require a deliberate second click to confirm.
+  // The arm self-resets after a few seconds and clears when panic subsides.
+  const panic = regime === 'panic'
+  const [armed, setArmed] = useState<OutcomeSide | null>(null)
+  const disarmTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const disarm = useCallback(() => {
+    setArmed(null)
+    if (disarmTimer.current) {
+      clearTimeout(disarmTimer.current)
+      disarmTimer.current = null
+    }
+  }, [])
+  useEffect(() => {
+    if (!panic) disarm()
+  }, [panic, disarm])
+  // New window (or unmount) → start disarmed; a stale confirm must not carry
+  // across a rollover into a different market.
+  useEffect(() => disarm, [market.upTokenId, disarm])
 
   const prefetch = useCallback(
     (outcome: OutcomeSide) => {
@@ -79,6 +110,14 @@ export function TradePanel({
 
   const buy = async (outcome: OutcomeSide) => {
     if (disabled || placing) return
+    // First click during a panic regime arms rather than submits.
+    if (panic && armed !== outcome) {
+      setArmed(outcome)
+      if (disarmTimer.current) clearTimeout(disarmTimer.current)
+      disarmTimer.current = setTimeout(() => setArmed(null), PANIC_ARM_MS)
+      return
+    }
+    disarm()
     const tokenId = outcome === 'up' ? market.upTokenId : market.downTokenId
     const ask = buyAsk(market, outcome)
     if (!tokenId) return toast.error('Token ID unavailable for this outcome')
@@ -160,8 +199,19 @@ export function TradePanel({
           : `Est. $${Math.max(MIN_BUY_USD, refPrice * size).toFixed(2)} per side`}
       </p>
 
+      {panic && (
+        <div className="flex items-center gap-2 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-[0.7rem] font-medium text-amber-300">
+          <TriangleAlert className="size-3.5 shrink-0" />
+          <span>
+            Panic regime{regimeRatio != null ? ` — vol ${regimeRatio.toFixed(1)}× baseline` : ''}. Fills
+            can gap; buys need a second tap to confirm.
+          </span>
+        </div>
+      )}
+
       <div className="grid grid-cols-2 gap-2.5">
         {(['up', 'down'] as const).map((outcome) => {
+          const armedThis = panic && armed === outcome
           const bid = outcome === 'up' ? market.bestBidUp : market.bestBidDown
           const ask = outcome === 'up' ? market.bestAskUp : market.bestAskDown
           // Only trust "no ask" as "book empty" while the socket is streaming — REST
@@ -182,10 +232,15 @@ export function TradePanel({
                   ? 'border-up/40 bg-up-soft text-up'
                   : 'border-down/40 bg-down-soft text-down',
                 blocked && 'border-amber-500/50',
+                armedThis && 'border-amber-500 ring-2 ring-amber-500/60',
               )}
             >
               <span className="text-sm font-semibold opacity-90">
-                {placing === outcome ? 'Placing…' : `Buy ${outcome === 'up' ? 'Up' : 'Down'}`}
+                {placing === outcome
+                  ? 'Placing…'
+                  : armedThis
+                    ? `Confirm ${outcome === 'up' ? 'Up' : 'Down'}?`
+                    : `Buy ${outcome === 'up' ? 'Up' : 'Down'}`}
               </span>
               <span className="text-2xl font-extrabold leading-none tabular-nums">
                 {formatPercent(outcome === 'up' ? market.upPrice : market.downPrice)}
@@ -194,6 +249,8 @@ export function TradePanel({
                 <span className="text-[0.65rem] font-medium text-amber-400">
                   {thinBook[outcome] ? 'No liquidity — retrying soon' : 'No asks — book empty'}
                 </span>
+              ) : armedThis ? (
+                <span className="text-[0.65rem] font-medium text-amber-400">Tap again to confirm</span>
               ) : bid != null && ask != null ? (
                 <span className="text-[0.65rem] tabular-nums opacity-70">
                   {formatPercent(bid)} – {formatPercent(ask)}
