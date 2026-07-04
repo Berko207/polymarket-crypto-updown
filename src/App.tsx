@@ -10,6 +10,7 @@ import { Header } from '@/components/layout/Header'
 import { WatchlistPanel } from '@/components/watchlist/WatchlistPanel'
 import { MarketDetail } from '@/components/market/MarketDetail'
 import { PortfolioPanel } from '@/components/portfolio/PortfolioPanel'
+import { BotControlPanel } from '@/components/bot/BotControlPanel'
 import { ApiUnlock } from '@/components/account/ApiUnlock'
 import { Card, CardContent } from '@/components/ui/card'
 import { Toaster } from '@/components/ui/sonner'
@@ -125,7 +126,8 @@ export function AppShell() {
           />
         </main>
 
-        <aside className="order-3 min-w-0">
+        <aside className="order-3 flex min-w-0 flex-col gap-4">
+          <BotControlPanel />
           <PanelCard title="Portfolio">
             <PortfolioPanel enabled={canTrade} timeframe={timeframe} selectedCoin={coin} />
           </PanelCard>
