@@ -54,6 +54,13 @@ export interface WindowOutcome {
   recordedAt: number
 }
 
+/** Matched flat-vs-regime Brier within one regime bucket. */
+export interface RegimeBucketStats {
+  samples: number
+  brierModel: number | null
+  brierRegime: number | null
+}
+
 export interface CalibrationStats {
   /** Outcomes recorded. */
   windows: number
@@ -72,6 +79,21 @@ export interface CalibrationStats {
    * samples accrue. */
   brierModelPaired: number | null
   brierMarketPaired: number | null
+  /** Matched flat-vs-regime Brier per regime bucket — shows whether the regime
+   * model only helps/hurts in specific states (it can only differ from flat in
+   * elevated/panic). */
+  byRegime: Record<VolRegime, RegimeBucketStats>
+}
+
+const REGIME_BUCKETS: VolRegime[] = ['calm', 'normal', 'elevated', 'panic']
+
+function emptyByRegime(): Record<VolRegime, RegimeBucketStats> {
+  return {
+    calm: { samples: 0, brierModel: null, brierRegime: null },
+    normal: { samples: 0, brierModel: null, brierRegime: null },
+    elevated: { samples: 0, brierModel: null, brierRegime: null },
+    panic: { samples: 0, brierModel: null, brierRegime: null },
+  }
 }
 
 let dbPromise: Promise<IDBDatabase> | null = null
@@ -189,6 +211,7 @@ export async function getCalibration(): Promise<CalibrationStats> {
     brierRegime: null,
     brierModelPaired: null,
     brierMarketPaired: null,
+    byRegime: emptyByRegime(),
   }
 
   let db: IDBDatabase
@@ -214,6 +237,8 @@ export async function getCalibration(): Promise<CalibrationStats> {
   // Flat/market scored over the regime subset only — the matched comparison.
   let sumModelPaired = 0
   let sumMarketPaired = 0
+  // Matched flat-vs-regime sums per regime bucket.
+  const perRegime = new Map(REGIME_BUCKETS.map((r) => [r, { n: 0, sm: 0, sr: 0 }]))
 
   for (const s of samples) {
     const outcome = outcomeByWindow.get(s.windowKey)
@@ -231,6 +256,22 @@ export async function getCalibration(): Promise<CalibrationStats> {
       sumModelPaired += (s.modelP - y) ** 2
       sumMarketPaired += (s.marketP - y) ** 2
       nRegime += 1
+      const bucket = s.regime ? perRegime.get(s.regime) : undefined
+      if (bucket) {
+        bucket.n += 1
+        bucket.sm += (s.modelP - y) ** 2
+        bucket.sr += (s.regimeP - y) ** 2
+      }
+    }
+  }
+
+  const byRegime = emptyByRegime()
+  for (const r of REGIME_BUCKETS) {
+    const b = perRegime.get(r)!
+    byRegime[r] = {
+      samples: b.n,
+      brierModel: b.n > 0 ? b.sm / b.n : null,
+      brierRegime: b.n > 0 ? b.sr / b.n : null,
     }
   }
 
@@ -244,6 +285,7 @@ export async function getCalibration(): Promise<CalibrationStats> {
     brierRegime: nRegime > 0 ? sumRegime / nRegime : null,
     brierModelPaired: nRegime > 0 ? sumModelPaired / nRegime : null,
     brierMarketPaired: nRegime > 0 ? sumMarketPaired / nRegime : null,
+    byRegime,
   }
 }
 

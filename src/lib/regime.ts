@@ -127,3 +127,29 @@ export function regimeVol(
 export function regimeHalfLives(lookbackMs: number): { fast: number; slow: number } {
   return { fast: lookbackMs * REGIME_FAST_FRACTION, slow: lookbackMs * REGIME_SLOW_FRACTION }
 }
+
+/**
+ * Per-bucket regime history for a timeline strip. Evaluates regimeVol at each
+ * bucket boundary over the ticks up to that point, so each cell matches what the
+ * live label would have read at that moment. O(buckets × ticks) — fine for a
+ * memoized sparkline over a short lookback.
+ */
+export function regimeSeries(
+  ticks: ChainlinkTick[],
+  fastHalfLifeMs: number,
+  slowHalfLifeMs: number,
+  bucketMs = 60_000,
+): { regime: VolRegime; ratio: number }[] {
+  const usable = ticks.filter((t) => !t.carried && t.value > 0)
+  if (usable.length < 2) return []
+  const first = usable[0].timestamp
+  const last = usable[usable.length - 1].timestamp
+  const out: { regime: VolRegime; ratio: number }[] = []
+  let idx = 0
+  for (let b = Math.ceil(first / bucketMs) * bucketMs; b <= last; b += bucketMs) {
+    while (idx < usable.length && usable[idx].timestamp <= b) idx += 1
+    const rv = regimeVol(usable.slice(0, idx), fastHalfLifeMs, slowHalfLifeMs)
+    if (rv) out.push({ regime: rv.regime, ratio: rv.ratio })
+  }
+  return out
+}
