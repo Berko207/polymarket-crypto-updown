@@ -44,6 +44,29 @@ export interface OutcomeRow {
   recordedAt: number
 }
 
+export interface TradeInsert {
+  windowKey: string
+  coin: string
+  timeframe: string
+  mode: string
+  side: 'up' | 'down'
+  entryT: number
+  entryPrice: number
+  size: number
+  cost: number
+  signalEdge: number
+  regimeEntry: string | null
+  status: string
+  orderId: string | null
+}
+
+export interface OpenTrade {
+  id: number
+  side: 'up' | 'down'
+  size: number
+  cost: number
+}
+
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS ticks (
   symbol TEXT NOT NULL, ts INTEGER NOT NULL, value REAL NOT NULL,
@@ -86,6 +109,14 @@ export interface BotDb {
   insertPrediction(row: PredictionRow): void
   upsertOutcome(row: OutcomeRow): void
   hasOutcome(windowKey: string): boolean
+  insertTrade(row: TradeInsert): void
+  tradeExists(windowKey: string): boolean
+  openTradesForWindow(windowKey: string): OpenTrade[]
+  settleTrade(id: number, settleT: number, payout: number, pnl: number): void
+  countOpenTrades(): number
+  countTradesSince(sinceMs: number): number
+  /** Open trades whose window already has a recorded outcome — ready to settle. */
+  pendingSettlements(): { id: number; side: 'up' | 'down'; size: number; cost: number; outcome: 'up' | 'down' }[]
   close(): void
 }
 
@@ -117,12 +148,43 @@ export function openDb(path: string, readonly = false): BotDb {
   `)
   const outCount = raw.prepare('SELECT 1 FROM outcomes WHERE window_key = ? LIMIT 1')
 
+  const insTrade = raw.prepare(`
+    INSERT INTO trades
+      (window_key, coin, timeframe, mode, side, entry_t, entry_price, size, cost,
+       signal_edge, regime_entry, status, order_id)
+    VALUES
+      (@windowKey, @coin, @timeframe, @mode, @side, @entryT, @entryPrice, @size, @cost,
+       @signalEdge, @regimeEntry, @status, @orderId)
+  `)
+  const tradeExistsStmt = raw.prepare('SELECT 1 FROM trades WHERE window_key = ? LIMIT 1')
+  const openForWindow = raw.prepare(
+    "SELECT id, side, size, cost FROM trades WHERE window_key = ? AND status = 'open'",
+  )
+  const settleStmt = raw.prepare(
+    "UPDATE trades SET status='settled', settle_t=@settleT, payout=@payout, pnl=@pnl WHERE id=@id",
+  )
+  const openCountStmt = raw.prepare("SELECT COUNT(*) AS n FROM trades WHERE status='open'")
+  const sinceCountStmt = raw.prepare('SELECT COUNT(*) AS n FROM trades WHERE entry_t >= ?')
+  const pendingStmt = raw.prepare(`
+    SELECT t.id AS id, t.side AS side, t.size AS size, t.cost AS cost, o.outcome AS outcome
+    FROM trades t JOIN outcomes o ON o.window_key = t.window_key
+    WHERE t.status = 'open'
+  `)
+
   return {
     raw,
     insertTick: (row) => void insTick.run(row),
     insertPrediction: (row) => void insPred.run(row),
     upsertOutcome: (row) => void upsOutcome.run(row),
     hasOutcome: (windowKey) => outCount.get(windowKey) != null,
+    insertTrade: (row) => void insTrade.run(row),
+    tradeExists: (windowKey) => tradeExistsStmt.get(windowKey) != null,
+    openTradesForWindow: (windowKey) => openForWindow.all(windowKey) as OpenTrade[],
+    settleTrade: (id, settleT, payout, pnl) => void settleStmt.run({ id, settleT, payout, pnl }),
+    countOpenTrades: () => (openCountStmt.get() as { n: number }).n,
+    countTradesSince: (sinceMs) => (sinceCountStmt.get(sinceMs) as { n: number }).n,
+    pendingSettlements: () =>
+      pendingStmt.all() as { id: number; side: 'up' | 'down'; size: number; cost: number; outcome: 'up' | 'down' }[],
     close: () => raw.close(),
   }
 }

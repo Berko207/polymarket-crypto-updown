@@ -10,7 +10,8 @@
     "build": "tsc -b && vite build",
     "lint": "oxlint",
     "preview": "vite preview",
-    "bot:record": "tsx bot/index.ts",
+    "bot:record": "tsx bot/index.ts record",
+    "bot:dry": "tsx bot/index.ts dry",
     "bot:report": "tsx bot/report.ts",
     "bot:check": "tsc -p bot/tsconfig.json"
   },

@@ -7,7 +7,9 @@ import { activeScopes, loadConfig } from './config'
 import { openDb } from './db'
 import { ChainlinkStream } from './sources/chainlink'
 import { fetchCurrentMarket } from './sources/gamma'
-import { predict } from './engine/predict'
+import { predict, type Prediction } from './engine/predict'
+import { decideEntry } from './engine/strategy'
+import { dryExecutor } from './engine/executor'
 import { VOL_LOOKBACK_MS } from '../src/lib/fairValue'
 import { chainlinkPair } from '../src/lib/cryptoPrice'
 import type { CoinId, ParsedMarket, TimeframeId } from '../src/lib/types'
@@ -39,10 +41,14 @@ function log(...args: unknown[]): void {
 
 async function main(): Promise<void> {
   const config = loadConfig()
+  const mode: 'record' | 'dry' = process.argv[2] === 'dry' ? 'dry' : 'record'
   const db = openDb(config.dbPath)
   const stream = new ChainlinkStream()
 
-  const stats = { ticks: 0, predictions: 0, outcomes: 0 }
+  const stats = { ticks: 0, predictions: 0, outcomes: 0, trades: 0, settled: 0 }
+  /** Windows we've already entered this session — sync guard against the async
+   * entry double-firing across ticks (DB tradeExists guards across restarts). */
+  const entered = new Set<string>()
   stream.start((symbol, tick) => {
     db.insertTick({ symbol, ts: tick.timestamp, value: tick.value, carried: tick.carried ? 1 : 0 })
     stats.ticks += 1
@@ -59,8 +65,54 @@ async function main(): Promise<void> {
   const tracked = new Map<string, TrackedWindow>()
 
   log(
-    `recorder up · db=${config.dbPath} · scopes=${scopes.map((s) => `${s.coin}/${s.timeframe}`).join(',')}`,
+    `${mode} up · db=${config.dbPath} · scopes=${scopes.map((s) => `${s.coin}/${s.timeframe}`).join(',')}` +
+      (mode === 'dry'
+        ? ` · entry ~T-${config.entryAtSec}s · edge≥${config.edgeThreshold} · $${config.stakeUsd}`
+        : ''),
   )
+
+  // Dry paper entry: once per window, late (~T-10s), on a confident non-panic edge.
+  async function maybeTrade(pred: Prediction, market: ParsedMarket, now: number): Promise<void> {
+    if (entered.has(pred.windowKey) || db.tradeExists(pred.windowKey)) return
+    if (db.countOpenTrades() >= config.maxConcurrent) return
+    if (db.countTradesSince(now - 86_400_000) >= config.maxDailyTrades) return
+    const order = decideEntry(pred, market, config, now)
+    if (!order) return
+    entered.add(pred.windowKey) // claim before the await so the next tick can't double-enter
+    const fill = await dryExecutor.buy(order)
+    db.insertTrade({
+      windowKey: pred.windowKey,
+      coin: pred.coin,
+      timeframe: pred.timeframe,
+      mode: 'dry',
+      side: order.side,
+      entryT: now,
+      entryPrice: fill.fillPrice,
+      size: fill.fillSize,
+      cost: order.stakeUsd,
+      signalEdge: pred.edge,
+      regimeEntry: pred.regime,
+      status: 'open',
+      orderId: fill.orderId,
+    })
+    stats.trades += 1
+    log(
+      `DRY ENTER ${pred.coin}/${pred.timeframe} ${order.side} @ ${fill.fillPrice.toFixed(3)} · ` +
+        `size ${fill.fillSize.toFixed(1)} · edge ${pred.edge.toFixed(3)} · ${pred.regime} · ` +
+        `${Math.round((market.endDate.getTime() - now) / 1000)}s left`,
+    )
+  }
+
+  function settleTrades(now: number): void {
+    for (const s of db.pendingSettlements()) {
+      const won = s.side === s.outcome
+      const payout = won ? s.size : 0
+      const pnl = payout - s.cost
+      db.settleTrade(s.id, now, payout, pnl)
+      stats.settled += 1
+      log(`DRY SETTLE ${s.side} ${won ? 'WIN ' : 'loss'} · pnl ${pnl >= 0 ? '+' : ''}${pnl.toFixed(3)}`)
+    }
+  }
 
   function refreshMarket(state: ScopeState, now: number): void {
     const ended = state.market ? now >= state.market.endDate.getTime() : true
@@ -105,6 +157,9 @@ async function main(): Promise<void> {
         endMs: market.endDate.getTime(),
       })
     }
+
+    // Trade every tick (not throttled) so the late T-10s entry lands on time.
+    if (mode === 'dry') void maybeTrade(pred, market, now)
 
     if (now - (lastSample.get(pred.windowKey) ?? 0) < config.sampleMs) return
     lastSample.set(pred.windowKey, now)
@@ -164,13 +219,18 @@ async function main(): Promise<void> {
       sampleScope(state, now)
     }
     sweepOutcomes(now)
+    if (mode === 'dry') settleTrades(now)
 
     if (now - lastStatus >= STATUS_MS) {
       lastStatus = now
       const live = scopes.filter((s) => s.market).length
       log(
         `ws=${stream.connected ? 'up' : 'down'} · live=${live}/${scopes.length} · ` +
-          `ticks=${stats.ticks} preds=${stats.predictions} outcomes=${stats.outcomes} · pending=${tracked.size}`,
+          `ticks=${stats.ticks} preds=${stats.predictions} outcomes=${stats.outcomes}` +
+          (mode === 'dry'
+            ? ` · trades=${stats.trades} settled=${stats.settled} open=${db.countOpenTrades()}`
+            : '') +
+          ` · pending=${tracked.size}`,
       )
     }
   }, config.tickMs)

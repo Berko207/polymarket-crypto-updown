@@ -277,12 +277,13 @@ pnpm bot:backtest # replay stored ticks through strategy with alt params (M3)
 
 ## 12. Milestones
 
-- **M1 — Recorder + SQLite.** `db.ts`, ported `chainlink.ts`, `gamma.ts`,
-  `predict.ts`, write predictions/outcomes/ticks. `bot:record` + `bot:report`
-  (Brier flat/reg/mkt + per-regime, mirroring the RegimePanel numbers but 24/7
-  across all coins/TFs). *Deliverable: real sample volume, zero trading.*
-- **M2 — Dry paper-trader.** `strategy.ts`, `dryExecutor`, `reconcile.ts`,
-  trades table, P&L in `bot:report`. *Deliverable: forward-tested paper P&L.*
+- **M1 — Recorder + SQLite. ✅ SHIPPED.** `db.ts`, ported `chainlink.ts`,
+  `gamma.ts`, `predict.ts`, write predictions/outcomes/ticks. `bot:record` +
+  `bot:report` (Brier flat/reg/mkt + per-regime, mirroring the RegimePanel
+  numbers but 24/7 across all coins/TFs). Verified live end-to-end.
+- **M2 — Dry paper-trader. ✅ SHIPPED.** `strategy.ts` (late ~T-10s edge entry),
+  `executor.ts` (`dryExecutor`), settlement via `db.pendingSettlements`, trades
+  table, P&L in `bot:report`. `bot:dry`. *Forward-tested paper P&L, zero orders.*
 - **M3 — Backtest/replay.** Re-run strategy over stored ticks with different
   EDGE_THRESHOLD / entry band / regime rules. *Deliverable: tuned params.*
 - **M4 — Live executor.** `guardOrder()` extraction, `liveExecutor`, promotion
