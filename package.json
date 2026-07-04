@@ -13,6 +13,7 @@
     "bot:record": "tsx bot/index.ts record",
     "bot:dry": "tsx bot/index.ts dry",
     "bot:report": "tsx bot/report.ts",
+    "bot:backtest": "tsx bot/backtest.ts",
     "bot:check": "tsc -p bot/tsconfig.json"
   },
   "dependencies": {

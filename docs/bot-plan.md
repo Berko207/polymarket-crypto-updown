@@ -284,8 +284,11 @@ pnpm bot:backtest # replay stored ticks through strategy with alt params (M3)
 - **M2 — Dry paper-trader. ✅ SHIPPED.** `strategy.ts` (late ~T-10s edge entry),
   `executor.ts` (`dryExecutor`), settlement via `db.pendingSettlements`, trades
   table, P&L in `bot:report`. `bot:dry`. *Forward-tested paper P&L, zero orders.*
-- **M3 — Backtest/replay.** Re-run strategy over stored ticks with different
-  EDGE_THRESHOLD / entry band / regime rules. *Deliverable: tuned params.*
+- **M3 — Backtest/replay. ✅ SHIPPED.** `backtest.ts` replays the M2 entry logic
+  over stored predictions+outcomes, sweeping edge threshold × entry timing →
+  ROI matrix + ranked combos + per-regime. `bot:backtest` (BT_EDGES / BT_ENTRIES
+  / BT_MIN_TRADES). Tunes the strategy on collected data; model-internal tuning
+  (vol lookback, regime half-lives) needs a tick-level re-sim — later extension.
 - **M4 — Live executor.** `guardOrder()` extraction, `liveExecutor`, promotion
   gate, kill switch. *Deliverable: real trading behind hard guards.*
 
