@@ -289,8 +289,11 @@ pnpm bot:backtest # replay stored ticks through strategy with alt params (M3)
   ROI matrix + ranked combos + per-regime. `bot:backtest` (BT_EDGES / BT_ENTRIES
   / BT_MIN_TRADES). Tunes the strategy on collected data; model-internal tuning
   (vol lookback, regime half-lives) needs a tick-level re-sim — later extension.
-- **M4 — Live executor.** `guardOrder()` extraction, `liveExecutor`, promotion
-  gate, kill switch. *Deliverable: real trading behind hard guards.*
+- **M4 — Live executor. ✅ SHIPPED.** `executor.ts` `makeLiveExecutor` (lazy-loads
+  `placeMarketOrder`; record/dry never load viem/clob), `guards.ts` (cost cap +
+  trading-enabled), promotion gate in `index.ts` (--i-understand-live +
+  wallet-ready + balance>0 + stake≤cap), `bot/STOP` kill-file. `bot:live`.
+  Refusal paths verified; live order path is the app's proven `placeMarketOrder`.
 
 ## 13. Open decisions (need your call)
 

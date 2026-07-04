@@ -11,7 +11,12 @@ import type { ParsedMarket } from '../../src/lib/types'
 export interface Order {
   side: 'up' | 'down'
   stakeUsd: number
+  /** Ref book price: the paper fill (dry) and the FAK limit hint (live). */
   fillPrice: number
+  /** CLOB token for the chosen side (live). */
+  tokenId: string
+  tickSize: number | null
+  negRisk: boolean | null
 }
 
 /** Best available buy price for a side: the ask, else the gamma outcome price. */
@@ -39,5 +44,14 @@ export function decideEntry(
   const side: 'up' | 'down' = pred.edge > 0 ? 'up' : 'down'
   const fillPrice = buyPrice(market, side)
   if (!(fillPrice > 0 && fillPrice < 1)) return null
-  return { side, stakeUsd: config.stakeUsd, fillPrice }
+  const tokenId = side === 'up' ? market.upTokenId : market.downTokenId
+  if (!tokenId) return null
+  return {
+    side,
+    stakeUsd: config.stakeUsd,
+    fillPrice,
+    tokenId,
+    tickSize: market.tickSize,
+    negRisk: market.negRisk,
+  }
 }

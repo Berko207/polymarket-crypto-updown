@@ -12,6 +12,7 @@
     "preview": "vite preview",
     "bot:record": "tsx bot/index.ts record",
     "bot:dry": "tsx bot/index.ts dry",
+    "bot:live": "tsx bot/index.ts live",
     "bot:report": "tsx bot/report.ts",
     "bot:backtest": "tsx bot/backtest.ts",
     "bot:check": "tsc -p bot/tsconfig.json"
