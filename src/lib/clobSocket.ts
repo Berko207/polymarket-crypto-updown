@@ -12,6 +12,9 @@ const WS_URL = 'wss://ws-subscriptions-clob.polymarket.com/ws/market'
 const PING_MS = 10_000
 const RECONNECT_MS = 2_000
 const RECONCILE_DEBOUNCE_MS = 30
+/** Give a replacement socket this long to reach OPEN before abandoning the attempt —
+ * a blackholed handshake (sleep/wake, VPN flip) must not gate reconcile forever. */
+const CONNECT_TIMEOUT_MS = 10_000
 
 export interface TokenQuote {
   bestBid: number | null
@@ -77,11 +80,14 @@ function patchQuote(map: TokenQuoteMap, assetId: string, patch: Partial<TokenQuo
   map[assetId] = { ...(map[assetId] ?? emptyQuote()), ...patch }
 }
 
-/** Apply one (or an array of) raw CLOB frame(s) to the shared quote map. Returns true if anything changed. */
-function applyFrame(raw: unknown, map: TokenQuoteMap): boolean {
+/** Apply one (or an array of) raw CLOB frame(s) to the shared quote map, ignoring
+ * tokens outside `wanted` — after a shrink the socket stays subscribed to dropped
+ * tokens until the next replacement, and their frames must not repopulate the map
+ * or fan out re-renders. Returns true if anything changed. */
+function applyFrame(raw: unknown, map: TokenQuoteMap, wanted: Set<string>): boolean {
   if (Array.isArray(raw)) {
     let changed = false
-    for (const item of raw) changed = applyFrame(item, map) || changed
+    for (const item of raw) changed = applyFrame(item, map, wanted) || changed
     return changed
   }
   if (!raw || typeof raw !== 'object') return false
@@ -90,7 +96,7 @@ function applyFrame(raw: unknown, map: TokenQuoteMap): boolean {
   switch (msg.event_type as string | undefined) {
     case 'book': {
       const assetId = msg.asset_id as string | undefined
-      if (!assetId) return false
+      if (!assetId || !wanted.has(assetId)) return false
       const { bestBid, bestAsk } = bestFromBook(
         (msg.bids as Array<{ price: string }>) ?? [],
         (msg.asks as Array<{ price: string }>) ?? [],
@@ -100,20 +106,23 @@ function applyFrame(raw: unknown, map: TokenQuoteMap): boolean {
     }
     case 'price_change': {
       const items = (msg.price_changes as Array<{ asset_id: string; best_bid?: string; best_ask?: string }>) ?? []
+      let changed = false
       for (const item of items) {
+        if (!wanted.has(item.asset_id)) continue
         patchQuote(map, item.asset_id, { bestBid: toNum(item.best_bid), bestAsk: toNum(item.best_ask) })
+        changed = true
       }
-      return items.length > 0
+      return changed
     }
     case 'best_bid_ask': {
       const assetId = msg.asset_id as string | undefined
-      if (!assetId) return false
+      if (!assetId || !wanted.has(assetId)) return false
       patchQuote(map, assetId, { bestBid: toNum(msg.best_bid), bestAsk: toNum(msg.best_ask) })
       return true
     }
     case 'last_trade_price': {
       const assetId = msg.asset_id as string | undefined
-      if (!assetId) return false
+      if (!assetId || !wanted.has(assetId)) return false
       patchQuote(map, assetId, { lastTrade: toNum(msg.price) })
       return true
     }
@@ -131,6 +140,8 @@ interface Subscription {
 class ClobSocket {
   private subs = new Set<Subscription>()
   private quotes: TokenQuoteMap = {}
+  /** Tokens some consumer currently wants — frames outside it are dropped. */
+  private wanted = new Set<string>()
   /** Active (open) socket — the only one whose frames are applied. */
   private ws: WebSocket | null = null
   /** Replacement socket still connecting; promoted to `ws` on open (make-before-break). */
@@ -139,6 +150,7 @@ class ClobSocket {
   private pingTimer: ReturnType<typeof setInterval> | null = null
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null
   private reconcileTimer: ReturnType<typeof setTimeout> | null = null
+  private connectTimer: ReturnType<typeof setTimeout> | null = null
   private connected = false
 
   subscribe(
@@ -187,6 +199,7 @@ class ClobSocket {
     for (const id of Object.keys(this.quotes)) {
       if (!keep.has(id)) delete this.quotes[id]
     }
+    this.wanted = keep
     if (next.length === 0) {
       this.teardown()
       return
@@ -194,6 +207,7 @@ class ClobSocket {
     // While a replacement is already connecting, wait for it — promotion reconciles
     // again, so a union that grew during the handshake gets one follow-up socket
     // instead of killing every half-open handshake (the app-open resolve storm).
+    // A hung handshake can't gate this forever: connectTimer abandons it.
     if (this.pendingWs) return
     // A shrink needs no resubscribe — keep the wider subscription and just serve the
     // narrower snapshots. Only a genuinely new token forces a socket replacement.
@@ -206,8 +220,17 @@ class ClobSocket {
   private clearTimers() {
     if (this.pingTimer) clearInterval(this.pingTimer)
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer)
+    if (this.connectTimer) clearTimeout(this.connectTimer)
     this.pingTimer = null
     this.reconnectTimer = null
+    this.connectTimer = null
+  }
+
+  private clearConnectTimer() {
+    if (this.connectTimer) {
+      clearTimeout(this.connectTimer)
+      this.connectTimer = null
+    }
   }
 
   private detach(ws: WebSocket) {
@@ -256,14 +279,27 @@ class ClobSocket {
       clearTimeout(this.reconnectTimer)
       this.reconnectTimer = null
     }
+    this.clearConnectTimer()
     if (this.pendingWs) this.closeQuietly(this.pendingWs)
 
     this.subscribedIds = ids
     const ws = new WebSocket(WS_URL)
     this.pendingWs = ws
 
+    // Abandon a handshake that never completes — otherwise it gates reconcile
+    // and scheduleReconnect until the browser's own (much longer) timeout.
+    this.connectTimer = setTimeout(() => {
+      this.connectTimer = null
+      if (ws !== this.pendingWs) return
+      this.closeQuietly(ws)
+      this.pendingWs = null
+      if (!this.ws) this.setConnected(false)
+      this.scheduleReconnect()
+    }, CONNECT_TIMEOUT_MS)
+
     ws.onopen = () => {
       if (ws !== this.pendingWs) return
+      this.clearConnectTimer()
       if (this.ws) this.closeQuietly(this.ws)
       if (this.pingTimer) clearInterval(this.pingTimer)
       this.ws = ws
@@ -281,7 +317,7 @@ class ClobSocket {
       if (ws !== this.ws) return
       if (event.data === 'PONG') return
       try {
-        if (applyFrame(JSON.parse(event.data as string), this.quotes)) this.notifyQuotes()
+        if (applyFrame(JSON.parse(event.data as string), this.quotes, this.wanted)) this.notifyQuotes()
       } catch {
         // ignore malformed frames
       }
@@ -290,6 +326,7 @@ class ClobSocket {
     ws.onclose = () => {
       if (ws === this.pendingWs) {
         // Never opened — the active socket (if any) is still streaming.
+        this.clearConnectTimer()
         this.pendingWs = null
         if (!this.ws) this.setConnected(false)
         this.scheduleReconnect()
@@ -326,6 +363,7 @@ class ClobSocket {
     }
     this.subscribedIds = []
     this.quotes = {}
+    this.wanted = new Set()
     this.setConnected(false)
   }
 }

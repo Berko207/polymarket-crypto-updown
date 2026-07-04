@@ -29,6 +29,13 @@ function parsePrice(value: unknown): number {
   return Number.isFinite(n) ? n : NaN
 }
 
+/** Usable price or null. Both strike consumers (focused card + watchlist lean) must
+ * share this — if they validate differently they can disagree on the same snapshot. */
+export function validPrice(value: unknown): number | null {
+  const n = Number(value)
+  return Number.isFinite(n) && n > 0 ? n : null
+}
+
 /** Rolling slugs (5m/15m/4h) — use slug-anchored eventStartTime when fetching window prices. */
 export function isRollingSlug(eventSlug: string): boolean {
   return /-updown-(5m|15m|4h)-\d{10}$/.test(eventSlug)

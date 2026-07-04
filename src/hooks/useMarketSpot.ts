@@ -8,16 +8,12 @@ import {
   fetchCryptoPrice,
   isRollingSlug,
   previousWindowParams,
+  validPrice,
 } from '@/lib/cryptoPrice'
 import { chainlinkSocket } from '@/lib/chainlinkSocket'
 import { marketMatchesScope, marketWindowKey } from '@/lib/marketScope'
 import { qk } from '@/queries/keys'
 import type { CoinId, ParsedMarket, TimeframeId } from '@/lib/types'
-
-function validPrice(value: unknown): number | null {
-  const n = Number(value)
-  return Number.isFinite(n) && n > 0 ? n : null
-}
 
 export type StrikePhase = 'upcoming' | 'preview' | 'loading' | 'locked' | 'unavailable'
 export type CurrentPhase = 'loading' | 'live' | 'polled' | 'final'
@@ -116,8 +112,10 @@ export function useMarketSpot(
     }
   }
 
-  const windowReady = !query.isPending && !query.isFetching
-  const prevReady = !prevWindow || (!prevQuery.isPending && !prevQuery.isFetching)
+  // isPending only — a background refetch (isFetching) leaves the previous data
+  // valid; gating on it made the strike alternate sources every 2s poll cycle.
+  const windowReady = !query.isPending
+  const prevReady = !prevWindow || !prevQuery.isPending
 
   const apiOpen = windowReady ? validPrice(query.data?.openPrice) : null
   const apiClose = windowReady ? validPrice(query.data?.closePrice) : null

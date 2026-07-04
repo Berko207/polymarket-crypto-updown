@@ -29,6 +29,10 @@ export interface BotConfig {
 }
 
 const ALL_COINS = COINS.map((c) => c.id)
+/** Default bot universe — the coins the edge model was calibrated/forward-tested on.
+ * doge/bnb DO stream on RTDS now, but stay opt-in (BOT_COINS=...,doge,bnb) so adding
+ * a Chainlink pair for the dashboard can never silently widen live trading scope. */
+const DEFAULT_COINS: CoinId[] = ['btc', 'eth', 'sol', 'xrp']
 const KNOWN_TF: TimeframeId[] = ['5m', '15m', '1h', '4h', 'daily']
 
 function parseList<T extends string>(raw: string | undefined, valid: T[], fallback: T[]): T[] {
@@ -48,8 +52,8 @@ function num(raw: string | undefined, fallback: number): number {
 
 export function loadConfig(): BotConfig {
   const env = process.env
-  // Only Chainlink-streamed coins can be modeled (doge/bnb have no oracle feed).
-  const coinsAll = parseList<CoinId>(env.BOT_COINS, ALL_COINS, ALL_COINS)
+  // Only Chainlink-streamed coins can be modeled; BOT_COINS may opt into any of them.
+  const coinsAll = parseList<CoinId>(env.BOT_COINS, ALL_COINS, DEFAULT_COINS)
   const coins = coinsAll.filter((c) => chainlinkPair(c))
   const timeframes = parseList<TimeframeId>(env.BOT_TIMEFRAMES, KNOWN_TF, ['5m', '15m'])
 

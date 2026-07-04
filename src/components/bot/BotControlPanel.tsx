@@ -24,7 +24,9 @@ export function BotControlPanel() {
   const status = useBotStatus()
   const mode = useBotMode()
   const halt = useBotHalt()
-  const s = status.data
+  // TanStack keeps the last successful data while polling errors — without the
+  // isError gate a killed bot would show "streaming" with stale PnL forever.
+  const s = status.isError ? undefined : status.data
 
   const switchMode = (next: BotMode) => {
     if (!s || next === s.mode || mode.isPending) return

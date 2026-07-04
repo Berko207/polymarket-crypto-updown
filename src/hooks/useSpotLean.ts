@@ -1,5 +1,6 @@
 import { useQuery } from '@tanstack/react-query'
 import { useChainlinkSpot } from '@/hooks/useChainlinkSpot'
+import { useNow } from '@/hooks/useNow'
 import { chainlinkSocket } from '@/lib/chainlinkSocket'
 import {
   chainlinkPair,
@@ -7,6 +8,7 @@ import {
   cryptoPriceWindowParams,
   fetchCryptoPrice,
   isRollingSlug,
+  validPrice,
 } from '@/lib/cryptoPrice'
 import { qk } from '@/queries/keys'
 import type { CoinId, ParsedMarket } from '@/lib/types'
@@ -38,50 +40,45 @@ const STRIKE_FALLBACK_DELAY_MS = 8_000
  */
 export function useSpotLean(coin: CoinId, market: ParsedMarket | null): SpotLean {
   const { tick } = useChainlinkSpot(coin)
+  const now = useNow()
   const pair = chainlinkPair(coin)
 
-  const usable = Boolean(pair && market && market.isLive && market.startDate)
-  const startMs = usable ? market!.startDate!.getTime() : 0
-  const rolling = usable && isRollingSlug(market!.eventSlug)
+  // Narrowed alias so the compiler enforces the guard instead of `!` assertions.
+  const live = pair && market && market.isLive && market.startDate ? market : null
+  const startMs = live?.startDate?.getTime() ?? 0
+  const rolling = live != null && isRollingSlug(live.eventSlug)
 
   const boundaryStrike =
-    usable && startMs > 0 ? chainlinkSocket.strikeAtBoundary(pair!, startMs, rolling) : null
+    live && pair && startMs > 0 ? chainlinkSocket.strikeAtBoundary(pair, startMs, rolling) : null
 
-  const window = rolling ? cryptoPriceWindowParams(market!) : null
-  // The parent list re-renders every second (useNow), so this flips on its own once
-  // the stream has had its chance to deliver the boundary tick.
+  const window = rolling && live ? cryptoPriceWindowParams(live) : null
   const needFallback =
-    boundaryStrike == null && window != null && Date.now() - startMs > STRIKE_FALLBACK_DELAY_MS
+    boundaryStrike == null && window != null && now - startMs > STRIKE_FALLBACK_DELAY_MS
   const windowQuery = useQuery({
-    queryKey: window
-      ? qk.cryptoWindow(
-          coin,
-          market!.timeframe,
-          market!.eventSlug,
-          window.eventStartTime,
-          window.endDate,
-        )
-      : (['cryptoWindow', 'lean-idle', coin] as const),
+    queryKey:
+      window && live
+        ? qk.cryptoWindow(coin, live.timeframe, live.eventSlug, window.eventStartTime, window.endDate)
+        : (['cryptoWindow', 'lean-idle', coin] as const),
     queryFn: () =>
       fetchCryptoPrice(coinSymbol(coin), window!.eventStartTime, window!.endDate, window!.variant),
     enabled: needFallback,
-    // The per-slot open is immutable once the window runs; only re-ask while it's missing
-    // (upstream can lag in a window's first seconds).
-    refetchInterval: (q) => (Number(q.state.data?.openPrice) > 0 ? false : 5_000),
+    // The per-slot open is immutable once the window runs; only re-ask while it's
+    // missing (upstream can lag in a window's first seconds), and back off on errors.
+    refetchInterval: (q) =>
+      q.state.status === 'error' ? 10_000 : validPrice(q.state.data?.openPrice) != null ? false : 5_000,
     staleTime: Infinity,
     gcTime: 60_000,
     retry: 1,
     structuralSharing: false,
   })
 
-  if (!usable) return EMPTY
+  if (!live || !pair) return EMPTY
 
-  const apiOpen = Number(windowQuery.data?.openPrice)
-  const fallbackStrike = Number.isFinite(apiOpen) && apiOpen > 0 ? apiOpen : null
+  const fallbackStrike = validPrice(windowQuery.data?.openPrice)
 
-  const strike = boundaryStrike ?? (rolling ? fallbackStrike : market!.priceToBeat)
+  const strike = boundaryStrike ?? (rolling ? fallbackStrike : live.priceToBeat)
   const liveValue = tick && Number.isFinite(tick.value) ? tick.value : null
-  const current = liveValue ?? chainlinkSocket.latestTick(pair!)?.value ?? null
+  const current = liveValue ?? chainlinkSocket.latestTick(pair)?.value ?? null
   const delta = strike != null && current != null ? current - strike : null
   return { delta, strike, current }
 }
