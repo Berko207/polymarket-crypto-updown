@@ -109,7 +109,12 @@ export function parseMarket(
     timeframe: effectiveTf,
     upPrice,
     downPrice,
-    volume: market.volumeNum ?? Number(market.volume) ?? event.volume ?? 0,
+    // Number(undefined) is NaN (not null), so guard before coercing or the ?? chain dies here.
+    volume:
+      market.volumeNum ??
+      (market.volume != null && market.volume !== '' ? Number(market.volume) : null) ??
+      event.volume ??
+      0,
     liquidity: market.liquidityNum ?? event.liquidity ?? 0,
     endDate,
     startDate: windowStart,

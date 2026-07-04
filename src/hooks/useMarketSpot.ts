@@ -77,7 +77,7 @@ export function useMarketSpot(
     queryKey: window
       ? qk.cryptoWindow(coin, timeframe, market!.eventSlug, window.eventStartTime, window.endDate)
       : (['cryptoWindow', 'pending', windowKey] as const),
-    queryFn: () => fetchCryptoPrice(symbol, window!.eventStartTime, window!.endDate),
+    queryFn: () => fetchCryptoPrice(symbol, window!.eventStartTime, window!.endDate, window!.variant),
     enabled: inScope && window != null,
     refetchInterval: (q) => {
       if (q.state.status === 'error') return 10_000
@@ -96,7 +96,8 @@ export function useMarketSpot(
     queryKey: prevWindow
       ? qk.cryptoWindowPrev(coin, timeframe, market!.eventSlug, prevWindow.eventStartTime, prevWindow.endDate)
       : (['cryptoWindowPrev', 'pending', windowKey] as const),
-    queryFn: () => fetchCryptoPrice(symbol, prevWindow!.eventStartTime, prevWindow!.endDate),
+    queryFn: () =>
+      fetchCryptoPrice(symbol, prevWindow!.eventStartTime, prevWindow!.endDate, prevWindow!.variant),
     enabled: inScope && rolling && started && prevWindow != null,
     staleTime: 0,
     gcTime: 0,
@@ -132,12 +133,10 @@ export function useMarketSpot(
   if (!started) {
     strike = preview
   } else if (rolling) {
-    // PM crypto-price openPrice is the hour anchor for nested 5m/15m windows — not per-slot.
-    // Window open = Chainlink tick at slug boundary, else prior window close.
-    strike = chainlinkStrike ?? prevClose
-    if (strike == null && windowReady && market!.timeframe !== '5m') {
-      strike = apiOpen
-    }
+    // With the window variant the API's openPrice is the true per-slot open (it used
+    // to be the hour anchor without one). Chainlink boundary tick still wins when the
+    // stream saw it; prior-window close covers the gap right after a rollover.
+    strike = chainlinkStrike ?? apiOpen ?? prevClose
   } else {
     strike = apiOpen ?? chainlinkStrike
   }

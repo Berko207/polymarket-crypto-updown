@@ -1,12 +1,14 @@
 import { getCoin } from './config'
 import type { CoinId, ParsedMarket } from './types'
 
-/** RTDS Chainlink symbols — doge/bnb have no Chainlink stream on Polymarket. */
+/** RTDS Chainlink symbols (doge/bnb verified streaming — probe RTDS before removing). */
 export const CHAINLINK_PAIR: Partial<Record<CoinId, string>> = {
   btc: 'btc/usd',
   eth: 'eth/usd',
   sol: 'sol/usd',
   xrp: 'xrp/usd',
+  doge: 'doge/usd',
+  bnb: 'bnb/usd',
 }
 
 export function chainlinkPair(coin: CoinId): string | null {
@@ -32,10 +34,26 @@ export function isRollingSlug(eventSlug: string): boolean {
   return /-updown-(5m|15m|4h)-\d{10}$/.test(eventSlug)
 }
 
+/**
+ * Upstream window discriminator (names lifted from polymarket.com's own event pages).
+ * Without it the crypto-price API ignores endDate: openPrice anchors to the hour and
+ * closePrice is just the live print — poison for per-slot strikes. Hourly needs none
+ * (the hour anchor IS its open); daily is deliberately left alone (PR #13 revert).
+ */
+const CRYPTO_PRICE_VARIANT: Partial<Record<ParsedMarket['timeframe'], string>> = {
+  '5m': 'fiveminute',
+  '15m': 'fifteen',
+  '4h': 'fourhour',
+}
+
+export interface CryptoPriceWindowParams {
+  eventStartTime: string
+  endDate: string
+  variant?: string
+}
+
 /** Prior adjacent window — its closePrice equals this window's Chainlink open. */
-export function previousWindowParams(
-  market: ParsedMarket,
-): { eventStartTime: string; endDate: string } | null {
+export function previousWindowParams(market: ParsedMarket): CryptoPriceWindowParams | null {
   if (!market.startDate || !market.endDate) return null
   const startMs = market.startDate.getTime()
   const durationMs = market.endDate.getTime() - startMs
@@ -43,13 +61,12 @@ export function previousWindowParams(
   return {
     eventStartTime: new Date(startMs - durationMs).toISOString(),
     endDate: new Date(startMs).toISOString(),
+    variant: CRYPTO_PRICE_VARIANT[market.timeframe],
   }
 }
 
 /** Params for Polymarket's Chainlink window API — one row per market window. */
-export function cryptoPriceWindowParams(
-  market: ParsedMarket,
-): { eventStartTime: string; endDate: string } | null {
+export function cryptoPriceWindowParams(market: ParsedMarket): CryptoPriceWindowParams | null {
   if (!market.endDate) return null
 
   // Rolling slugs embed the window start as unix seconds — most reliable anchor.
@@ -59,16 +76,22 @@ export function cryptoPriceWindowParams(
     : market.startDate?.toISOString()
   if (!eventStartTime) return null
 
-  return { eventStartTime, endDate: market.endDate.toISOString() }
+  return {
+    eventStartTime,
+    endDate: market.endDate.toISOString(),
+    variant: CRYPTO_PRICE_VARIANT[market.timeframe],
+  }
 }
 
 export async function fetchCryptoPrice(
   symbol: string,
   eventStartTime: string,
   endDate?: string,
+  variant?: string,
 ): Promise<CryptoPriceSnapshot> {
   const params = new URLSearchParams({ symbol, eventStartTime })
   if (endDate) params.set('endDate', endDate)
+  if (variant) params.set('variant', variant)
 
   const res = await fetch(`/api/crypto-price?${params}`)
   const body = await res.text()

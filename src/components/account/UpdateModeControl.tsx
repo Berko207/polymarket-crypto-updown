@@ -16,9 +16,9 @@ export function UpdateModeControl() {
   return (
     <Popover>
       <PopoverTrigger asChild>
-        <Button variant="outline" size="sm" className="gap-1.5">
+        <Button variant="outline" size="sm" className="gap-1.5" title={`Update speed · ${current?.label}`}>
           <Gauge className="size-3.5" />
-          <span className="hidden sm:inline">{current?.label}</span>
+          <span className="hidden sm:inline">Speed</span>
         </Button>
       </PopoverTrigger>
       <PopoverContent align="end" className="w-60">
