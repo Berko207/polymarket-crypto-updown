@@ -63,9 +63,15 @@ export interface CalibrationStats {
   samples: number
   /** Samples carrying a regime prediction (subset of `samples`). */
   regimeSamples: number
+  /** Flat/market Brier over ALL scored samples (the standing headline). */
   brierModel: number | null
-  brierRegime: number | null
   brierMarket: number | null
+  brierRegime: number | null
+  /** Flat/market Brier over the SAME regime-carrying subset as `brierRegime` —
+   * the matched A/B, so regime-vs-flat is apples-to-apples. Null until regime
+   * samples accrue. */
+  brierModelPaired: number | null
+  brierMarketPaired: number | null
 }
 
 let dbPromise: Promise<IDBDatabase> | null = null
@@ -179,8 +185,10 @@ export async function getCalibration(): Promise<CalibrationStats> {
     samples: 0,
     regimeSamples: 0,
     brierModel: null,
-    brierRegime: null,
     brierMarket: null,
+    brierRegime: null,
+    brierModelPaired: null,
+    brierMarketPaired: null,
   }
 
   let db: IDBDatabase
@@ -201,8 +209,11 @@ export async function getCalibration(): Promise<CalibrationStats> {
   let n = 0
   let nRegime = 0
   let sumModel = 0
-  let sumRegime = 0
   let sumMarket = 0
+  let sumRegime = 0
+  // Flat/market scored over the regime subset only — the matched comparison.
+  let sumModelPaired = 0
+  let sumMarketPaired = 0
 
   for (const s of samples) {
     const outcome = outcomeByWindow.get(s.windowKey)
@@ -212,10 +223,13 @@ export async function getCalibration(): Promise<CalibrationStats> {
     sumMarket += (s.marketP - y) ** 2
     n += 1
     scored.add(s.windowKey)
-    // Regime model only scores where it produced a prediction, so the A/B stays
-    // apples-to-apples and old (pre-regime) samples don't skew it.
+    // The regime model only scores where it produced a prediction. Flat and
+    // market are re-scored over that same subset so reg-vs-flat is apples-to-
+    // apples and old (pre-regime) samples don't skew the head-to-head.
     if (s.regimeP != null) {
       sumRegime += (s.regimeP - y) ** 2
+      sumModelPaired += (s.modelP - y) ** 2
+      sumMarketPaired += (s.marketP - y) ** 2
       nRegime += 1
     }
   }
@@ -226,8 +240,10 @@ export async function getCalibration(): Promise<CalibrationStats> {
     samples: n,
     regimeSamples: nRegime,
     brierModel: n > 0 ? sumModel / n : null,
-    brierRegime: nRegime > 0 ? sumRegime / nRegime : null,
     brierMarket: n > 0 ? sumMarket / n : null,
+    brierRegime: nRegime > 0 ? sumRegime / nRegime : null,
+    brierModelPaired: nRegime > 0 ? sumModelPaired / nRegime : null,
+    brierMarketPaired: nRegime > 0 ? sumMarketPaired / nRegime : null,
   }
 }
 

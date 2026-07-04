@@ -74,6 +74,19 @@ export function FairValuePanel({
   const edgePts = fv.edge != null ? fv.edge * 100 : null
   const stats = calibration.data
 
+  // How far the regime-σ model pulls P(Up) away from the flat model. Zero in a
+  // calm/normal regime (the two σ estimates agree) — the split only opens up
+  // when recent vol departs from the window baseline.
+  const regimeDeltaPts =
+    fv.regimeP != null && fv.modelP != null ? (fv.regimeP - fv.modelP) * 100 : null
+  const regimeAligned = regimeDeltaPts != null && Math.abs(regimeDeltaPts) < 0.1
+
+  // Prefer the matched A/B (flat/reg/mkt over the same regime-carrying samples);
+  // fall back to the all-sample headline until regime samples accrue.
+  const hasRegimeBrier = stats?.brierRegime != null && stats?.brierModelPaired != null
+  const brierFlat = hasRegimeBrier ? stats!.brierModelPaired : stats?.brierModel ?? null
+  const brierMkt = hasRegimeBrier ? stats!.brierMarketPaired : stats?.brierMarket ?? null
+
   const onExport = () => {
     void exportPredictionLog()
       .then((json) => {
@@ -123,12 +136,18 @@ export function FairValuePanel({
         />
       </div>
 
-      {fv.regimeP != null && fv.modelP != null && (
+      {fv.regimeP != null && regimeDeltaPts != null && (
         <p className="text-center text-[0.65rem] text-muted-foreground">
-          Regime σ model:{' '}
-          <span className="font-semibold tabular-nums text-foreground">{formatPercent(fv.regimeP)}</span> Up
-          {fv.regime ? ` · ${REGIME_BADGE[fv.regime].label.toLowerCase()}` : ''} · flat{' '}
-          <span className="tabular-nums">{formatPercent(fv.modelP)}</span>
+          Regime σ{fv.regime ? ` (${REGIME_BADGE[fv.regime].label.toLowerCase()})` : ''}:{' '}
+          <span className="font-semibold tabular-nums text-foreground">{formatPercent(fv.regimeP)}</span> Up ·{' '}
+          {regimeAligned ? (
+            <span>matches flat</span>
+          ) : (
+            <span className={cn('font-medium tabular-nums', regimeDeltaPts > 0 ? 'text-up' : 'text-down')}>
+              {regimeDeltaPts > 0 ? '+' : ''}
+              {regimeDeltaPts.toFixed(1)} pts vs flat
+            </span>
+          )}
         </p>
       )}
 
@@ -152,15 +171,29 @@ export function FairValuePanel({
           )}
         </span>
         <span className="flex items-center gap-1.5">
-          {stats && stats.samples > 0 && stats.brierModel != null && stats.brierMarket != null && (
+          {stats && stats.samples > 0 && brierFlat != null && brierMkt != null && (
             <span
-              title={`${stats.scoredWindows} scored windows · ${stats.samples} samples${
-                stats.regimeSamples > 0 ? ` · ${stats.regimeSamples} regime` : ''
-              } · lower is better`}
+              title={
+                hasRegimeBrier
+                  ? `Matched over ${stats.regimeSamples} regime samples · lower is better`
+                  : `${stats.scoredWindows} scored windows · ${stats.samples} samples · lower is better`
+              }
             >
-              Brier {stats.brierModel.toFixed(3)}
-              {stats.brierRegime != null && <> · reg {stats.brierRegime.toFixed(3)}</>} · mkt{' '}
-              {stats.brierMarket.toFixed(3)}
+              Brier {brierFlat.toFixed(3)}
+              {hasRegimeBrier && (
+                <>
+                  {' '}
+                  · reg{' '}
+                  <span
+                    className={cn(
+                      stats.brierRegime! < brierFlat ? 'text-up' : stats.brierRegime! > brierFlat ? 'text-down' : undefined,
+                    )}
+                  >
+                    {stats.brierRegime!.toFixed(3)}
+                  </span>
+                </>
+              )}{' '}
+              · mkt {brierMkt.toFixed(3)}
             </span>
           )}
           <Button
