@@ -11,6 +11,7 @@
     "lint": "oxlint",
     "preview": "vite preview",
     "bot:record": "tsx bot/index.ts record",
+    "bot:paper": "tsx bot/index.ts paper",
     "bot:dry": "tsx bot/index.ts dry",
     "bot:live": "tsx bot/index.ts live",
     "bot:report": "tsx bot/report.ts",

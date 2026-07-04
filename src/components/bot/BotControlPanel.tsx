@@ -3,16 +3,20 @@ import { cn } from '@/lib/utils'
 import { useBotHalt, useBotMode, useBotStatus } from '@/queries/bot'
 import type { BotMode } from '@/lib/botControl'
 
+// Record = observe/log only · Paper = simulated fills, no real money · Live =
+// real orders (gated). "Paper" is the wire id 'dry' — the bot/DB keep that id.
 const MODES: { id: BotMode; label: string }[] = [
   { id: 'record', label: 'Record' },
-  { id: 'dry', label: 'Dry' },
+  { id: 'dry', label: 'Paper' },
   { id: 'live', label: 'Live' },
 ]
 
+const modeLabel = (id: BotMode): string => MODES.find((m) => m.id === id)?.label ?? id
+
 /**
- * Dry/Live switch + live status for the local bot. Talks to the bot's control
- * server (localhost only) — shows "offline" when the bot isn't running or the
- * dashboard is deployed (production can't reach the operator's machine).
+ * Bot execution-mode switch + live status for the local bot. Talks to the bot's
+ * control server (localhost only) — shows "offline" when the bot isn't running
+ * or the dashboard is deployed (production can't reach the operator's machine).
  */
 export function BotControlPanel() {
   const status = useBotStatus()
@@ -25,7 +29,7 @@ export function BotControlPanel() {
       <div className="flex items-center justify-between rounded-xl border border-border bg-secondary/40 px-4 py-3 text-[0.7rem] text-muted-foreground">
         <span className="font-semibold uppercase tracking-wide">Bot</span>
         <span>
-          offline · <code className="rounded bg-secondary px-1 py-0.5">pnpm bot:dry</code>
+          offline · <code className="rounded bg-secondary px-1 py-0.5">pnpm bot:paper</code>
         </span>
       </div>
     )
@@ -35,7 +39,7 @@ export function BotControlPanel() {
     if (next === s.mode || mode.isPending) return
     mode.mutate(next, {
       onError: (e) => toast.error(e instanceof Error ? e.message : 'mode switch failed'),
-      onSuccess: () => toast.success(`Bot → ${next}`),
+      onSuccess: () => toast.success(`Bot → ${modeLabel(next)}`),
     })
   }
 
