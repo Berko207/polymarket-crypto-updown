@@ -294,6 +294,11 @@ pnpm bot:backtest # replay stored ticks through strategy with alt params (M3)
   trading-enabled), promotion gate in `index.ts` (--i-understand-live +
   wallet-ready + balance>0 + stake≤cap), `bot/STOP` kill-file. `bot:live`.
   Refusal paths verified; live order path is the app's proven `placeMarketOrder`.
+- **M5 — Dashboard Dry/Live switch. ✅ SHIPPED.** `bot/control.ts` control server
+  (127.0.0.1, CORS localhost, x-bot-token for mutations); runtime-switchable mode
+  in `index.ts` (setMode arms/disarms live via the same gate — stays dry on
+  failure); `BotControlPanel` in the dashboard right column polls `/status` and
+  drives mode + halt. Live only switchable if the bot launched with `--allow-live`.
 
 ## 13. Open decisions (need your call)
 

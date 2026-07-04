@@ -117,6 +117,8 @@ export interface BotDb {
   countTradesSince(sinceMs: number): number
   /** Open trades whose window already has a recorded outcome — ready to settle. */
   pendingSettlements(): { id: number; side: 'up' | 'down'; size: number; cost: number; outcome: 'up' | 'down' }[]
+  /** Aggregate paper/live trade P&L for the status endpoint. */
+  tradeSummary(): { entered: number; settled: number; open: number; wins: number; staked: number; pnl: number }
   close(): void
 }
 
@@ -170,6 +172,16 @@ export function openDb(path: string, readonly = false): BotDb {
     FROM trades t JOIN outcomes o ON o.window_key = t.window_key
     WHERE t.status = 'open'
   `)
+  const summaryStmt = raw.prepare(`
+    SELECT
+      COUNT(*) AS entered,
+      COALESCE(SUM(CASE WHEN status='settled' THEN 1 ELSE 0 END), 0) AS settled,
+      COALESCE(SUM(CASE WHEN status='open' THEN 1 ELSE 0 END), 0) AS open,
+      COALESCE(SUM(CASE WHEN status='settled' AND pnl>0 THEN 1 ELSE 0 END), 0) AS wins,
+      COALESCE(SUM(CASE WHEN status='settled' THEN cost ELSE 0 END), 0) AS staked,
+      COALESCE(SUM(CASE WHEN status='settled' THEN pnl ELSE 0 END), 0) AS pnl
+    FROM trades
+  `)
 
   return {
     raw,
@@ -185,6 +197,15 @@ export function openDb(path: string, readonly = false): BotDb {
     countTradesSince: (sinceMs) => (sinceCountStmt.get(sinceMs) as { n: number }).n,
     pendingSettlements: () =>
       pendingStmt.all() as { id: number; side: 'up' | 'down'; size: number; cost: number; outcome: 'up' | 'down' }[],
+    tradeSummary: () =>
+      summaryStmt.get() as {
+        entered: number
+        settled: number
+        open: number
+        wins: number
+        staked: number
+        pnl: number
+      },
     close: () => raw.close(),
   }
 }

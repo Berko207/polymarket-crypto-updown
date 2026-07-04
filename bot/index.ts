@@ -1,7 +1,9 @@
 /**
- * M1 recorder: headless, 24/7. Streams Chainlink ticks + gamma odds for every
- * in-scope market, logs flat+regime predictions (throttled) and window outcomes
- * to SQLite. No trading. `pnpm bot:record`.
+ * Bot entry. Streams Chainlink ticks + gamma odds for every in-scope market,
+ * logs flat+regime predictions and outcomes to SQLite, and (dry/live) trades the
+ * late T-10s edge signal. Mode is runtime-switchable via the control server so
+ * the dashboard can flip Dry/Live without a restart.
+ *   record → log only · dry → paper-trade · live → real FAK orders (gated)
  */
 import '../api/_lib/loadEnv' // side effect: load .env.local (POLY_* for live, BOT_* overrides)
 import { existsSync } from 'node:fs'
@@ -14,6 +16,7 @@ import { predict, type Prediction } from './engine/predict'
 import { decideEntry } from './engine/strategy'
 import { dryExecutor, makeLiveExecutor } from './engine/executor'
 import { maxOrderCost, tradingEnabled } from './engine/guards'
+import { startControlServer, type BotMode } from './control'
 import { VOL_LOOKBACK_MS } from '../src/lib/fairValue'
 import { chainlinkPair } from '../src/lib/cryptoPrice'
 import type { CoinId, ParsedMarket, TimeframeId } from '../src/lib/types'
@@ -45,8 +48,16 @@ function log(...args: unknown[]): void {
 
 async function main(): Promise<void> {
   const config = loadConfig()
-  const mode: 'record' | 'dry' | 'live' =
+  // Mutable at runtime so the dashboard can flip the switch without a restart.
+  let mode: BotMode =
     process.argv[2] === 'live' ? 'live' : process.argv[2] === 'dry' ? 'dry' : 'record'
+  // Live is only reachable if the operator launched with explicit intent.
+  const allowLive =
+    process.argv.includes('--i-understand-live') ||
+    process.argv.includes('--allow-live') ||
+    process.env.BOT_I_UNDERSTAND_LIVE === '1' ||
+    process.env.BOT_ALLOW_LIVE === '1'
+  let halted = false
   const db = openDb(config.dbPath)
   const stream = new ChainlinkStream()
 
@@ -54,7 +65,7 @@ async function main(): Promise<void> {
   /** Windows we've already entered this session — sync guard against the async
    * entry double-firing across ticks (DB tradeExists guards across restarts). */
   const entered = new Set<string>()
-  /** dry paper executor by default; the live gate below swaps in the real one. */
+  /** dry paper executor by default; arming live swaps in the real one. */
   let executor = dryExecutor
   const STOP_FILE = resolve(process.cwd(), 'bot/STOP')
   stream.start((symbol, tick) => {
@@ -79,41 +90,58 @@ async function main(): Promise<void> {
         : ''),
   )
 
-  // --- LIVE promotion gate: every guard must pass or the process refuses to arm ---
-  if (mode === 'live') {
-    const confirmed =
-      process.argv.includes('--i-understand-live') || process.env.BOT_I_UNDERSTAND_LIVE === '1'
-    if (!confirmed) {
-      log('LIVE refused — pass --i-understand-live (or BOT_I_UNDERSTAND_LIVE=1) to arm real orders')
-      process.exit(1)
-    }
-    if (!tradingEnabled()) {
-      log('LIVE refused — POLY_TRADING_ENABLED is 0/false')
-      process.exit(1)
-    }
+  // --- LIVE arming: every guard must pass; returns an error instead of exiting
+  // so the same path serves both startup and a runtime switch. ---
+  async function armLive(): Promise<{ ok: boolean; error?: string; balance?: number }> {
+    if (!allowLive) return { ok: false, error: 'live not permitted — start the bot with --allow-live' }
+    if (!tradingEnabled()) return { ok: false, error: 'POLY_TRADING_ENABLED is 0/false' }
     if (config.stakeUsd > maxOrderCost()) {
-      log(`LIVE refused — stake $${config.stakeUsd} exceeds POLY_MAX_ORDER_COST $${maxOrderCost()}`)
-      process.exit(1)
+      return { ok: false, error: `stake $${config.stakeUsd} exceeds POLY_MAX_ORDER_COST $${maxOrderCost()}` }
     }
     const { fetchAccountSnapshot } = await import('../api/_lib/clob')
     let snap: Awaited<ReturnType<typeof fetchAccountSnapshot>>
     try {
       snap = await fetchAccountSnapshot()
     } catch (e) {
-      log('LIVE refused — account check failed:', e instanceof Error ? e.message : String(e))
-      process.exit(1)
+      return { ok: false, error: `account check failed: ${e instanceof Error ? e.message : String(e)}` }
     }
-    if (!snap.canTrade) {
-      log(`LIVE refused — wallet not ready: ${snap.walletSetupIssue ?? 'missing signer/key'}`)
-      process.exit(1)
-    }
-    if (!(snap.usdcBalance > 0)) {
-      log(`LIVE refused — zero USDC balance`)
-      process.exit(1)
-    }
+    if (!snap.canTrade) return { ok: false, error: `wallet not ready: ${snap.walletSetupIssue ?? 'missing signer/key'}` }
+    if (!(snap.usdcBalance > 0)) return { ok: false, error: 'zero USDC balance' }
     executor = makeLiveExecutor()
+    return { ok: true, balance: snap.usdcBalance }
+  }
+
+  async function setMode(next: BotMode): Promise<{ ok: boolean; error?: string }> {
+    if (next === mode) return { ok: true }
+    if (next === 'live') {
+      const r = await armLive()
+      if (!r.ok) return r
+      log(`⚠ LIVE ARMED (control) · balance $${r.balance?.toFixed(2)} · stake $${config.stakeUsd} · max/order $${maxOrderCost()}`)
+    } else {
+      executor = dryExecutor
+    }
+    const prev = mode
+    mode = next
+    log(`mode ${prev} → ${next}`)
+    return { ok: true }
+  }
+
+  function setHalted(next: boolean): void {
+    if (next === halted) return
+    halted = next
+    log(halted ? 'entries HALTED (control)' : 'entries RESUMED (control)')
+  }
+
+  // Startup live still refuses hard (exit) — a launched-live bot that can't arm
+  // shouldn't silently fall back to dry.
+  if (mode === 'live') {
+    const r = await armLive()
+    if (!r.ok) {
+      log(`LIVE refused — ${r.error}`)
+      process.exit(1)
+    }
     log(
-      `⚠ LIVE ARMED · balance $${snap.usdcBalance.toFixed(2)} · stake $${config.stakeUsd} · ` +
+      `⚠ LIVE ARMED · balance $${r.balance?.toFixed(2)} · stake $${config.stakeUsd} · ` +
         `max/order $${maxOrderCost()} · maxDaily ${config.maxDailyTrades} · maxOpen ${config.maxConcurrent} · ` +
         `create ${STOP_FILE} to halt entries`,
     )
@@ -123,8 +151,8 @@ async function main(): Promise<void> {
   // paper-fills; live places a real FAK BUY. `bot/STOP` halts new entries.
   let stopLoggedAt = 0
   async function maybeTrade(pred: Prediction, market: ParsedMarket, now: number): Promise<void> {
-    if (existsSync(STOP_FILE)) {
-      if (now - stopLoggedAt > 60_000) {
+    if (halted || existsSync(STOP_FILE)) {
+      if (existsSync(STOP_FILE) && now - stopLoggedAt > 60_000) {
         stopLoggedAt = now
         log('STOP file present — entries halted')
       }
@@ -284,6 +312,36 @@ async function main(): Promise<void> {
     }
   }
 
+  // --- control server for the dashboard Dry/Live switch ---
+  const controlServer =
+    process.env.BOT_CONTROL === '0'
+      ? null
+      : startControlServer(
+          {
+            getStatus: () => ({
+              mode,
+              allowLive,
+              halted,
+              connected: stream.connected,
+              scopes: scopes.map((s) => `${s.coin}/${s.timeframe}`),
+              liveScopes: scopes.filter((s) => s.market).length,
+              stats: {
+                ticks: stats.ticks,
+                predictions: stats.predictions,
+                outcomes: stats.outcomes,
+                trades: stats.trades,
+                settled: stats.settled,
+              },
+              summary: db.tradeSummary(),
+            }),
+            setMode,
+            setHalted,
+          },
+          Number(process.env.BOT_CONTROL_PORT ?? 8790),
+          process.env.BOT_CONTROL_TOKEN?.trim() || undefined,
+          log,
+        )
+
   let lastStatus = 0
   const timer = setInterval(() => {
     const now = Date.now()
@@ -310,9 +368,10 @@ async function main(): Promise<void> {
 
   const shutdown = (): void => {
     clearInterval(timer)
+    controlServer?.close()
     stream.stop()
     db.close()
-    log('recorder stopped')
+    log(`${mode} stopped`)
     process.exit(0)
   }
   process.on('SIGINT', shutdown)
