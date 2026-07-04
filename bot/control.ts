@@ -77,9 +77,10 @@ export function startControlServer(
           }
           const body = await readJson(req)
           if (url.pathname === '/mode') {
-            const mode = body.mode
+            // 'paper' is the UI's name for the wire mode 'dry' — accept it here too.
+            const mode = body.mode === 'paper' ? 'dry' : body.mode
             if (mode !== 'record' && mode !== 'dry' && mode !== 'live') {
-              return send(400, { error: 'mode must be record|dry|live' })
+              return send(400, { error: 'mode must be record|dry (alias: paper)|live' })
             }
             const r = await runtime.setMode(mode)
             return r.ok ? send(200, runtime.getStatus()) : send(409, { error: r.error })

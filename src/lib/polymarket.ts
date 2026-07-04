@@ -24,6 +24,14 @@ async function fetchJson<T>(path: string): Promise<T> {
   return res.json() as Promise<T>
 }
 
+/** Coerce to a finite number or null — Number('N/A') and Number('1,234') are NaN,
+ * which is NOT nullish and would poison a ?? fallback chain. */
+function toFiniteNum(value: unknown): number | null {
+  if (value == null || value === '') return null
+  const n = Number(value)
+  return Number.isFinite(n) ? n : null
+}
+
 function parseJsonArray<T>(value: string | undefined, fallback: T[]): T[] {
   if (!value) return fallback
   try {
@@ -109,7 +117,7 @@ export function parseMarket(
     timeframe: effectiveTf,
     upPrice,
     downPrice,
-    volume: market.volumeNum ?? Number(market.volume) ?? event.volume ?? 0,
+    volume: market.volumeNum ?? toFiniteNum(market.volume) ?? event.volume ?? 0,
     liquidity: market.liquidityNum ?? event.liquidity ?? 0,
     endDate,
     startDate: windowStart,

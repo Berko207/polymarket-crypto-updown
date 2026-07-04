@@ -49,8 +49,10 @@ function log(...args: unknown[]): void {
 async function main(): Promise<void> {
   const config = loadConfig()
   // Mutable at runtime so the dashboard can flip the switch without a restart.
+  // 'paper' is an alias for the wire mode 'dry' (paper-trading, no real orders).
+  const launchArg = process.argv[2]
   let mode: BotMode =
-    process.argv[2] === 'live' ? 'live' : process.argv[2] === 'dry' ? 'dry' : 'record'
+    launchArg === 'live' ? 'live' : launchArg === 'dry' || launchArg === 'paper' ? 'dry' : 'record'
   // Live is only reachable if the operator launched with explicit intent.
   const allowLive =
     process.argv.includes('--i-understand-live') ||
