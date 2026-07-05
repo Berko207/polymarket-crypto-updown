@@ -1,6 +1,6 @@
 import { useEffect, useRef } from 'react'
 import { chainlinkSocket } from '@/lib/chainlinkSocket'
-import { chainlinkPair } from '@/lib/cryptoPrice'
+import { chainlinkPair, SETTLE_SLOP_MS } from '@/lib/cryptoPrice'
 import {
   ACTIONABLE_EDGE,
   MAX_TRUSTED_SPREAD,
@@ -150,31 +150,27 @@ export function useFairValue(market: ParsedMarket | null, spot: MarketSpot): Fai
   const stateRef = useRef({ market, spot, value, locked, msRemaining, pair })
   stateRef.current = { market, spot, value, locked, msRemaining, pair }
 
-  // Direct outcome capture, keyed on the condition itself: the completed market
-  // is only retained for a sub-second blip during rollover, so a clock-tick
-  // effect loses the race — this fires the moment the "final" render commits.
+  // Direct outcome capture, keyed on the settlement price itself: fires the moment a
+  // settlement-grade price (Chainlink boundary tick, or settled REST close) is available —
+  // NOT at the local end-time on a pre-settlement/frozen spot.current, which recorded the
+  // wrong up/down side on near-boundary closes and poisoned the Brier log.
   const outcomeKey =
-    market &&
-    spot.completed &&
-    spot.currentPhase === 'final' &&
-    spot.strike != null &&
-    spot.current != null
-      ? marketWindowKey(market)
-      : null
+    market && spot.settlementPrice != null && spot.strike != null ? marketWindowKey(market) : null
 
   useEffect(() => {
     if (!outcomeKey || outcomeLoggedRef.current === outcomeKey) return
     const { market, spot } = stateRef.current
-    if (!market || spot.strike == null || spot.current == null) return
+    if (!market || spot.strike == null || spot.settlementPrice == null) return
     outcomeLoggedRef.current = outcomeKey
     logOutcome({
       windowKey: outcomeKey,
       eventSlug: market.eventSlug,
       coin: market.coin,
       timeframe: market.timeframe,
+      // Strike stays the model-used (displayed) strike so Brier stays self-consistent.
       strike: spot.strike,
-      finalPrice: spot.current,
-      outcome: spot.current > spot.strike ? 'up' : 'down',
+      finalPrice: spot.settlementPrice,
+      outcome: spot.settlementPrice > spot.strike ? 'up' : 'down',
       endMs: market.endDate.getTime(),
       recordedAt: Date.now(),
     })
@@ -190,7 +186,7 @@ export function useFairValue(market: ParsedMarket | null, spot: MarketSpot): Fai
     // logOutcome puts by windowKey — a duplicate with the direct path is benign.
     const sampled = sampledWindowRef.current
     if (sampled && Date.now() > sampled.endMs + 2_000) {
-      const finalPrice = chainlinkSocket.firstPriceAtOrAfter(sampled.pair, sampled.endMs, 120_000)
+      const finalPrice = chainlinkSocket.firstPriceAtOrAfter(sampled.pair, sampled.endMs, SETTLE_SLOP_MS)
       if (finalPrice != null) {
         logOutcome({
           windowKey: sampled.windowKey,

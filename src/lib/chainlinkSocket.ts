@@ -6,6 +6,11 @@
 const WS_URL = 'wss://ws-live-data.polymarket.com'
 const PING_MS = 5_000
 const RECONNECT_MS = 2_000
+/** No frame (tick OR PONG) for this long on an OPEN socket → force-reconnect: the
+ * browser never surfaced the half-open/silent connection (sleep, VPN flip) as closed. */
+const STALE_SOCKET_MS = 25_000
+/** Watchdog cadence — well under STALE_SOCKET_MS so a stall is caught within ~one interval. */
+const WATCHDOG_MS = 5_000
 /** Keep ticks long enough to cover a 4h window plus slack. */
 const HISTORY_MS = 5 * 60 * 60 * 1000
 const MAX_HISTORY_TICKS = 8_000
@@ -33,7 +38,12 @@ class ChainlinkSocket {
   private ws: WebSocket | null = null
   private pingTimer: ReturnType<typeof setInterval> | null = null
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null
+  private watchdogTimer: ReturnType<typeof setInterval> | null = null
   private connected = false
+  /** Wall-clock ms of the last frame from the active socket (tick OR PONG). */
+  private lastMessageAt = 0
+  private listenersAttached = false
+  private lastHealthCheck = 0
 
   subscribe(
     symbols: string[],
@@ -46,6 +56,7 @@ class ChainlinkSocket {
       onConnectedChange,
     }
     this.subs.add(sub)
+    if (this.subs.size === 1) this.attachGlobalListeners()
     onUpdate(this.snapshot(sub.symbols))
     onConnectedChange?.(this.connected)
     this.ensureSocket()
@@ -73,8 +84,47 @@ class ChainlinkSocket {
   private clearTimers() {
     if (this.pingTimer) clearInterval(this.pingTimer)
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer)
+    if (this.watchdogTimer) clearInterval(this.watchdogTimer)
     this.pingTimer = null
     this.reconnectTimer = null
+    this.watchdogTimer = null
+  }
+
+  /** Debounced liveness check shared by the visibility/online listeners: revive a
+   * closed socket, or force-reconnect an OPEN-but-silent (half-open) one. */
+  private checkFeedHealth() {
+    if (this.subs.size === 0) return
+    const nowMs = Date.now()
+    if (nowMs - this.lastHealthCheck < 2_000) return
+    this.lastHealthCheck = nowMs
+    if (!this.ws || this.ws.readyState === WebSocket.CLOSED) {
+      this.ensureSocket()
+    } else if (this.ws.readyState === WebSocket.OPEN && nowMs - this.lastMessageAt > STALE_SOCKET_MS) {
+      this.openSocket()
+    }
+  }
+
+  private onVisibility = () => {
+    if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return
+    this.checkFeedHealth()
+  }
+
+  private onOnline = () => this.checkFeedHealth()
+
+  // Attached once on the 0→1 subscriber transition, removed in teardown (1→0) — many
+  // components subscribe, so per-subscribe attach would leak duplicate listeners.
+  private attachGlobalListeners() {
+    if (this.listenersAttached) return
+    if (typeof document !== 'undefined') document.addEventListener('visibilitychange', this.onVisibility)
+    if (typeof window !== 'undefined') window.addEventListener('online', this.onOnline)
+    this.listenersAttached = true
+  }
+
+  private detachGlobalListeners() {
+    if (!this.listenersAttached) return
+    if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', this.onVisibility)
+    if (typeof window !== 'undefined') window.removeEventListener('online', this.onOnline)
+    this.listenersAttached = false
   }
 
   private detach(ws: WebSocket) {
@@ -96,6 +146,14 @@ class ChainlinkSocket {
 
   latestTick(pair: string): ChainlinkTick | null {
     return this.prices[pair] ?? null
+  }
+
+  /** Wall-clock ms since the last frame from the active socket, or Infinity when no
+   * socket is open — the display-staleness signal consumers gate "live" on. Backed by
+   * PING/PONG, so a calm feed with sparse oracle prints still reads as fresh. */
+  msSinceLastMessage(): number {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return Infinity
+    return Date.now() - this.lastMessageAt
   }
 
   /** Retained ticks at/after `sinceMs`, oldest first (bounded by the 5h ring buffer). */
@@ -211,6 +269,7 @@ class ChainlinkSocket {
 
     ws.onopen = () => {
       if (ws !== this.ws) return
+      this.lastMessageAt = Date.now()
       this.setConnected(true)
       ws.send(
         JSON.stringify({
@@ -221,10 +280,22 @@ class ChainlinkSocket {
       this.pingTimer = setInterval(() => {
         if (ws.readyState === WebSocket.OPEN) ws.send('PING')
       }, PING_MS)
+      // Force-reconnect a half-open socket the browser never reported as closed:
+      // no tick AND no PONG for STALE_SOCKET_MS while still OPEN means it's dead.
+      this.watchdogTimer = setInterval(() => {
+        if (
+          this.ws === ws &&
+          ws.readyState === WebSocket.OPEN &&
+          Date.now() - this.lastMessageAt > STALE_SOCKET_MS
+        ) {
+          this.openSocket()
+        }
+      }, WATCHDOG_MS)
     }
 
     ws.onmessage = (event) => {
       if (ws !== this.ws) return
+      this.lastMessageAt = Date.now()
       if (event.data === 'PONG') return
       try {
         if (this.applyMessage(JSON.parse(event.data as string))) this.notify()
@@ -254,6 +325,7 @@ class ChainlinkSocket {
 
   private teardown() {
     this.clearTimers()
+    this.detachGlobalListeners()
     if (this.ws) {
       this.detach(this.ws)
       try {

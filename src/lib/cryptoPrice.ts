@@ -53,6 +53,16 @@ const CRYPTO_PRICE_VARIANT: Partial<Record<ParsedMarket['timeframe'], string>> =
   '4h': 'fourhour',
 }
 
+/**
+ * Max ms after a window boundary that a Chainlink tick may be accepted as the
+ * settlement/resolution price. Shared by the settlement path in `useMarketSpot`
+ * and the outcome backfill in `useFairValue` so both resolve to the SAME price —
+ * a >60s gap is never a near-tie, so the up/down sign is unambiguous. Tighter than
+ * the 120s rolling-strike slop, which only needs the window's open value, not a
+ * knife-edge resolution.
+ */
+export const SETTLE_SLOP_MS = 60_000
+
 export interface CryptoPriceWindowParams {
   eventStartTime: string
   endDate: string
