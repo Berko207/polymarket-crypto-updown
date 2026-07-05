@@ -28,7 +28,15 @@ export type SignalSource = 'flat' | 'regime' | 'blend'
 
 export interface BotConfig {
   coins: CoinId[]
+  /** Recorded universe — every coin×timeframe here is polled/logged. */
   timeframes: TimeframeId[]
+  /**
+   * Subset of `timeframes` that entries actually fire on (recording still covers
+   * all of `timeframes`). Lets 5m stay a recorded dataset while not being traded —
+   * it bled net-negative even before fees, whereas 15m/1h/4h held up. Runtime-
+   * adjustable from the dashboard. Always intersected with `timeframes`.
+   */
+  tradeTimeframes: TimeframeId[]
   dbPath: string
   /** Main loop cadence — must be ≤ a few s so M2 can fire at T-10s. */
   tickMs: number
@@ -49,6 +57,7 @@ export interface BotConfig {
   entryToleranceSec: number
   edgeThreshold: number
   stakeUsd: number
+  /** Max entries in a rolling 24h window; 0 = unlimited (paper default). Live falls back to 50. */
   maxDailyTrades: number
   maxConcurrent: number
   // --- swing scalp (strategy='swing') ---
@@ -89,11 +98,13 @@ export interface BotConfig {
 }
 
 const ALL_COINS = COINS.map((c) => c.id)
-/** Default bot universe — the coins the edge model was calibrated/forward-tested on.
- * doge/bnb DO stream on RTDS now, but stay opt-in (BOT_COINS=...,doge,bnb) so adding
- * a Chainlink pair for the dashboard can never silently widen live trading scope. */
-const DEFAULT_COINS: CoinId[] = ['btc', 'eth', 'sol', 'xrp']
+/** Default bot universe — all Chainlink-streamed up/down coins. Override with BOT_COINS. */
+const DEFAULT_COINS: CoinId[] = ['btc', 'eth', 'sol', 'xrp', 'doge', 'bnb']
 const KNOWN_TF: TimeframeId[] = ['5m', '15m', '1h', '4h', 'daily']
+/** Recorded by default — 5m kept for its dataset even though it's not traded. */
+const DEFAULT_RECORD_TF: TimeframeId[] = ['5m', '15m', '1h', '4h']
+/** Traded by default — windows long enough for the swing to work; excludes 5m. */
+const DEFAULT_TRADE_TF: TimeframeId[] = ['15m', '1h', '4h']
 
 function parseList<T extends string>(raw: string | undefined, valid: T[], fallback: T[]): T[] {
   if (!raw) return fallback
@@ -122,7 +133,14 @@ export function loadConfig(): BotConfig {
   // Only Chainlink-streamed coins can be modeled; BOT_COINS may opt into any of them.
   const coinsAll = parseList<CoinId>(env.BOT_COINS, ALL_COINS, DEFAULT_COINS)
   const coins = coinsAll.filter((c) => chainlinkPair(c))
-  const timeframes = parseList<TimeframeId>(env.BOT_TIMEFRAMES, KNOWN_TF, ['5m', '15m'])
+  const timeframes = parseList<TimeframeId>(env.BOT_TIMEFRAMES, KNOWN_TF, DEFAULT_RECORD_TF)
+  // Trade only a subset of what's recorded. Intersect with `timeframes` so we can
+  // never "trade" a timeframe that isn't being fetched; if that leaves nothing
+  // (e.g. BOT_TIMEFRAMES excludes every trade default), fall back to trading all
+  // recorded timeframes so the bot never silently goes no-op.
+  const tradeWanted = parseList<TimeframeId>(env.BOT_TRADE_TIMEFRAMES, KNOWN_TF, DEFAULT_TRADE_TF)
+  const tradeIntersect = tradeWanted.filter((tf) => timeframes.includes(tf))
+  const tradeTimeframes = tradeIntersect.length ? tradeIntersect : timeframes
   const strategy: 'value' | 'swing' =
     env.BOT_STRATEGY?.trim().toLowerCase() === 'swing' ? 'swing' : 'value'
   const swingTrigger: SwingTrigger =
@@ -134,6 +152,7 @@ export function loadConfig(): BotConfig {
   return {
     coins,
     timeframes,
+    tradeTimeframes,
     dbPath: env.BOT_DB_PATH?.trim() || 'bot/data.db',
     tickMs: num(env.BOT_TICK_MS, 1_000),
     sampleMs: num(env.BOT_SAMPLE_MS, 10_000),
@@ -145,7 +164,7 @@ export function loadConfig(): BotConfig {
     entryToleranceSec: num(env.BOT_ENTRY_TOLERANCE_SEC, 4),
     edgeThreshold: num(env.BOT_EDGE_THRESHOLD, 0.05),
     stakeUsd: num(env.BOT_STAKE_USD, 1),
-    maxDailyTrades: num(env.BOT_MAX_DAILY_TRADES, 50),
+    maxDailyTrades: numNonNeg(env.BOT_MAX_DAILY_TRADES, 0),
     maxConcurrent: num(env.BOT_MAX_CONCURRENT, 5),
     swingMovePts: num(env.BOT_SWING_MOVE_PTS, 0.04),
     swingWindowSec: num(env.BOT_SWING_WINDOW_SEC, 20),

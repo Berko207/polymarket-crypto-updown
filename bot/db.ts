@@ -113,6 +113,56 @@ export interface TradeClose {
   pnl: number
 }
 
+/** Filters for the dashboard trade-history grid; every field is optional (omit = any). */
+export interface TradeQuery {
+  mode?: string
+  strategy?: string
+  coin?: string
+  timeframe?: string
+  status?: string
+  reason?: string
+  /** 'win' | 'loss' — among realized (settled/closed) trades only. */
+  outcome?: 'win' | 'loss'
+  /** entry_t epoch-ms bounds (inclusive). */
+  from?: number
+  to?: number
+  limit?: number
+  offset?: number
+}
+
+/** A full trade row for the history grid — every persisted column. */
+export interface TradeHistoryRow {
+  id: number
+  windowKey: string
+  coin: string
+  timeframe: string
+  mode: string
+  strategy: string
+  side: 'up' | 'down'
+  entryT: number
+  entryPrice: number
+  size: number
+  cost: number
+  entryFee: number
+  signalEdge: number
+  regimeEntry: string | null
+  status: string
+  settleT: number | null
+  exitPrice: number | null
+  exitReason: string | null
+  exitFee: number | null
+  payout: number | null
+  pnl: number | null
+  orderId: string | null
+}
+
+/** One page of filtered history plus totals for the whole (unpaged) filtered set. */
+export interface TradeHistoryPage {
+  rows: TradeHistoryRow[]
+  total: number
+  summary: { realized: number; wins: number; pnl: number; staked: number }
+}
+
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS ticks (
   symbol TEXT NOT NULL, ts INTEGER NOT NULL, value REAL NOT NULL,
@@ -173,6 +223,12 @@ export interface BotDb {
   openTrades(): OpenTradeRow[]
   /** Most-recent finished trades, newest first (activity feed). */
   recentClosed(limit: number): ClosedTradeRow[]
+  /** Filtered, paged trade history for the dashboard grid (newest first). */
+  queryTrades(query: TradeQuery): TradeHistoryPage
+  /** Last recorded strike for a window (from predictions), for outcome sweeps after restart. */
+  windowStrike(windowKey: string): number | null
+  /** First persisted tick at/after a boundary, within slop (survives bot restarts). */
+  tickAtOrAfter(symbol: string, boundaryMs: number, maxSlopMs: number): number | null
   close(): void
 }
 
@@ -278,6 +334,12 @@ export function openDb(path: string, readonly = false): BotDb {
     FROM trades WHERE status IN ('settled','closed')
     ORDER BY settle_t DESC LIMIT ?
   `)
+  const windowStrikeStmt = raw.prepare(
+    'SELECT strike FROM predictions WHERE window_key = ? ORDER BY t DESC LIMIT 1',
+  )
+  const tickAtOrAfterStmt = raw.prepare(
+    'SELECT value FROM ticks WHERE symbol = ? AND ts >= ? AND ts <= ? ORDER BY ts ASC LIMIT 1',
+  )
 
   return {
     raw,
@@ -307,6 +369,73 @@ export function openDb(path: string, readonly = false): BotDb {
       swingExitsStmt.all() as { reason: string; n: number; wins: number; pnl: number }[],
     openTrades: () => openTradesStmt.all() as OpenTradeRow[],
     recentClosed: (limit) => recentClosedStmt.all(limit) as ClosedTradeRow[],
+    queryTrades: (q) => {
+      // Build the WHERE dynamically; every value is a bound param (never interpolated).
+      const where: string[] = []
+      const params: Record<string, unknown> = {}
+      const eq = (col: string, key: keyof TradeQuery): void => {
+        const v = q[key]
+        if (v != null && v !== '') {
+          where.push(`${col} = @${key}`)
+          params[key] = v
+        }
+      }
+      eq('mode', 'mode')
+      eq('strategy', 'strategy')
+      eq('coin', 'coin')
+      eq('timeframe', 'timeframe')
+      eq('status', 'status')
+      eq('exit_reason', 'reason')
+      if (q.from != null) {
+        where.push('entry_t >= @from')
+        params.from = q.from
+      }
+      if (q.to != null) {
+        where.push('entry_t <= @to')
+        params.to = q.to
+      }
+      if (q.outcome === 'win') where.push("status IN ('settled','closed') AND pnl > 0")
+      if (q.outcome === 'loss') where.push("status IN ('settled','closed') AND pnl <= 0")
+      const clause = where.length ? `WHERE ${where.join(' AND ')}` : ''
+      const limit = Math.min(Math.max(Math.trunc(q.limit ?? 200), 1), 2000)
+      const offset = Math.max(Math.trunc(q.offset ?? 0), 0)
+
+      const rows = raw
+        .prepare(
+          `SELECT id, window_key AS windowKey, coin, timeframe, mode, strategy, side,
+                  entry_t AS entryT, entry_price AS entryPrice, size, cost, entry_fee AS entryFee,
+                  signal_edge AS signalEdge, regime_entry AS regimeEntry, status,
+                  settle_t AS settleT, exit_price AS exitPrice, exit_reason AS exitReason,
+                  exit_fee AS exitFee, payout, pnl, order_id AS orderId
+           FROM trades ${clause}
+           ORDER BY entry_t DESC
+           LIMIT @__limit OFFSET @__offset`,
+        )
+        .all({ ...params, __limit: limit, __offset: offset }) as TradeHistoryRow[]
+
+      const agg = raw
+        .prepare(
+          `SELECT
+             COUNT(*) AS total,
+             COALESCE(SUM(CASE WHEN status IN ('settled','closed') THEN 1 ELSE 0 END), 0) AS realized,
+             COALESCE(SUM(CASE WHEN status IN ('settled','closed') AND pnl > 0 THEN 1 ELSE 0 END), 0) AS wins,
+             COALESCE(SUM(CASE WHEN status IN ('settled','closed') THEN pnl ELSE 0 END), 0) AS pnl,
+             COALESCE(SUM(CASE WHEN status IN ('settled','closed') THEN cost ELSE 0 END), 0) AS staked
+           FROM trades ${clause}`,
+        )
+        .get(params) as { total: number; realized: number; wins: number; pnl: number; staked: number }
+
+      return {
+        rows,
+        total: agg.total,
+        summary: { realized: agg.realized, wins: agg.wins, pnl: agg.pnl, staked: agg.staked },
+      }
+    },
+    windowStrike: (windowKey) =>
+      (windowStrikeStmt.get(windowKey) as { strike: number } | undefined)?.strike ?? null,
+    tickAtOrAfter: (symbol, boundaryMs, maxSlopMs) =>
+      (tickAtOrAfterStmt.get(symbol, boundaryMs, boundaryMs + maxSlopMs) as { value: number } | undefined)
+        ?.value ?? null,
     close: () => raw.close(),
   }
 }

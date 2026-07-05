@@ -6,6 +6,12 @@ export function marketWindowKey(market: ParsedMarket): string {
   return `${market.eventSlug}:${market.startDate?.getTime() ?? ''}:${market.endDate.getTime()}`
 }
 
+/** Parse end timestamp (ms) from a marketWindowKey string, or null if malformed. */
+export function windowEndMsFromKey(windowKey: string): number | null {
+  const end = Number(windowKey.split(':').pop())
+  return Number.isFinite(end) ? end : null
+}
+
 /** True when a polled market belongs to the selected coin + timeframe tab. */
 export function marketMatchesScope(
   market: ParsedMarket,

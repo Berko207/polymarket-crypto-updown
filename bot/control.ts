@@ -5,12 +5,15 @@
  * hostile page can't satisfy). GET /status is read-only/open.
  */
 import { createServer, type IncomingMessage, type Server } from 'node:http'
+import type { TradeQuery, TradeHistoryPage } from './db'
 
 export type BotMode = 'record' | 'dry' | 'live'
 
 export interface BotStatus {
   mode: BotMode
-  /** Active entry/exit family — fixed at launch via BOT_STRATEGY (not runtime-switchable). */
+  /** USDC stake per automated entry (runtime-adjustable via POST /stake). */
+  stakeUsd: number
+  /** Active entry/exit family — runtime-switchable from the dashboard (POST /strategy). */
   strategy: 'value' | 'swing'
   allowLive: boolean
   halted: boolean
@@ -19,6 +22,15 @@ export interface BotStatus {
   liveScopes: number
   stats: { ticks: number; predictions: number; outcomes: number; trades: number; settled: number }
   summary: { entered: number; settled: number; open: number; wins: number; staked: number; pnl: number }
+  /** Entries in the rolling 24h window vs the cap — when equal, new entries are blocked. */
+  dailyTrades: number
+  maxDailyTrades: number
+  /** Timeframes entries currently fire on (a subset of availableTimeframes). */
+  tradeTimeframes: string[]
+  /** Every recorded timeframe — the toggleable universe for trade selection. */
+  availableTimeframes: string[]
+  /** Open positions still being force-closed at market after a strategy switch. */
+  pendingCloses: number
   /** Closed swing trades by exit reason (empty for the value strategy). */
   swingExits: { reason: string; n: number; wins: number; pnl: number }[]
   /** Active swing entry trigger + fair-value source (swing strategy only). */
@@ -55,6 +67,12 @@ export interface BotRuntime {
   getStatus(): BotStatus
   setMode(mode: BotMode): Promise<{ ok: boolean; error?: string }>
   setHalted(halted: boolean): void
+  setStakeUsd(stakeUsd: number): { ok: boolean; error?: string }
+  /** 0 = mode default (50 live, unlimited paper). */
+  setMaxDailyTrades(maxDailyTrades: number): { ok: boolean; error?: string }
+  setStrategy(strategy: 'value' | 'swing'): { ok: boolean; error?: string }
+  setTradeTimeframes(timeframes: string[]): { ok: boolean; error?: string }
+  getHistory(query: TradeQuery): TradeHistoryPage
 }
 
 const LOCAL_ORIGIN = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/
@@ -103,6 +121,37 @@ export function startControlServer(
       try {
         if (req.method === 'GET' && url.pathname === '/status') return send(200, runtime.getStatus())
 
+        if (req.method === 'GET' && url.pathname === '/history') {
+          const p = url.searchParams
+          const str = (k: string): string | undefined => {
+            const v = p.get(k)
+            return v && v !== 'all' ? v : undefined
+          }
+          const int = (k: string): number | undefined => {
+            const v = p.get(k)
+            if (v == null || v === '') return undefined
+            const n = Number(v)
+            return Number.isFinite(n) ? n : undefined
+          }
+          const outcome = str('outcome')
+          return send(
+            200,
+            runtime.getHistory({
+              mode: str('mode'),
+              strategy: str('strategy'),
+              coin: str('coin'),
+              timeframe: str('timeframe'),
+              status: str('status'),
+              reason: str('reason'),
+              outcome: outcome === 'win' || outcome === 'loss' ? outcome : undefined,
+              from: int('from'),
+              to: int('to'),
+              limit: int('limit'),
+              offset: int('offset'),
+            }),
+          )
+        }
+
         if (req.method === 'POST') {
           if (token && req.headers['x-bot-token'] !== token) {
             return send(401, { error: 'missing or bad x-bot-token' })
@@ -120,6 +169,31 @@ export function startControlServer(
           if (url.pathname === '/halt') {
             runtime.setHalted(Boolean(body.halted))
             return send(200, runtime.getStatus())
+          }
+          if (url.pathname === '/stake') {
+            const stakeUsd = Number(body.stakeUsd)
+            const r = runtime.setStakeUsd(stakeUsd)
+            return r.ok ? send(200, runtime.getStatus()) : send(400, { error: r.error })
+          }
+          if (url.pathname === '/daily-cap') {
+            const maxDailyTrades = Number(body.maxDailyTrades)
+            const r = runtime.setMaxDailyTrades(maxDailyTrades)
+            return r.ok ? send(200, runtime.getStatus()) : send(400, { error: r.error })
+          }
+          if (url.pathname === '/strategy') {
+            const strategy = body.strategy
+            if (strategy !== 'value' && strategy !== 'swing') {
+              return send(400, { error: 'strategy must be value|swing' })
+            }
+            const r = runtime.setStrategy(strategy)
+            return r.ok ? send(200, runtime.getStatus()) : send(400, { error: r.error })
+          }
+          if (url.pathname === '/timeframes') {
+            if (!Array.isArray(body.timeframes)) {
+              return send(400, { error: 'timeframes must be an array' })
+            }
+            const r = runtime.setTradeTimeframes(body.timeframes.map(String))
+            return r.ok ? send(200, runtime.getStatus()) : send(400, { error: r.error })
           }
         }
         send(404, { error: 'not found' })

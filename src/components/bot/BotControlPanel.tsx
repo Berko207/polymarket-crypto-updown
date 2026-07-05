@@ -1,6 +1,17 @@
+import { useEffect, useState } from 'react'
 import { toast } from 'sonner'
 import { cn } from '@/lib/utils'
-import { useBotHalt, useBotMode, useBotStatus } from '@/queries/bot'
+import { MIN_BUY_USD } from '@/lib/api'
+import { Input } from '@/components/ui/input'
+import {
+  useBotHalt,
+  useBotMaxDailyTrades,
+  useBotMode,
+  useBotStake,
+  useBotStatus,
+  useBotStrategy,
+  useBotTradeTimeframes,
+} from '@/queries/bot'
 import { EXIT_META } from '@/lib/botFormat'
 import type { BotMode } from '@/lib/botControl'
 
@@ -14,6 +25,9 @@ const MODES: { id: BotMode; label: string }[] = [
 
 const modeLabel = (id: BotMode): string => MODES.find((m) => m.id === id)?.label ?? id
 
+const STAKE_PRESETS = [1, 5, 10, 25] as const
+const DAILY_CAP_PRESETS = [50, 100, 250, 500, 1000] as const
+
 /**
  * Bot execution-mode switch + live status for the local bot. Talks to the bot's
  * control server (localhost only). The Record/Paper/Live switch is always shown;
@@ -25,9 +39,65 @@ export function BotControlPanel() {
   const status = useBotStatus()
   const mode = useBotMode()
   const halt = useBotHalt()
+  const stake = useBotStake()
+  const dailyCapMut = useBotMaxDailyTrades()
+  const strat = useBotStrategy()
+  const tradeTf = useBotTradeTimeframes()
   // TanStack keeps the last successful data while polling errors — without the
   // isError gate a killed bot would show "streaming" with stale PnL forever.
   const s = status.isError ? undefined : status.data
+  const stakeSupported = s?.stakeUsd != null
+  const dailyCapSupported = s?.maxDailyTrades != null
+  const serverStake = s?.stakeUsd ?? MIN_BUY_USD
+  const serverDailyCap = s?.maxDailyTrades ?? 0
+  const [draftStake, setDraftStake] = useState(serverStake)
+  const [draftDailyCap, setDraftDailyCap] = useState(serverDailyCap)
+  // Strategy + trade-timeframe control needs a bot new enough to report the universe.
+  const tfSupported = s?.availableTimeframes != null
+  const availableTf = s?.availableTimeframes ?? []
+  const tradedTf = s?.tradeTimeframes ?? []
+
+  useEffect(() => {
+    setDraftStake(serverStake)
+  }, [serverStake])
+
+  useEffect(() => {
+    setDraftDailyCap(serverDailyCap)
+  }, [serverDailyCap])
+
+  const commitStake = (raw: number) => {
+    if (!stakeSupported) {
+      toast.error('Restart the bot (pnpm bot:paper) to enable stake control')
+      return
+    }
+    const next = Math.max(MIN_BUY_USD, raw || MIN_BUY_USD)
+    setDraftStake(next)
+    if (!s || next === serverStake || stake.isPending) return
+    stake.mutate(next, {
+      onError: (e) => {
+        const msg = e instanceof Error ? e.message : 'stake update failed'
+        toast.error(msg === 'not found' ? 'Restart the bot (pnpm bot:paper) to enable stake control' : msg)
+      },
+      onSuccess: () => toast.success(`Stake → $${next}`),
+    })
+  }
+
+  const commitDailyCap = (raw: number) => {
+    if (!dailyCapSupported) {
+      toast.error('Restart the bot to enable daily cap control')
+      return
+    }
+    const next = Math.max(0, Math.floor(raw) || 0)
+    setDraftDailyCap(next)
+    if (!s || next === serverDailyCap || dailyCapMut.isPending) return
+    dailyCapMut.mutate(next, {
+      onError: (e) => {
+        const msg = e instanceof Error ? e.message : 'daily cap update failed'
+        toast.error(msg === 'not found' ? 'Restart the bot to enable daily cap control' : msg)
+      },
+      onSuccess: () => toast.success(`Daily cap → ${next > 0 ? next : 'default'}`),
+    })
+  }
 
   const switchMode = (next: BotMode) => {
     if (!s || next === s.mode || mode.isPending) return
@@ -37,10 +107,41 @@ export function BotControlPanel() {
     })
   }
 
+  const switchStrategy = (next: 'value' | 'swing') => {
+    if (!s || next === s.strategy || strat.isPending) return
+    strat.mutate(next, {
+      onError: (e) => {
+        const msg = e instanceof Error ? e.message : 'strategy switch failed'
+        toast.error(msg === 'not found' ? 'Restart the bot (pnpm bot:paper) to enable strategy control' : msg)
+      },
+      onSuccess: () => toast.success(`Strategy → ${next === 'swing' ? 'Swing' : 'Value'}`),
+    })
+  }
+
+  const toggleTf = (tf: string) => {
+    if (!s || tradeTf.isPending) return
+    const set = new Set(tradedTf)
+    if (set.has(tf)) set.delete(tf)
+    else set.add(tf)
+    const next = availableTf.filter((t) => set.has(t)) // keep canonical order
+    if (next.length === 0) {
+      toast.error('Keep at least one timeframe on — use Halt to pause all entries')
+      return
+    }
+    tradeTf.mutate(next, {
+      onError: (e) => toast.error(e instanceof Error ? e.message : 'timeframe update failed'),
+    })
+  }
+
   const roi = s && s.summary.staked > 0 ? (s.summary.pnl / s.summary.staked) * 100 : null
   const hit = s && s.summary.settled > 0 ? (s.summary.wins / s.summary.settled) * 100 : null
   const strategy = s?.strategy ?? 'value'
   const swingExits = s?.swingExits ?? []
+  const dailyCap =
+    s?.dailyTrades != null &&
+    s.maxDailyTrades != null &&
+    s.maxDailyTrades > 0 &&
+    s.dailyTrades >= s.maxDailyTrades
 
   return (
     <div className="flex flex-col gap-3 rounded-xl border border-border bg-secondary/60 p-4">
@@ -115,9 +216,202 @@ export function BotControlPanel() {
         })}
       </div>
 
+      {s && tfSupported && (
+        <div className="flex flex-col gap-2 rounded-lg bg-secondary px-3 py-2">
+          <div className="flex items-center justify-between gap-2">
+            <span className="text-xs font-medium text-muted-foreground">Strategy</span>
+            <div className="grid grid-cols-2 gap-0.5 rounded-md bg-background/60 p-0.5">
+              {(['value', 'swing'] as const).map((st) => (
+                <button
+                  key={st}
+                  type="button"
+                  disabled={strat.isPending}
+                  onClick={() => switchStrategy(st)}
+                  title={
+                    st === 'swing'
+                      ? 'Swing scalp — fade odds overshoot, auto take-profit/stop mid-window'
+                      : 'Value — late edge bet held to settlement'
+                  }
+                  className={cn(
+                    'rounded px-3 py-1 text-xs font-semibold transition disabled:opacity-40',
+                    strategy === st
+                      ? 'bg-background text-foreground shadow-sm'
+                      : 'text-muted-foreground hover:text-foreground',
+                  )}
+                >
+                  {st === 'swing' ? 'Swing' : 'Value'}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="flex flex-col gap-1">
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-xs font-medium text-muted-foreground">Trade timeframes</span>
+              <span className="text-[0.6rem] text-muted-foreground">off = recorded, not traded</span>
+            </div>
+            <div className="flex flex-wrap gap-1">
+              {availableTf.map((tf) => {
+                const on = tradedTf.includes(tf)
+                return (
+                  <button
+                    key={tf}
+                    type="button"
+                    disabled={tradeTf.isPending}
+                    onClick={() => toggleTf(tf)}
+                    aria-pressed={on}
+                    title={on ? `Trading ${tf} — click to record-only` : `${tf} recorded only — click to trade`}
+                    className={cn(
+                      'rounded px-2 py-0.5 text-[0.7rem] font-semibold tabular-nums transition disabled:opacity-40',
+                      on
+                        ? 'bg-primary/15 text-primary'
+                        : 'bg-background/40 text-muted-foreground line-through hover:text-foreground',
+                    )}
+                  >
+                    {tf}
+                  </button>
+                )
+              })}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {s && s.mode !== 'record' && (
+        <div className="flex flex-col gap-1.5 rounded-lg bg-secondary px-3 py-2">
+          <div className="flex items-center justify-between gap-2">
+            <span className="text-xs font-medium text-muted-foreground">Stake per trade</span>
+            <label className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
+              $
+              <Input
+                type="number"
+                inputMode="decimal"
+                className="h-7 w-20 text-right text-xs font-bold tabular-nums"
+                min={MIN_BUY_USD}
+                step={1}
+                value={draftStake}
+                disabled={!stakeSupported || stake.isPending}
+                onChange={(e) => setDraftStake(Math.max(MIN_BUY_USD, Number(e.target.value) || MIN_BUY_USD))}
+                onBlur={() => commitStake(draftStake)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    e.currentTarget.blur()
+                  }
+                }}
+              />
+            </label>
+          </div>
+          {!stakeSupported && (
+            <p className="text-[0.65rem] text-amber-300">
+              Restart the bot to enable — stop it and run{' '}
+              <code className="rounded bg-secondary px-1 py-0.5">pnpm bot:paper</code>
+            </p>
+          )}
+          <div className="flex flex-wrap gap-1">
+            {STAKE_PRESETS.map((v) => (
+              <button
+                key={v}
+                type="button"
+                disabled={!stakeSupported || stake.isPending}
+                onClick={() => commitStake(v)}
+                className={cn(
+                  'rounded px-2 py-0.5 text-[0.65rem] font-semibold tabular-nums transition disabled:opacity-40',
+                  serverStake === v
+                    ? 'bg-background text-foreground shadow-sm'
+                    : 'text-muted-foreground hover:text-foreground',
+                )}
+              >
+                ${v}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {s && s.mode !== 'record' && (
+        <div className="flex flex-col gap-1.5 rounded-lg bg-secondary px-3 py-2">
+          <div className="flex items-center justify-between gap-2">
+            <span className="text-xs font-medium text-muted-foreground">
+              Daily trade cap
+              {s.dailyTrades != null && (
+                <span className="ml-1.5 font-normal tabular-nums text-muted-foreground/80">
+                  ({s.dailyTrades}/{serverDailyCap > 0 ? serverDailyCap : '∞'} in 24h)
+                </span>
+              )}
+            </span>
+            <label className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
+              max
+              <Input
+                type="number"
+                inputMode="numeric"
+                className="h-7 w-20 text-right text-xs font-bold tabular-nums"
+                min={0}
+                step={1}
+                value={draftDailyCap}
+                disabled={!dailyCapSupported || dailyCapMut.isPending}
+                onChange={(e) => setDraftDailyCap(Math.max(0, Math.floor(Number(e.target.value) || 0)))}
+                onBlur={() => commitDailyCap(draftDailyCap)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    e.currentTarget.blur()
+                  }
+                }}
+              />
+            </label>
+          </div>
+          {!dailyCapSupported && (
+            <p className="text-[0.65rem] text-amber-300">
+              Restart the bot to enable — stop it and run{' '}
+              <code className="rounded bg-secondary px-1 py-0.5">pnpm bot:paper</code>
+            </p>
+          )}
+          <div className="flex flex-wrap gap-1">
+            {DAILY_CAP_PRESETS.map((v) => (
+              <button
+                key={v}
+                type="button"
+                disabled={!dailyCapSupported || dailyCapMut.isPending}
+                onClick={() => commitDailyCap(v)}
+                className={cn(
+                  'rounded px-2 py-0.5 text-[0.65rem] font-semibold tabular-nums transition disabled:opacity-40',
+                  serverDailyCap === v
+                    ? 'bg-background text-foreground shadow-sm'
+                    : 'text-muted-foreground hover:text-foreground',
+                )}
+              >
+                {v}
+              </button>
+            ))}
+            {s.mode === 'dry' && (
+              <button
+                type="button"
+                disabled={!dailyCapSupported || dailyCapMut.isPending}
+                onClick={() => commitDailyCap(0)}
+                title="0 = unlimited in paper mode"
+                className={cn(
+                  'rounded px-2 py-0.5 text-[0.65rem] font-semibold transition disabled:opacity-40',
+                  serverDailyCap === 0
+                    ? 'bg-background text-foreground shadow-sm'
+                    : 'text-muted-foreground hover:text-foreground',
+                )}
+              >
+                ∞
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+
       {!s && (
         <p className="text-center text-[0.7rem] text-muted-foreground">
           offline · run <code className="rounded bg-secondary px-1 py-0.5">pnpm bot:paper</code> to control the bot
+        </p>
+      )}
+
+      {dailyCap && (
+        <p className="rounded-lg bg-amber-500/15 px-3 py-1.5 text-center text-[0.7rem] font-semibold text-amber-300">
+          Daily cap reached ({s!.dailyTrades}/{s!.maxDailyTrades} entries in 24h) — no new trades until older
+          ones roll off, or raise the cap above
         </p>
       )}
 

@@ -1,5 +1,17 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { fetchBotStatus, setBotHalted, setBotMode, type BotMode, type BotStatus } from '@/lib/botControl'
+import {
+  fetchBotHistory,
+  fetchBotStatus,
+  setBotHalted,
+  setBotMode,
+  setBotStake,
+  setBotMaxDailyTrades,
+  setBotStrategy,
+  setBotTradeTimeframes,
+  type BotMode,
+  type BotStatus,
+  type HistoryFilters,
+} from '@/lib/botControl'
 
 const KEY = ['bot', 'status'] as const
 
@@ -28,5 +40,48 @@ export function useBotHalt() {
   return useMutation({
     mutationFn: (halted: boolean) => setBotHalted(halted),
     onSuccess: (status: BotStatus) => qc.setQueryData(KEY, status),
+  })
+}
+
+export function useBotStake() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (stakeUsd: number) => setBotStake(stakeUsd),
+    onSuccess: (status: BotStatus) => qc.setQueryData(KEY, status),
+  })
+}
+
+export function useBotMaxDailyTrades() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (maxDailyTrades: number) => setBotMaxDailyTrades(maxDailyTrades),
+    onSuccess: (status: BotStatus) => qc.setQueryData(KEY, status),
+  })
+}
+
+export function useBotStrategy() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (strategy: 'value' | 'swing') => setBotStrategy(strategy),
+    onSuccess: (status: BotStatus) => qc.setQueryData(KEY, status),
+  })
+}
+
+export function useBotTradeTimeframes() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (timeframes: string[]) => setBotTradeTimeframes(timeframes),
+    onSuccess: (status: BotStatus) => qc.setQueryData(KEY, status),
+  })
+}
+
+/** Filtered trade history; only fetches while the grid is open (`enabled`). */
+export function useBotHistory(filters: HistoryFilters, enabled: boolean) {
+  return useQuery({
+    queryKey: ['bot', 'history', filters],
+    queryFn: () => fetchBotHistory(filters),
+    enabled,
+    placeholderData: (prev) => prev,
+    staleTime: 2_000,
   })
 }

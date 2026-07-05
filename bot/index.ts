@@ -20,7 +20,7 @@ import { dryExecutor, makeLiveExecutor, type SellOrder } from './engine/executor
 import { maxOrderCost, tradingEnabled } from './engine/guards'
 import { startControlServer, type BotMode } from './control'
 import { VOL_LOOKBACK_MS } from '../src/lib/fairValue'
-import { marketWindowKey } from '../src/lib/marketScope'
+import { marketWindowKey, windowEndMsFromKey } from '../src/lib/marketScope'
 import { chainlinkPair } from '../src/lib/cryptoPrice'
 import type { CoinId, ParsedMarket, TimeframeId } from '../src/lib/types'
 
@@ -44,6 +44,10 @@ interface TrackedWindow {
 const STATUS_MS = 30_000
 const OUTCOME_SLOP_MS = 120_000
 const OUTCOME_GIVEUP_MS = 150_000
+/** Live-only fallback when BOT_MAX_DAILY_TRADES is unset/0 — paper has no cap. */
+const LIVE_DEFAULT_DAILY_CAP = 50
+/** Retry cadence for force-closing a position that couldn't fill (empty/thin book). */
+const CLOSE_RETRY_MS = 3_000
 
 function log(...args: unknown[]): void {
   console.info(new Date().toISOString(), ...args)
@@ -85,6 +89,12 @@ async function main(): Promise<void> {
     })
     .filter((s): s is ScopeState => s != null)
 
+  // Timeframes entries currently fire on (a subset of the recorded scopes above).
+  // Mutable so the dashboard can widen/narrow trading without a restart; every
+  // timeframe is still recorded regardless of what's in here.
+  const recordedTf = new Set<TimeframeId>(scopes.map((s) => s.timeframe))
+  const tradeTf = new Set<TimeframeId>(config.tradeTimeframes.filter((tf) => recordedTf.has(tf)))
+
   const lastSample = new Map<string, number>()
   const tracked = new Map<string, TrackedWindow>()
   // Swing state: recent mids per window (swing detection), per-window re-entry
@@ -93,6 +103,11 @@ async function main(): Promise<void> {
   const swingCooldown = new Map<string, number>()
   const enteringSwing = new Set<string>()
   const exitingTrades = new Set<number>()
+  // Positions queued to force-close at market (strategy switch): id → exit reason.
+  // Retried every CLOSE_RETRY_MS until each fills or its window ends.
+  const pendingClose = new Map<number, string>()
+  let draining = false
+  let lastCloseDrain = 0
 
   const strategyBrief =
     config.strategy === 'swing'
@@ -104,7 +119,9 @@ async function main(): Promise<void> {
       : `value · entry ~T-${config.entryAtSec}s · edge≥${config.edgeThreshold}`
   log(
     `${mode} up · db=${config.dbPath} · scopes=${scopes.map((s) => `${s.coin}/${s.timeframe}`).join(',')}` +
-      (mode !== 'record' ? ` · ${strategyBrief} · $${config.stakeUsd}` : ''),
+      (mode !== 'record'
+        ? ` · trade[${config.timeframes.filter((tf) => tradeTf.has(tf)).join(',') || 'none'}] · ${strategyBrief} · $${config.stakeUsd}`
+        : ''),
   )
 
   // --- LIVE arming: every guard must pass; returns an error instead of exiting
@@ -149,6 +166,53 @@ async function main(): Promise<void> {
     log(halted ? 'entries HALTED (control)' : 'entries RESUMED (control)')
   }
 
+  const MIN_STAKE_USD = 1
+
+  function setStakeUsd(next: number): { ok: boolean; error?: string } {
+    if (!Number.isFinite(next) || next < MIN_STAKE_USD) {
+      return { ok: false, error: `stake must be at least $${MIN_STAKE_USD}` }
+    }
+    const cap = maxOrderCost()
+    if (next > cap) return { ok: false, error: `stake $${next} exceeds max order cost $${cap}` }
+    if (next === config.stakeUsd) return { ok: true }
+    const prev = config.stakeUsd
+    config.stakeUsd = next
+    log(`stake $${prev} → $${next} (control)`)
+    return { ok: true }
+  }
+
+  function setStrategy(next: 'value' | 'swing'): { ok: boolean; error?: string } {
+    if (next !== 'value' && next !== 'swing') return { ok: false, error: 'strategy must be value|swing' }
+    if (next === config.strategy) return { ok: true }
+    const prev = config.strategy
+    config.strategy = next
+    log(`strategy ${prev} → ${next} (control)`)
+    // Market-close positions from the old regime so they realize now instead of
+    // riding to settlement. The flip is instant; drainPendingCloses keeps retrying
+    // the sells (empty/thin book) each cycle until filled or the window settles.
+    if (db.countOpenTrades() > 0) requestCloseAllOpen('strategy-switch')
+    return { ok: true }
+  }
+
+  function setTradeTimeframes(next: string[]): { ok: boolean; error?: string } {
+    if (!Array.isArray(next)) return { ok: false, error: 'timeframes must be an array' }
+    const uniq = [
+      ...new Set(
+        next
+          .map((t) => String(t).trim().toLowerCase())
+          .filter((t): t is TimeframeId => recordedTf.has(t as TimeframeId)),
+      ),
+    ]
+    if (uniq.length === 0) {
+      return { ok: false, error: 'select at least one recorded timeframe (use Halt to pause all entries)' }
+    }
+    tradeTf.clear()
+    for (const t of uniq) tradeTf.add(t)
+    config.tradeTimeframes = uniq
+    log(`trade timeframes → ${uniq.join(',')} (control)`)
+    return { ok: true }
+  }
+
   // Startup live still refuses hard (exit) — a launched-live bot that can't arm
   // shouldn't silently fall back to dry.
   if (mode === 'live') {
@@ -159,7 +223,7 @@ async function main(): Promise<void> {
     }
     log(
       `⚠ LIVE ARMED · balance $${r.balance?.toFixed(2)} · stake $${config.stakeUsd} · ` +
-        `max/order $${maxOrderCost()} · maxDaily ${config.maxDailyTrades} · maxOpen ${config.maxConcurrent} · ` +
+        `max/order $${maxOrderCost()} · maxDaily ${effectiveDailyCap() || '∞'} · maxOpen ${config.maxConcurrent} · ` +
         `create ${STOP_FILE} to halt entries`,
     )
   }
@@ -177,13 +241,36 @@ async function main(): Promise<void> {
     return false
   }
 
+  /** 0 = unlimited (paper/record); live uses LIVE_DEFAULT_DAILY_CAP when unset. */
+  function effectiveDailyCap(): number {
+    if (config.maxDailyTrades > 0) return config.maxDailyTrades
+    return mode === 'live' ? LIVE_DEFAULT_DAILY_CAP : 0
+  }
+
+  function setMaxDailyTrades(next: number): { ok: boolean; error?: string } {
+    if (!Number.isFinite(next) || next < 0 || !Number.isInteger(next)) {
+      return { ok: false, error: 'maxDailyTrades must be a non-negative integer (0 = mode default)' }
+    }
+    if (next === config.maxDailyTrades) return { ok: true }
+    const prev = effectiveDailyCap()
+    config.maxDailyTrades = next
+    log(`daily cap ${prev || '∞'} → ${effectiveDailyCap() || '∞'} (control)`)
+    return { ok: true }
+  }
+
+  function dailyCapReached(now: number): boolean {
+    const cap = effectiveDailyCap()
+    if (cap <= 0) return false
+    return db.countTradesSince(now - 86_400_000) >= cap
+  }
+
   // Value entry: once per window, late (~T-10s), on a confident non-panic edge.
   // Dry paper-fills; live places a real FAK BUY. Held to settlement.
   async function maybeTrade(pred: Prediction, market: ParsedMarket, now: number): Promise<void> {
     if (entriesHalted(now)) return
     if (entered.has(pred.windowKey) || db.tradeExists(pred.windowKey)) return
     if (db.countOpenTrades() >= config.maxConcurrent) return
-    if (db.countTradesSince(now - 86_400_000) >= config.maxDailyTrades) return
+    if (dailyCapReached(now)) return
     const order = decideEntry(pred, market, config, now)
     if (!order) return
     entered.add(pred.windowKey) // claim before the await so the next tick can't double-enter
@@ -288,7 +375,7 @@ async function main(): Promise<void> {
     if (db.openTradesForWindow(pred.windowKey).some((t) => t.strategy === 'swing')) return
     if (now - (swingCooldown.get(pred.windowKey) ?? 0) < config.swingCooldownSec * 1_000) return
     if (db.countOpenTrades() >= config.maxConcurrent) return
-    if (db.countTradesSince(now - 86_400_000) >= config.maxDailyTrades) return
+    if (dailyCapReached(now)) return
     const order = decideSwingEntry(pred, market, midHistory.get(pred.windowKey) ?? [], config, now)
     if (!order) return
 
@@ -335,9 +422,105 @@ async function main(): Promise<void> {
   }
 
   // Manage exits before entries so a stop/take-profit frees the per-window slot.
-  async function manageSwing(pred: Prediction, market: ParsedMarket, now: number): Promise<void> {
+  // Exits run even when this timeframe isn't currently tradable, so toggling a
+  // timeframe off from the dashboard never strands an open scalp mid-window.
+  async function manageSwing(
+    pred: Prediction,
+    market: ParsedMarket,
+    now: number,
+    canEnter: boolean,
+  ): Promise<void> {
     await swingExit(pred, market, now)
-    await swingEnter(pred, market, now)
+    if (canEnter) await swingEnter(pred, market, now)
+  }
+
+  // Queue every open position to be force-closed at market (used on a strategy
+  // switch). The selling is retried each cycle by drainPendingCloses until each
+  // fills or its window ends, so an empty/thin book doesn't strand the switch.
+  function requestCloseAllOpen(reason: string): void {
+    let n = 0
+    for (const t of db.openTrades()) {
+      if (!pendingClose.has(t.id)) {
+        pendingClose.set(t.id, reason)
+        n += 1
+      }
+    }
+    if (n > 0) {
+      log(`  queued ${n} open position(s) to close at market (${reason}) — retrying until filled or settled`)
+      void drainPendingCloses()
+    }
+  }
+
+  // Attempt to market-close each queued position at the current bid. One that
+  // can't fill now (no/thin book) stays queued and is retried next cycle; once its
+  // window ends it's dropped (settleTrades resolves it). Mirrors swingExit's sell.
+  async function drainPendingCloses(): Promise<void> {
+    if (draining || pendingClose.size === 0) return
+    draining = true
+    try {
+      const live = new Map<string, ParsedMarket>()
+      for (const sc of scopes) if (sc.market) live.set(marketWindowKey(sc.market), sc.market)
+      const openById = new Map(db.openTrades().map((t) => [t.id, t] as const))
+      for (const [id, reason] of [...pendingClose]) {
+        if (exitingTrades.has(id)) continue
+        const pos = openById.get(id)
+        if (!pos) {
+          pendingClose.delete(id) // already closed/settled elsewhere
+          continue
+        }
+        const market = live.get(pos.windowKey)
+        const tokenId = market ? (pos.side === 'up' ? market.upTokenId : market.downTokenId) : null
+        const mark = market ? bidForSide(deriveBook(market), pos.side) : null
+        if (!market || !tokenId || !(mark != null && mark > 0)) {
+          // No book to sell into right now. Keep retrying while the window is open;
+          // once it ends, settleTrades takes over, so stop tracking it.
+          const endMs = market?.endDate.getTime() ?? windowEndMsFromKey(pos.windowKey)
+          if (endMs != null && Date.now() > endMs) {
+            pendingClose.delete(id)
+            log(`${mode.toUpperCase()} CLOSE give-up #${id} ${pos.coin}/${pos.timeframe} — no book, leaving to settle`)
+          }
+          continue
+        }
+        const sellOrder: SellOrder = {
+          side: pos.side,
+          tokenId,
+          size: pos.size,
+          sellPrice: mark,
+          tickSize: market.tickSize,
+          negRisk: market.negRisk,
+        }
+        exitingTrades.add(id)
+        let fill
+        try {
+          fill = await executor.sell(sellOrder)
+        } catch (e) {
+          exitingTrades.delete(id)
+          log(`${mode.toUpperCase()} CLOSE FAILED #${id} ${pos.side} — ${e instanceof Error ? e.message : String(e)} (will retry)`)
+          continue
+        }
+        exitingTrades.delete(id)
+        if (!(fill.fillSize > 0 && fill.fillPrice > 0)) {
+          // Unmatched — empty/thin book. Stay queued and retry next cycle.
+          continue
+        }
+        const now = Date.now()
+        const exitFee = config.feeSell ? takerFee(fill.fillPrice, fill.fillSize, config.feeRate) : 0
+        const payout = fill.fillPrice * fill.fillSize - exitFee
+        const pnl = payout - pos.cost
+        db.closeTrade({ id, exitT: now, exitPrice: fill.fillPrice, exitReason: reason, exitFee, payout, pnl })
+        swingCooldown.set(pos.windowKey, now)
+        stats.settled += 1
+        pendingClose.delete(id)
+        log(
+          `${mode.toUpperCase()} CLOSE ${reason} ${pos.coin}/${pos.timeframe} ${pos.side} @ ${fill.fillPrice.toFixed(3)} · ` +
+            `pnl ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(3)}`,
+        )
+      }
+    } catch (e) {
+      log(`drainPendingCloses error — ${e instanceof Error ? e.message : String(e)}`)
+    } finally {
+      draining = false
+    }
   }
 
   function settleTrades(now: number): void {
@@ -370,6 +553,7 @@ async function main(): Promise<void> {
     return db.openTrades().map((t) => {
       const market = live.get(t.windowKey) ?? null
       const mark = market ? bidForSide(deriveBook(market), t.side) : null
+      const endMs = market?.endDate.getTime() ?? windowEndMsFromKey(t.windowKey)
       return {
         coin: t.coin,
         timeframe: t.timeframe,
@@ -379,7 +563,7 @@ async function main(): Promise<void> {
         size: t.size,
         mark,
         unrealizedPnl: mark != null ? mark * t.size - t.cost : null,
-        msRemaining: market ? market.endDate.getTime() - now : null,
+        msRemaining: endMs != null ? endMs - now : null,
       }
     })
   }
@@ -435,12 +619,15 @@ async function main(): Promise<void> {
       })
     }
 
-    // Trade every tick (not throttled) so entries/exits land on time.
+    // Trade every tick (not throttled) so entries/exits land on time. Entries only
+    // fire on tradable timeframes; recorded-but-not-traded ones (e.g. 5m) still log
+    // predictions above but never enter. Swing exits are managed regardless.
     if (mode !== 'record') {
+      const canEnter = tradeTf.has(state.timeframe)
       if (config.strategy === 'swing') {
         recordMid(pred, now)
-        void manageSwing(pred, market, now)
-      } else {
+        void manageSwing(pred, market, now, canEnter)
+      } else if (canEnter) {
         void maybeTrade(pred, market, now)
       }
     }
@@ -475,6 +662,27 @@ async function main(): Promise<void> {
     swingCooldown.delete(windowKey)
   }
 
+  // After a restart, in-memory `tracked` is empty — re-seed from open trades so
+  // sweepOutcomes can still record outcomes and settleTrades can close orphans.
+  function seedTrackedFromOpen(): void {
+    for (const t of db.openTrades()) {
+      if (tracked.has(t.windowKey)) continue
+      const endMs = windowEndMsFromKey(t.windowKey)
+      if (endMs == null) continue
+      const pair = chainlinkPair(t.coin as CoinId)
+      if (!pair) continue
+      const strike = db.windowStrike(t.windowKey)
+      if (strike == null) continue
+      tracked.set(t.windowKey, {
+        pair,
+        coin: t.coin,
+        timeframe: t.timeframe,
+        strike,
+        endMs,
+      })
+    }
+  }
+
   function sweepOutcomes(now: number): void {
     for (const [windowKey, w] of tracked) {
       if (now <= w.endMs + 2_000) continue
@@ -482,7 +690,9 @@ async function main(): Promise<void> {
         forget(windowKey)
         continue
       }
-      const finalPrice = stream.firstPriceAtOrAfter(w.pair, w.endMs, OUTCOME_SLOP_MS)
+      let finalPrice =
+        stream.firstPriceAtOrAfter(w.pair, w.endMs, OUTCOME_SLOP_MS) ??
+        db.tickAtOrAfter(w.pair, w.endMs, OUTCOME_SLOP_MS)
       if (finalPrice != null) {
         db.upsertOutcome({
           windowKey,
@@ -510,6 +720,7 @@ async function main(): Promise<void> {
           {
             getStatus: () => ({
               mode,
+              stakeUsd: config.stakeUsd,
               strategy: config.strategy,
               allowLive,
               halted,
@@ -524,6 +735,13 @@ async function main(): Promise<void> {
                 settled: stats.settled,
               },
               summary: db.tradeSummary(),
+              dailyTrades: db.countTradesSince(Date.now() - 86_400_000),
+              maxDailyTrades: effectiveDailyCap(),
+              // Traded subset + the full recorded universe it can be toggled across.
+              tradeTimeframes: config.timeframes.filter((tf) => tradeTf.has(tf)),
+              availableTimeframes: config.timeframes.filter((tf) => recordedTf.has(tf)),
+              // Positions still being force-closed at market (strategy switch retries).
+              pendingCloses: pendingClose.size,
               swingExits: config.strategy === 'swing' ? db.swingExits() : [],
               swingTrigger: config.swingTrigger,
               swingSource: config.signalSource,
@@ -532,11 +750,18 @@ async function main(): Promise<void> {
             }),
             setMode,
             setHalted,
+            setStakeUsd,
+            setMaxDailyTrades,
+            setStrategy,
+            setTradeTimeframes,
+            getHistory: (query) => db.queryTrades(query),
           },
           Number(process.env.BOT_CONTROL_PORT ?? 8790),
           process.env.BOT_CONTROL_TOKEN?.trim() || undefined,
           log,
         )
+
+  seedTrackedFromOpen()
 
   let lastStatus = 0
   const timer = setInterval(() => {
@@ -545,17 +770,27 @@ async function main(): Promise<void> {
       refreshMarket(state, now)
       sampleScope(state, now)
     }
+    seedTrackedFromOpen()
     sweepOutcomes(now)
     if (mode !== 'record') settleTrades(now)
+    // Retry any queued force-closes (strategy switch) whose book was empty/thin.
+    if (mode !== 'record' && pendingClose.size > 0 && now - lastCloseDrain >= CLOSE_RETRY_MS) {
+      lastCloseDrain = now
+      void drainPendingCloses()
+    }
 
     if (now - lastStatus >= STATUS_MS) {
       lastStatus = now
       const live = scopes.filter((s) => s.market).length
+      const dailyTrades = db.countTradesSince(now - 86_400_000)
+      const cap = effectiveDailyCap()
+      const dailyCap = mode !== 'record' && cap > 0 && dailyTrades >= cap
       log(
         `[${mode}] ws=${stream.connected ? 'up' : 'down'} · live=${live}/${scopes.length} · ` +
           `ticks=${stats.ticks} preds=${stats.predictions} outcomes=${stats.outcomes}` +
           (mode !== 'record'
-            ? ` · trades=${stats.trades} settled=${stats.settled} open=${db.countOpenTrades()}`
+            ? ` · trades=${stats.trades} settled=${stats.settled} open=${db.countOpenTrades()}` +
+              ` · daily ${dailyTrades}/${cap || '∞'}${dailyCap ? ' CAP' : ''}`
             : '') +
           ` · pending=${tracked.size}`,
       )

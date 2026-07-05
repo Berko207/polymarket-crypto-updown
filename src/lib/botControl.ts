@@ -8,6 +8,8 @@ export type BotMode = 'record' | 'dry' | 'live'
 
 export interface BotStatus {
   mode: BotMode
+  /** USDC stake per automated entry; defaults to 1 when talking to an older bot. */
+  stakeUsd?: number
   /** Optional so a bot predating the swing strategy still renders (defaults to value). */
   strategy?: 'value' | 'swing'
   allowLive: boolean
@@ -17,6 +19,14 @@ export interface BotStatus {
   liveScopes: number
   stats: { ticks: number; predictions: number; outcomes: number; trades: number; settled: number }
   summary: { entered: number; settled: number; open: number; wins: number; staked: number; pnl: number }
+  /** Entries in the rolling 24h window; optional for older bot builds. */
+  dailyTrades?: number
+  maxDailyTrades?: number
+  /** Traded subset + full recorded universe; absent when talking to an older bot. */
+  tradeTimeframes?: string[]
+  availableTimeframes?: string[]
+  /** Positions still being force-closed at market (strategy-switch retries). */
+  pendingCloses?: number
   swingExits?: { reason: string; n: number; wins: number; pnl: number }[]
   swingTrigger?: 'edge' | 'move'
   swingSource?: 'flat' | 'regime' | 'blend'
@@ -82,3 +92,67 @@ async function post(path: string, body: unknown): Promise<BotStatus> {
 
 export const setBotMode = (mode: BotMode): Promise<BotStatus> => post('/mode', { mode })
 export const setBotHalted = (halted: boolean): Promise<BotStatus> => post('/halt', { halted })
+export const setBotStake = (stakeUsd: number): Promise<BotStatus> => post('/stake', { stakeUsd })
+export const setBotMaxDailyTrades = (maxDailyTrades: number): Promise<BotStatus> =>
+  post('/daily-cap', { maxDailyTrades })
+export const setBotStrategy = (strategy: 'value' | 'swing'): Promise<BotStatus> =>
+  post('/strategy', { strategy })
+export const setBotTradeTimeframes = (timeframes: string[]): Promise<BotStatus> =>
+  post('/timeframes', { timeframes })
+
+/** One trade row in the history grid — mirrors the bot's TradeHistoryRow. */
+export interface TradeHistoryRow {
+  id: number
+  windowKey: string
+  coin: string
+  timeframe: string
+  mode: string
+  strategy: string
+  side: 'up' | 'down'
+  entryT: number
+  entryPrice: number
+  size: number
+  cost: number
+  entryFee: number
+  signalEdge: number
+  regimeEntry: string | null
+  status: string
+  settleT: number | null
+  exitPrice: number | null
+  exitReason: string | null
+  exitFee: number | null
+  payout: number | null
+  pnl: number | null
+  orderId: string | null
+}
+
+export interface HistoryFilters {
+  mode?: string
+  strategy?: string
+  coin?: string
+  timeframe?: string
+  status?: string
+  reason?: string
+  outcome?: string
+  /** entry_t epoch-ms bounds (inclusive). */
+  from?: number
+  to?: number
+  limit?: number
+  offset?: number
+}
+
+export interface HistoryPage {
+  rows: TradeHistoryRow[]
+  total: number
+  summary: { realized: number; wins: number; pnl: number; staked: number }
+}
+
+export async function fetchBotHistory(filters: HistoryFilters): Promise<HistoryPage> {
+  const q = new URLSearchParams()
+  for (const [k, v] of Object.entries(filters)) {
+    if (v != null && v !== '') q.set(k, String(v))
+  }
+  const res = await fetch(`${BASE}/history?${q.toString()}`, { signal: AbortSignal.timeout(8000) })
+  if (!res.ok) throw new Error(`bot history ${res.status}`)
+  return (await res.json()) as HistoryPage
+}
