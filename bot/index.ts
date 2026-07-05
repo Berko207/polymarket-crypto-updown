@@ -10,6 +10,7 @@ import { existsSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { activeScopes, loadConfig } from './config'
 import { openDb } from './db'
+import { loadRuntimeSettings, saveRuntimeSettings } from './runtime'
 import { ChainlinkStream } from './sources/chainlink'
 import { fetchCurrentMarket } from './sources/gamma'
 import { predict, type Prediction } from './engine/predict'
@@ -48,6 +49,7 @@ const OUTCOME_GIVEUP_MS = 150_000
 const LIVE_DEFAULT_DAILY_CAP = 50
 /** Retry cadence for force-closing a position that couldn't fill (empty/thin book). */
 const CLOSE_RETRY_MS = 3_000
+const RUNTIME_PATH = resolve(process.cwd(), 'bot/runtime.json')
 
 function log(...args: unknown[]): void {
   console.info(new Date().toISOString(), ...args)
@@ -55,6 +57,14 @@ function log(...args: unknown[]): void {
 
 async function main(): Promise<void> {
   const config = loadConfig()
+  const runtime = loadRuntimeSettings(RUNTIME_PATH)
+  if (
+    runtime.maxDailyTrades != null &&
+    Number.isInteger(runtime.maxDailyTrades) &&
+    runtime.maxDailyTrades >= 0
+  ) {
+    config.maxDailyTrades = runtime.maxDailyTrades
+  }
   // Mutable at runtime so the dashboard can flip the switch without a restart.
   // 'paper' is an alias for the wire mode 'dry' (paper-trading, no real orders).
   const launchArg = process.argv[2]
@@ -254,6 +264,7 @@ async function main(): Promise<void> {
     if (next === config.maxDailyTrades) return { ok: true }
     const prev = effectiveDailyCap()
     config.maxDailyTrades = next
+    saveRuntimeSettings(RUNTIME_PATH, { maxDailyTrades: next })
     log(`daily cap ${prev || '∞'} → ${effectiveDailyCap() || '∞'} (control)`)
     return { ok: true }
   }

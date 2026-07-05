@@ -30,4 +30,5 @@ dist
 
 bot/data.db
 bot/data.db-*
+bot/runtime.json
 bot/STOP

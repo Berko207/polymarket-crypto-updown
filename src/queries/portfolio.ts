@@ -16,7 +16,7 @@ import {
   type PlaceOrderResponse,
   type Position,
 } from '@/lib/api'
-import { recentFillPrice, recentFillSize, recentFillAt, hasRecentFill, rememberRecentFill, rememberRecentSell, clearRecentFill, clearRecentSell, recentFillPositions, isRecentlySold } from '@/lib/recentFills'
+import { recentFillPrice, recentFillSize, recentFillAt, hasRecentFill, rememberRecentFill, rememberRecentSell, clearRecentFill, recentFillPositions, isRecentlySold } from '@/lib/recentFills'
 import { timeframeFromEventSlug } from '@/lib/slugs'
 import { getTokenMarketLabel } from '@/lib/tokenLabels'
 import { qk } from './keys'

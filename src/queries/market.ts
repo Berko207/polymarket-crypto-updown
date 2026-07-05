@@ -186,8 +186,17 @@ export function useLiveMarket(coin: CoinId, timeframe: TimeframeId): LiveMarket 
     refetch,
   )
 
+  // Bridge brief poll gaps (API miss / in-flight refetch) and rollovers — without this
+  // the focused card blanks to DetailSkeleton every ~6s while isFetching, which makes
+  // the chart impossible to watch during manual trading.
+  const fallback =
+    sameScope &&
+    lastMarketRef.current.market &&
+    marketMatchesScope(lastMarketRef.current.market, coin, timeframe)
+      ? lastMarketRef.current.market
+      : null
   const retained =
-    !queryMarket && rolling && sameScope ? lastMarketRef.current.market : null
+    !queryMarket && fallback && (rolling || isCurrentWindow(fallback, now)) ? fallback : null
   const market =
     queryMarket ??
     (retained && marketMatchesScope(retained, coin, timeframe) ? retained : null)
@@ -198,7 +207,7 @@ export function useLiveMarket(coin: CoinId, timeframe: TimeframeId): LiveMarket 
   )
   const { quotes, connected } = useTokenQuotes(tokenIds, {
     enabled: tokenIds.length > 0,
-    throttleMs: 0,
+    throttleMs: config.useWebSocket ? config.throttleMs : 0,
   })
 
   const displayMarket = useMemo(() => {
@@ -207,9 +216,11 @@ export function useLiveMarket(coin: CoinId, timeframe: TimeframeId): LiveMarket 
     return live
   }, [market, coin, timeframe, quotes, now, rolling])
 
+  // isFetching alone must not blank the card — background polls keep prior data and the
+  // fallback above covers null snapshots; only the first load or a true empty state loads.
   const switching =
     !displayMarket &&
-    (query.isLoading || query.isFetching || (queryMarket == null && query.isFetched && !rolling))
+    (query.isLoading || (queryMarket == null && query.isFetched && !rolling && !fallback))
   const isLoading = switching
 
   return {

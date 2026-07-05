@@ -1,4 +1,4 @@
-import { useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { memo, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { useChainlinkHistory } from '@/hooks/useChainlinkHistory'
 import {
@@ -72,13 +72,22 @@ function timeLabel(ms: number, withDay = false): string {
  * shaded by which side is winning, with the un-elapsed window as empty runway on
  * the right. Hover reads exact price/Δ/time off the path.
  */
-export function WindowPriceChart({ market, spot }: { market: ParsedMarket; spot: MarketSpot }) {
+export const WindowPriceChart = memo(function WindowPriceChart({
+  market,
+  spot,
+}: {
+  market: ParsedMarket
+  spot: MarketSpot
+}) {
   const pair = chainlinkPair(market.coin)
   const startMs = market.startDate?.getTime() ?? 0
   const endMs = market.endDate.getTime()
+  const windowSlug = market.eventSlug
 
   const containerRef = useRef<HTMLDivElement>(null)
   const [width, setWidth] = useState(0)
+  /** Expand-only Y domain — stops the path from jumping every tick as padding recenters. */
+  const yDomainRef = useRef<{ slug: string; lo: number; hi: number } | null>(null)
   useLayoutEffect(() => {
     const el = containerRef.current
     if (!el) return
@@ -142,6 +151,15 @@ export function WindowPriceChart({ market, spot }: { market: ParsedMarket; spot:
     lo -= yPad
     hi += yPad
 
+    if (yDomainRef.current?.slug !== windowSlug) {
+      yDomainRef.current = { slug: windowSlug, lo, hi }
+    } else {
+      const prev = yDomainRef.current
+      lo = Math.min(prev.lo, lo)
+      hi = Math.max(prev.hi, hi)
+      yDomainRef.current = { slug: windowSlug, lo, hi }
+    }
+
     const x = (t: number) => ((t - x0) / xSpan) * width
     const y = (v: number) => PAD_Y + (1 - (v - lo) / (hi - lo)) * (HEIGHT - PAD_Y * 2)
 
@@ -154,7 +172,7 @@ export function WindowPriceChart({ market, spot }: { market: ParsedMarket; spot:
 
     const last = points[points.length - 1]
     return { points, x, y, line, area, strikeY, last, x0 }
-  }, [width, ticks, startMs, endMs, spot.strike])
+  }, [width, ticks, startMs, endMs, spot.strike, windowSlug])
 
   if (!pair || startMs <= 0) return null
 
@@ -274,5 +292,18 @@ export function WindowPriceChart({ market, spot }: { market: ParsedMarket; spot:
         <span>{timeLabel(endMs, endMs - startMs > 12 * 3_600_000)}</span>
       </div>
     </div>
+  )
+}, chartPropsEqual)
+
+function chartPropsEqual(
+  prev: { market: ParsedMarket; spot: MarketSpot },
+  next: { market: ParsedMarket; spot: MarketSpot },
+): boolean {
+  return (
+    prev.market.eventSlug === next.market.eventSlug &&
+    prev.market.coin === next.market.coin &&
+    prev.market.startDate?.getTime() === next.market.startDate?.getTime() &&
+    prev.market.endDate.getTime() === next.market.endDate.getTime() &&
+    prev.spot.strike === next.spot.strike
   )
 }
