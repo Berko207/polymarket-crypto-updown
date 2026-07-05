@@ -68,6 +68,8 @@ export interface BotRuntime {
   setMode(mode: BotMode): Promise<{ ok: boolean; error?: string }>
   setHalted(halted: boolean): void
   setStakeUsd(stakeUsd: number): { ok: boolean; error?: string }
+  /** 0 = mode default (50 live, unlimited paper). */
+  setMaxDailyTrades(maxDailyTrades: number): { ok: boolean; error?: string }
   setStrategy(strategy: 'value' | 'swing'): { ok: boolean; error?: string }
   setTradeTimeframes(timeframes: string[]): { ok: boolean; error?: string }
   getHistory(query: TradeQuery): TradeHistoryPage
@@ -171,6 +173,11 @@ export function startControlServer(
           if (url.pathname === '/stake') {
             const stakeUsd = Number(body.stakeUsd)
             const r = runtime.setStakeUsd(stakeUsd)
+            return r.ok ? send(200, runtime.getStatus()) : send(400, { error: r.error })
+          }
+          if (url.pathname === '/daily-cap') {
+            const maxDailyTrades = Number(body.maxDailyTrades)
+            const r = runtime.setMaxDailyTrades(maxDailyTrades)
             return r.ok ? send(200, runtime.getStatus()) : send(400, { error: r.error })
           }
           if (url.pathname === '/strategy') {

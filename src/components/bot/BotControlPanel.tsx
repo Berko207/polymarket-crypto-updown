@@ -5,6 +5,7 @@ import { MIN_BUY_USD } from '@/lib/api'
 import { Input } from '@/components/ui/input'
 import {
   useBotHalt,
+  useBotMaxDailyTrades,
   useBotMode,
   useBotStake,
   useBotStatus,
@@ -25,6 +26,7 @@ const MODES: { id: BotMode; label: string }[] = [
 const modeLabel = (id: BotMode): string => MODES.find((m) => m.id === id)?.label ?? id
 
 const STAKE_PRESETS = [1, 5, 10, 25] as const
+const DAILY_CAP_PRESETS = [50, 100, 250, 500, 1000] as const
 
 /**
  * Bot execution-mode switch + live status for the local bot. Talks to the bot's
@@ -38,14 +40,18 @@ export function BotControlPanel() {
   const mode = useBotMode()
   const halt = useBotHalt()
   const stake = useBotStake()
+  const dailyCapMut = useBotMaxDailyTrades()
   const strat = useBotStrategy()
   const tradeTf = useBotTradeTimeframes()
   // TanStack keeps the last successful data while polling errors — without the
   // isError gate a killed bot would show "streaming" with stale PnL forever.
   const s = status.isError ? undefined : status.data
   const stakeSupported = s?.stakeUsd != null
+  const dailyCapSupported = s?.maxDailyTrades != null
   const serverStake = s?.stakeUsd ?? MIN_BUY_USD
+  const serverDailyCap = s?.maxDailyTrades ?? 0
   const [draftStake, setDraftStake] = useState(serverStake)
+  const [draftDailyCap, setDraftDailyCap] = useState(serverDailyCap)
   // Strategy + trade-timeframe control needs a bot new enough to report the universe.
   const tfSupported = s?.availableTimeframes != null
   const availableTf = s?.availableTimeframes ?? []
@@ -54,6 +60,10 @@ export function BotControlPanel() {
   useEffect(() => {
     setDraftStake(serverStake)
   }, [serverStake])
+
+  useEffect(() => {
+    setDraftDailyCap(serverDailyCap)
+  }, [serverDailyCap])
 
   const commitStake = (raw: number) => {
     if (!stakeSupported) {
@@ -69,6 +79,23 @@ export function BotControlPanel() {
         toast.error(msg === 'not found' ? 'Restart the bot (pnpm bot:paper) to enable stake control' : msg)
       },
       onSuccess: () => toast.success(`Stake → $${next}`),
+    })
+  }
+
+  const commitDailyCap = (raw: number) => {
+    if (!dailyCapSupported) {
+      toast.error('Restart the bot to enable daily cap control')
+      return
+    }
+    const next = Math.max(0, Math.floor(raw) || 0)
+    setDraftDailyCap(next)
+    if (!s || next === serverDailyCap || dailyCapMut.isPending) return
+    dailyCapMut.mutate(next, {
+      onError: (e) => {
+        const msg = e instanceof Error ? e.message : 'daily cap update failed'
+        toast.error(msg === 'not found' ? 'Restart the bot to enable daily cap control' : msg)
+      },
+      onSuccess: () => toast.success(`Daily cap → ${next > 0 ? next : 'default'}`),
     })
   }
 
@@ -301,6 +328,80 @@ export function BotControlPanel() {
         </div>
       )}
 
+      {s && s.mode !== 'record' && (
+        <div className="flex flex-col gap-1.5 rounded-lg bg-secondary px-3 py-2">
+          <div className="flex items-center justify-between gap-2">
+            <span className="text-xs font-medium text-muted-foreground">
+              Daily trade cap
+              {s.dailyTrades != null && (
+                <span className="ml-1.5 font-normal tabular-nums text-muted-foreground/80">
+                  ({s.dailyTrades}/{serverDailyCap > 0 ? serverDailyCap : '∞'} in 24h)
+                </span>
+              )}
+            </span>
+            <label className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
+              max
+              <Input
+                type="number"
+                inputMode="numeric"
+                className="h-7 w-20 text-right text-xs font-bold tabular-nums"
+                min={0}
+                step={1}
+                value={draftDailyCap}
+                disabled={!dailyCapSupported || dailyCapMut.isPending}
+                onChange={(e) => setDraftDailyCap(Math.max(0, Math.floor(Number(e.target.value) || 0)))}
+                onBlur={() => commitDailyCap(draftDailyCap)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    e.currentTarget.blur()
+                  }
+                }}
+              />
+            </label>
+          </div>
+          {!dailyCapSupported && (
+            <p className="text-[0.65rem] text-amber-300">
+              Restart the bot to enable — stop it and run{' '}
+              <code className="rounded bg-secondary px-1 py-0.5">pnpm bot:paper</code>
+            </p>
+          )}
+          <div className="flex flex-wrap gap-1">
+            {DAILY_CAP_PRESETS.map((v) => (
+              <button
+                key={v}
+                type="button"
+                disabled={!dailyCapSupported || dailyCapMut.isPending}
+                onClick={() => commitDailyCap(v)}
+                className={cn(
+                  'rounded px-2 py-0.5 text-[0.65rem] font-semibold tabular-nums transition disabled:opacity-40',
+                  serverDailyCap === v
+                    ? 'bg-background text-foreground shadow-sm'
+                    : 'text-muted-foreground hover:text-foreground',
+                )}
+              >
+                {v}
+              </button>
+            ))}
+            {s.mode === 'dry' && (
+              <button
+                type="button"
+                disabled={!dailyCapSupported || dailyCapMut.isPending}
+                onClick={() => commitDailyCap(0)}
+                title="0 = unlimited in paper mode"
+                className={cn(
+                  'rounded px-2 py-0.5 text-[0.65rem] font-semibold transition disabled:opacity-40',
+                  serverDailyCap === 0
+                    ? 'bg-background text-foreground shadow-sm'
+                    : 'text-muted-foreground hover:text-foreground',
+                )}
+              >
+                ∞
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+
       {!s && (
         <p className="text-center text-[0.7rem] text-muted-foreground">
           offline · run <code className="rounded bg-secondary px-1 py-0.5">pnpm bot:paper</code> to control the bot
@@ -309,9 +410,8 @@ export function BotControlPanel() {
 
       {dailyCap && (
         <p className="rounded-lg bg-amber-500/15 px-3 py-1.5 text-center text-[0.7rem] font-semibold text-amber-300">
-          Daily cap reached ({s!.dailyTrades}/{s!.maxDailyTrades} entries in 24h) — no new trades until
-          older ones roll off, or restart with a higher{' '}
-          <code className="rounded bg-secondary px-1 py-0.5">BOT_MAX_DAILY_TRADES</code>
+          Daily cap reached ({s!.dailyTrades}/{s!.maxDailyTrades} entries in 24h) — no new trades until older
+          ones roll off, or raise the cap above
         </p>
       )}
 

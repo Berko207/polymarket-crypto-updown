@@ -93,6 +93,8 @@ async function post(path: string, body: unknown): Promise<BotStatus> {
 export const setBotMode = (mode: BotMode): Promise<BotStatus> => post('/mode', { mode })
 export const setBotHalted = (halted: boolean): Promise<BotStatus> => post('/halt', { halted })
 export const setBotStake = (stakeUsd: number): Promise<BotStatus> => post('/stake', { stakeUsd })
+export const setBotMaxDailyTrades = (maxDailyTrades: number): Promise<BotStatus> =>
+  post('/daily-cap', { maxDailyTrades })
 export const setBotStrategy = (strategy: 'value' | 'swing'): Promise<BotStatus> =>
   post('/strategy', { strategy })
 export const setBotTradeTimeframes = (timeframes: string[]): Promise<BotStatus> =>

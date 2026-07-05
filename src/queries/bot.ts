@@ -5,6 +5,7 @@ import {
   setBotHalted,
   setBotMode,
   setBotStake,
+  setBotMaxDailyTrades,
   setBotStrategy,
   setBotTradeTimeframes,
   type BotMode,
@@ -46,6 +47,14 @@ export function useBotStake() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: (stakeUsd: number) => setBotStake(stakeUsd),
+    onSuccess: (status: BotStatus) => qc.setQueryData(KEY, status),
+  })
+}
+
+export function useBotMaxDailyTrades() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (maxDailyTrades: number) => setBotMaxDailyTrades(maxDailyTrades),
     onSuccess: (status: BotStatus) => qc.setQueryData(KEY, status),
   })
 }

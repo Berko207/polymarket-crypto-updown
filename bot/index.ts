@@ -247,6 +247,17 @@ async function main(): Promise<void> {
     return mode === 'live' ? LIVE_DEFAULT_DAILY_CAP : 0
   }
 
+  function setMaxDailyTrades(next: number): { ok: boolean; error?: string } {
+    if (!Number.isFinite(next) || next < 0 || !Number.isInteger(next)) {
+      return { ok: false, error: 'maxDailyTrades must be a non-negative integer (0 = mode default)' }
+    }
+    if (next === config.maxDailyTrades) return { ok: true }
+    const prev = effectiveDailyCap()
+    config.maxDailyTrades = next
+    log(`daily cap ${prev || '∞'} → ${effectiveDailyCap() || '∞'} (control)`)
+    return { ok: true }
+  }
+
   function dailyCapReached(now: number): boolean {
     const cap = effectiveDailyCap()
     if (cap <= 0) return false
@@ -740,6 +751,7 @@ async function main(): Promise<void> {
             setMode,
             setHalted,
             setStakeUsd,
+            setMaxDailyTrades,
             setStrategy,
             setTradeTimeframes,
             getHistory: (query) => db.queryTrades(query),
