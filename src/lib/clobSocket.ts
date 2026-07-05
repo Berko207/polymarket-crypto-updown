@@ -15,6 +15,12 @@ const RECONCILE_DEBOUNCE_MS = 30
 /** Give a replacement socket this long to reach OPEN before abandoning the attempt —
  * a blackholed handshake (sleep/wake, VPN flip) must not gate reconcile forever. */
 const CONNECT_TIMEOUT_MS = 10_000
+/** No frame (book/quote OR PONG) for this long on the active OPEN socket → force-reconnect
+ * a half-open/silent connection the browser never reported as closed. PONG (every PING_MS)
+ * keeps a quiet-but-healthy market fresh, so this only trips on a genuinely dead socket. */
+const STALE_SOCKET_MS = 30_000
+/** Watchdog cadence — well under STALE_SOCKET_MS so a stall is caught within ~one interval. */
+const WATCHDOG_MS = 5_000
 
 export interface TokenQuote {
   bestBid: number | null
@@ -151,7 +157,12 @@ class ClobSocket {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null
   private reconcileTimer: ReturnType<typeof setTimeout> | null = null
   private connectTimer: ReturnType<typeof setTimeout> | null = null
+  private watchdogTimer: ReturnType<typeof setInterval> | null = null
   private connected = false
+  /** Wall-clock ms of the last frame from the ACTIVE socket (book/quote or PONG). */
+  private lastMessageAt = 0
+  private listenersAttached = false
+  private lastHealthCheck = 0
 
   subscribe(
     tokenIds: string[],
@@ -164,6 +175,7 @@ class ClobSocket {
       onConnectedChange,
     }
     this.subs.add(sub)
+    if (!this.listenersAttached) this.attachGlobalListeners()
     onUpdate(this.snapshot(sub.tokenIds))
     onConnectedChange?.(this.connected)
     this.scheduleReconcile()
@@ -221,9 +233,49 @@ class ClobSocket {
     if (this.pingTimer) clearInterval(this.pingTimer)
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer)
     if (this.connectTimer) clearTimeout(this.connectTimer)
+    if (this.watchdogTimer) clearInterval(this.watchdogTimer)
     this.pingTimer = null
     this.reconnectTimer = null
     this.connectTimer = null
+    this.watchdogTimer = null
+  }
+
+  /** Debounced liveness check for the visibility/online listeners: revive a closed
+   * socket, or force-reconnect (make-before-break) an OPEN-but-silent active one. */
+  private checkFeedHealth() {
+    if (this.subs.size === 0 || this.pendingWs) return
+    const nowMs = Date.now()
+    if (nowMs - this.lastHealthCheck < 2_000) return
+    this.lastHealthCheck = nowMs
+    const ids = this.union()
+    if (ids.length === 0) return
+    const closed = !this.ws || this.ws.readyState === WebSocket.CLOSED
+    const stale =
+      this.ws?.readyState === WebSocket.OPEN && nowMs - this.lastMessageAt > STALE_SOCKET_MS
+    if (closed || stale) this.openSocket(ids)
+  }
+
+  private onVisibility = () => {
+    if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return
+    this.checkFeedHealth()
+  }
+
+  private onOnline = () => this.checkFeedHealth()
+
+  // Attached once (first subscriber), removed in teardown — many components subscribe,
+  // so a per-subscribe attach would leak duplicate document/window listeners.
+  private attachGlobalListeners() {
+    if (this.listenersAttached) return
+    if (typeof document !== 'undefined') document.addEventListener('visibilitychange', this.onVisibility)
+    if (typeof window !== 'undefined') window.addEventListener('online', this.onOnline)
+    this.listenersAttached = true
+  }
+
+  private detachGlobalListeners() {
+    if (!this.listenersAttached) return
+    if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', this.onVisibility)
+    if (typeof window !== 'undefined') window.removeEventListener('online', this.onOnline)
+    this.listenersAttached = false
   }
 
   private clearConnectTimer() {
@@ -302,19 +354,36 @@ class ClobSocket {
       this.clearConnectTimer()
       if (this.ws) this.closeQuietly(this.ws)
       if (this.pingTimer) clearInterval(this.pingTimer)
+      if (this.watchdogTimer) clearInterval(this.watchdogTimer)
       this.ws = ws
       this.pendingWs = null
+      this.lastMessageAt = Date.now()
       this.setConnected(true)
       ws.send(JSON.stringify({ assets_ids: ids, type: 'market', custom_feature_enabled: true }))
       this.pingTimer = setInterval(() => {
         if (ws.readyState === WebSocket.OPEN) ws.send('PING')
       }, PING_MS)
+      // Force-reconnect (make-before-break) a half-open active socket the browser never
+      // reported as closed: no frame AND no PONG for STALE_SOCKET_MS while still OPEN. The
+      // `!pendingWs` guard means an in-flight reconcile/reconnect isn't fought.
+      this.watchdogTimer = setInterval(() => {
+        if (
+          this.ws === ws &&
+          !this.pendingWs &&
+          ws.readyState === WebSocket.OPEN &&
+          Date.now() - this.lastMessageAt > STALE_SOCKET_MS
+        ) {
+          const nextIds = this.union()
+          if (nextIds.length > 0) this.openSocket(nextIds)
+        }
+      }, WATCHDOG_MS)
       // Tokens that arrived while this socket was connecting need one follow-up pass.
       this.scheduleReconcile()
     }
 
     ws.onmessage = (event) => {
       if (ws !== this.ws) return
+      this.lastMessageAt = Date.now()
       if (event.data === 'PONG') return
       try {
         if (applyFrame(JSON.parse(event.data as string), this.quotes, this.wanted)) this.notifyQuotes()
@@ -338,6 +407,12 @@ class ClobSocket {
         clearInterval(this.pingTimer)
         this.pingTimer = null
       }
+      // Clear the watchdog too (onopen only recreates it on a successful promotion): a
+      // persistently-failing reconnect would otherwise leak a no-op interval pinning this ws.
+      if (this.watchdogTimer) {
+        clearInterval(this.watchdogTimer)
+        this.watchdogTimer = null
+      }
       this.ws = null
       this.scheduleReconnect()
     }
@@ -353,6 +428,7 @@ class ClobSocket {
 
   private teardown() {
     this.clearTimers()
+    this.detachGlobalListeners()
     if (this.ws) {
       this.closeQuietly(this.ws)
       this.ws = null
