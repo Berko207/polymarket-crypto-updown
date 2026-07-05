@@ -18,6 +18,8 @@ export interface BotStatus {
   stats: { ticks: number; predictions: number; outcomes: number; trades: number; settled: number }
   summary: { entered: number; settled: number; open: number; wins: number; staked: number; pnl: number }
   swingExits?: { reason: string; n: number; wins: number; pnl: number }[]
+  swingTrigger?: 'edge' | 'move'
+  swingSource?: 'flat' | 'regime' | 'blend'
   openPositions?: {
     coin: string
     timeframe: string

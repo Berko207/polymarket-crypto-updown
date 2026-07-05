@@ -14,7 +14,7 @@ import { ChainlinkStream } from './sources/chainlink'
 import { fetchCurrentMarket } from './sources/gamma'
 import { predict, type Prediction } from './engine/predict'
 import { decideEntry } from './engine/strategy'
-import { decideSwingEntry, decideExit, deriveBook, bidForSide, type MidPoint } from './engine/swing'
+import { decideSwingEntry, decideExit, deriveBook, bidForSide, sourceEdge, type MidPoint } from './engine/swing'
 import { takerFee } from './engine/fees'
 import { dryExecutor, makeLiveExecutor, type SellOrder } from './engine/executor'
 import { maxOrderCost, tradingEnabled } from './engine/guards'
@@ -96,8 +96,9 @@ async function main(): Promise<void> {
 
   const strategyBrief =
     config.strategy === 'swing'
-      ? `swing · move≥${config.swingMovePts}/${config.swingWindowSec}s · edge≥${config.swingEdgeMin} · ` +
-        `TP ${config.swingTakeProfitPts}/SL ${config.swingStopLossPts} · timeStop ${config.swingTimeStopSec}s · ` +
+      ? `swing/${config.swingTrigger} · src ${config.signalSource} · edge≥${config.swingEdgeMin}` +
+        (config.swingTrigger === 'move' ? ` · move≥${config.swingMovePts}/${config.swingWindowSec}s` : '') +
+        ` · TP ${config.swingTakeProfitPts}/SL ${config.swingStopLossPts} · timeStop ${config.swingTimeStopSec}s · ` +
         `fee ${config.feeRate}${config.feeSell ? '+sell' : ''}`
       : `value · entry ~T-${config.entryAtSec}s · edge≥${config.edgeThreshold}`
   log(
@@ -306,6 +307,7 @@ async function main(): Promise<void> {
     }
     const entryFee = takerFee(fill.fillPrice, fill.fillSize, config.feeRate)
     const cost = fill.fillPrice * fill.fillSize + entryFee
+    const signalEdge = sourceEdge(pred, config.signalSource)
     db.insertTrade({
       windowKey: pred.windowKey,
       coin: pred.coin,
@@ -318,15 +320,15 @@ async function main(): Promise<void> {
       size: fill.fillSize,
       cost,
       entryFee,
-      signalEdge: pred.edge,
+      signalEdge,
       regimeEntry: pred.regime,
       status: 'open',
       orderId: fill.orderId,
     })
     stats.trades += 1
     log(
-      `${mode.toUpperCase()} ENTER swing ${pred.coin}/${pred.timeframe} ${order.side} @ ${fill.fillPrice.toFixed(3)} · ` +
-        `size ${fill.fillSize.toFixed(1)} · cost $${cost.toFixed(2)} · edge ${pred.edge.toFixed(3)} · ${pred.regime} · ` +
+      `${mode.toUpperCase()} ENTER swing/${config.swingTrigger} ${pred.coin}/${pred.timeframe} ${order.side} @ ${fill.fillPrice.toFixed(3)} · ` +
+        `size ${fill.fillSize.toFixed(1)} · cost $${cost.toFixed(2)} · edge ${signalEdge.toFixed(3)} (${config.signalSource}) · ${pred.regime} · ` +
         `${Math.round((market.endDate.getTime() - now) / 1000)}s left`,
     )
   }
@@ -515,6 +517,8 @@ async function main(): Promise<void> {
               },
               summary: db.tradeSummary(),
               swingExits: config.strategy === 'swing' ? db.swingExits() : [],
+              swingTrigger: config.swingTrigger,
+              swingSource: config.signalSource,
               openPositions: openPositions(),
               recentClosed: db.recentClosed(8),
             }),
