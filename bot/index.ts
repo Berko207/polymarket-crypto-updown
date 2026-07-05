@@ -149,6 +149,21 @@ async function main(): Promise<void> {
     log(halted ? 'entries HALTED (control)' : 'entries RESUMED (control)')
   }
 
+  const MIN_STAKE_USD = 1
+
+  function setStakeUsd(next: number): { ok: boolean; error?: string } {
+    if (!Number.isFinite(next) || next < MIN_STAKE_USD) {
+      return { ok: false, error: `stake must be at least $${MIN_STAKE_USD}` }
+    }
+    const cap = maxOrderCost()
+    if (next > cap) return { ok: false, error: `stake $${next} exceeds max order cost $${cap}` }
+    if (next === config.stakeUsd) return { ok: true }
+    const prev = config.stakeUsd
+    config.stakeUsd = next
+    log(`stake $${prev} → $${next} (control)`)
+    return { ok: true }
+  }
+
   // Startup live still refuses hard (exit) — a launched-live bot that can't arm
   // shouldn't silently fall back to dry.
   if (mode === 'live') {
@@ -510,6 +525,7 @@ async function main(): Promise<void> {
           {
             getStatus: () => ({
               mode,
+              stakeUsd: config.stakeUsd,
               strategy: config.strategy,
               allowLive,
               halted,
@@ -532,6 +548,7 @@ async function main(): Promise<void> {
             }),
             setMode,
             setHalted,
+            setStakeUsd,
           },
           Number(process.env.BOT_CONTROL_PORT ?? 8790),
           process.env.BOT_CONTROL_TOKEN?.trim() || undefined,

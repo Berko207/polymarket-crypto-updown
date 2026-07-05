@@ -1,6 +1,9 @@
+import { useEffect, useState } from 'react'
 import { toast } from 'sonner'
 import { cn } from '@/lib/utils'
-import { useBotHalt, useBotMode, useBotStatus } from '@/queries/bot'
+import { MIN_BUY_USD } from '@/lib/api'
+import { Input } from '@/components/ui/input'
+import { useBotHalt, useBotMode, useBotStake, useBotStatus } from '@/queries/bot'
 import { EXIT_META } from '@/lib/botFormat'
 import type { BotMode } from '@/lib/botControl'
 
@@ -14,6 +17,8 @@ const MODES: { id: BotMode; label: string }[] = [
 
 const modeLabel = (id: BotMode): string => MODES.find((m) => m.id === id)?.label ?? id
 
+const STAKE_PRESETS = [1, 5, 10, 25] as const
+
 /**
  * Bot execution-mode switch + live status for the local bot. Talks to the bot's
  * control server (localhost only). The Record/Paper/Live switch is always shown;
@@ -25,9 +30,34 @@ export function BotControlPanel() {
   const status = useBotStatus()
   const mode = useBotMode()
   const halt = useBotHalt()
+  const stake = useBotStake()
   // TanStack keeps the last successful data while polling errors — without the
   // isError gate a killed bot would show "streaming" with stale PnL forever.
   const s = status.isError ? undefined : status.data
+  const stakeSupported = s?.stakeUsd != null
+  const serverStake = s?.stakeUsd ?? MIN_BUY_USD
+  const [draftStake, setDraftStake] = useState(serverStake)
+
+  useEffect(() => {
+    setDraftStake(serverStake)
+  }, [serverStake])
+
+  const commitStake = (raw: number) => {
+    if (!stakeSupported) {
+      toast.error('Restart the bot (pnpm bot:paper) to enable stake control')
+      return
+    }
+    const next = Math.max(MIN_BUY_USD, raw || MIN_BUY_USD)
+    setDraftStake(next)
+    if (!s || next === serverStake || stake.isPending) return
+    stake.mutate(next, {
+      onError: (e) => {
+        const msg = e instanceof Error ? e.message : 'stake update failed'
+        toast.error(msg === 'not found' ? 'Restart the bot (pnpm bot:paper) to enable stake control' : msg)
+      },
+      onSuccess: () => toast.success(`Stake → $${next}`),
+    })
+  }
 
   const switchMode = (next: BotMode) => {
     if (!s || next === s.mode || mode.isPending) return
@@ -114,6 +144,57 @@ export function BotControlPanel() {
           )
         })}
       </div>
+
+      {s && s.mode !== 'record' && (
+        <div className="flex flex-col gap-1.5 rounded-lg bg-secondary px-3 py-2">
+          <div className="flex items-center justify-between gap-2">
+            <span className="text-xs font-medium text-muted-foreground">Stake per trade</span>
+            <label className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
+              $
+              <Input
+                type="number"
+                inputMode="decimal"
+                className="h-7 w-20 text-right text-xs font-bold tabular-nums"
+                min={MIN_BUY_USD}
+                step={1}
+                value={draftStake}
+                disabled={!stakeSupported || stake.isPending}
+                onChange={(e) => setDraftStake(Math.max(MIN_BUY_USD, Number(e.target.value) || MIN_BUY_USD))}
+                onBlur={() => commitStake(draftStake)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    e.currentTarget.blur()
+                  }
+                }}
+              />
+            </label>
+          </div>
+          {!stakeSupported && (
+            <p className="text-[0.65rem] text-amber-300">
+              Restart the bot to enable — stop it and run{' '}
+              <code className="rounded bg-secondary px-1 py-0.5">pnpm bot:paper</code>
+            </p>
+          )}
+          <div className="flex flex-wrap gap-1">
+            {STAKE_PRESETS.map((v) => (
+              <button
+                key={v}
+                type="button"
+                disabled={!stakeSupported || stake.isPending}
+                onClick={() => commitStake(v)}
+                className={cn(
+                  'rounded px-2 py-0.5 text-[0.65rem] font-semibold tabular-nums transition disabled:opacity-40',
+                  serverStake === v
+                    ? 'bg-background text-foreground shadow-sm'
+                    : 'text-muted-foreground hover:text-foreground',
+                )}
+              >
+                ${v}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
 
       {!s && (
         <p className="text-center text-[0.7rem] text-muted-foreground">

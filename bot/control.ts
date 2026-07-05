@@ -10,6 +10,8 @@ export type BotMode = 'record' | 'dry' | 'live'
 
 export interface BotStatus {
   mode: BotMode
+  /** USDC stake per automated entry (runtime-adjustable via POST /stake). */
+  stakeUsd: number
   /** Active entry/exit family — fixed at launch via BOT_STRATEGY (not runtime-switchable). */
   strategy: 'value' | 'swing'
   allowLive: boolean
@@ -55,6 +57,7 @@ export interface BotRuntime {
   getStatus(): BotStatus
   setMode(mode: BotMode): Promise<{ ok: boolean; error?: string }>
   setHalted(halted: boolean): void
+  setStakeUsd(stakeUsd: number): { ok: boolean; error?: string }
 }
 
 const LOCAL_ORIGIN = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/
@@ -120,6 +123,11 @@ export function startControlServer(
           if (url.pathname === '/halt') {
             runtime.setHalted(Boolean(body.halted))
             return send(200, runtime.getStatus())
+          }
+          if (url.pathname === '/stake') {
+            const stakeUsd = Number(body.stakeUsd)
+            const r = runtime.setStakeUsd(stakeUsd)
+            return r.ok ? send(200, runtime.getStatus()) : send(400, { error: r.error })
           }
         }
         send(404, { error: 'not found' })

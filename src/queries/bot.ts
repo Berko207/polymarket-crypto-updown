@@ -1,5 +1,12 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { fetchBotStatus, setBotHalted, setBotMode, type BotMode, type BotStatus } from '@/lib/botControl'
+import {
+  fetchBotStatus,
+  setBotHalted,
+  setBotMode,
+  setBotStake,
+  type BotMode,
+  type BotStatus,
+} from '@/lib/botControl'
 
 const KEY = ['bot', 'status'] as const
 
@@ -27,6 +34,14 @@ export function useBotHalt() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: (halted: boolean) => setBotHalted(halted),
+    onSuccess: (status: BotStatus) => qc.setQueryData(KEY, status),
+  })
+}
+
+export function useBotStake() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (stakeUsd: number) => setBotStake(stakeUsd),
     onSuccess: (status: BotStatus) => qc.setQueryData(KEY, status),
   })
 }

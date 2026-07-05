@@ -8,6 +8,8 @@ export type BotMode = 'record' | 'dry' | 'live'
 
 export interface BotStatus {
   mode: BotMode
+  /** USDC stake per automated entry; defaults to 1 when talking to an older bot. */
+  stakeUsd?: number
   /** Optional so a bot predating the swing strategy still renders (defaults to value). */
   strategy?: 'value' | 'swing'
   allowLive: boolean
@@ -82,3 +84,4 @@ async function post(path: string, body: unknown): Promise<BotStatus> {
 
 export const setBotMode = (mode: BotMode): Promise<BotStatus> => post('/mode', { mode })
 export const setBotHalted = (halted: boolean): Promise<BotStatus> => post('/halt', { halted })
+export const setBotStake = (stakeUsd: number): Promise<BotStatus> => post('/stake', { stakeUsd })
