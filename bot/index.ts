@@ -648,6 +648,7 @@ async function main(): Promise<void> {
             setStakeUsd,
             setStrategy,
             setTradeTimeframes,
+            getHistory: (query) => db.queryTrades(query),
           },
           Number(process.env.BOT_CONTROL_PORT ?? 8790),
           process.env.BOT_CONTROL_TOKEN?.trim() || undefined,

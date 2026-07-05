@@ -1,6 +1,7 @@
 import { cn } from '@/lib/utils'
 import { useBotStatus } from '@/queries/bot'
 import { EXIT_META, fmtAgo, fmtCountdown, sideArrow, sideCls } from '@/lib/botFormat'
+import { BotHistoryDialog } from './BotHistoryDialog'
 
 /**
  * Live monitor for the local bot: what it's holding right now (with unrealized
@@ -23,7 +24,10 @@ export function BotMonitorPanel() {
         <p className="text-[0.65rem] font-semibold uppercase tracking-wide text-muted-foreground">
           Bot monitor
         </p>
-        <span className="text-[0.65rem] text-muted-foreground">watching {s.scopes.length} markets</span>
+        <span className="flex items-center gap-2">
+          <span className="text-[0.65rem] text-muted-foreground">watching {s.scopes.length} markets</span>
+          <BotHistoryDialog />
+        </span>
       </div>
 
       <div className="flex flex-col gap-1.5">

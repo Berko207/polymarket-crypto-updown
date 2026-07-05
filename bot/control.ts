@@ -5,6 +5,7 @@
  * hostile page can't satisfy). GET /status is read-only/open.
  */
 import { createServer, type IncomingMessage, type Server } from 'node:http'
+import type { TradeQuery, TradeHistoryPage } from './db'
 
 export type BotMode = 'record' | 'dry' | 'live'
 
@@ -67,6 +68,7 @@ export interface BotRuntime {
   setStakeUsd(stakeUsd: number): { ok: boolean; error?: string }
   setStrategy(strategy: 'value' | 'swing'): { ok: boolean; error?: string }
   setTradeTimeframes(timeframes: string[]): { ok: boolean; error?: string }
+  getHistory(query: TradeQuery): TradeHistoryPage
 }
 
 const LOCAL_ORIGIN = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/
@@ -114,6 +116,37 @@ export function startControlServer(
     void (async () => {
       try {
         if (req.method === 'GET' && url.pathname === '/status') return send(200, runtime.getStatus())
+
+        if (req.method === 'GET' && url.pathname === '/history') {
+          const p = url.searchParams
+          const str = (k: string): string | undefined => {
+            const v = p.get(k)
+            return v && v !== 'all' ? v : undefined
+          }
+          const int = (k: string): number | undefined => {
+            const v = p.get(k)
+            if (v == null || v === '') return undefined
+            const n = Number(v)
+            return Number.isFinite(n) ? n : undefined
+          }
+          const outcome = str('outcome')
+          return send(
+            200,
+            runtime.getHistory({
+              mode: str('mode'),
+              strategy: str('strategy'),
+              coin: str('coin'),
+              timeframe: str('timeframe'),
+              status: str('status'),
+              reason: str('reason'),
+              outcome: outcome === 'win' || outcome === 'loss' ? outcome : undefined,
+              from: int('from'),
+              to: int('to'),
+              limit: int('limit'),
+              offset: int('offset'),
+            }),
+          )
+        }
 
         if (req.method === 'POST') {
           if (token && req.headers['x-bot-token'] !== token) {

@@ -1,5 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
+  fetchBotHistory,
   fetchBotStatus,
   setBotHalted,
   setBotMode,
@@ -8,6 +9,7 @@ import {
   setBotTradeTimeframes,
   type BotMode,
   type BotStatus,
+  type HistoryFilters,
 } from '@/lib/botControl'
 
 const KEY = ['bot', 'status'] as const
@@ -61,5 +63,16 @@ export function useBotTradeTimeframes() {
   return useMutation({
     mutationFn: (timeframes: string[]) => setBotTradeTimeframes(timeframes),
     onSuccess: (status: BotStatus) => qc.setQueryData(KEY, status),
+  })
+}
+
+/** Filtered trade history; only fetches while the grid is open (`enabled`). */
+export function useBotHistory(filters: HistoryFilters, enabled: boolean) {
+  return useQuery({
+    queryKey: ['bot', 'history', filters],
+    queryFn: () => fetchBotHistory(filters),
+    enabled,
+    placeholderData: (prev) => prev,
+    staleTime: 2_000,
   })
 }
