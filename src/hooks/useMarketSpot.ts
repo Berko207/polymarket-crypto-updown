@@ -8,6 +8,7 @@ import {
   fetchCryptoPrice,
   isRollingSlug,
   previousWindowParams,
+  SETTLE_SLOP_MS,
   validPrice,
 } from '@/lib/cryptoPrice'
 import { chainlinkSocket } from '@/lib/chainlinkSocket'
@@ -18,6 +19,12 @@ import type { CoinId, ParsedMarket, TimeframeId } from '@/lib/types'
 export type StrikePhase = 'upcoming' | 'preview' | 'loading' | 'locked' | 'unavailable'
 export type CurrentPhase = 'loading' | 'live' | 'polled' | 'final'
 
+/** Chainlink WS silent longer than this (no frame incl PONG) → stop trusting the live
+ * tick for the display and fall back to fresh REST. Sits between PING (5s) and the
+ * socket watchdog (25s); keyed on socket liveness — not price-tick recency — so a calm
+ * market's sparse oracle prints don't flap the display source. */
+const STALE_DISPLAY_MS = 12_000
+
 export interface MarketSpot {
   strike: number | null
   strikePhase: StrikePhase
@@ -25,6 +32,10 @@ export interface MarketSpot {
   currentPhase: CurrentPhase
   delta: number | null
   completed: boolean
+  /** Settlement-grade resolution price for the OUTCOME LOG (not the display): the
+   * Chainlink boundary tick Polymarket resolves on, or a settled REST close. Null
+   * until one is available — a missing outcome row beats a wrong one. */
+  settlementPrice: number | null
 }
 
 /** True when order-book Up% disagrees with spot vs strike (meaningful move). */
@@ -109,6 +120,7 @@ export function useMarketSpot(
       currentPhase: 'loading',
       delta: null,
       completed: false,
+      settlementPrice: null,
     }
   }
 
@@ -158,14 +170,29 @@ export function useMarketSpot(
   }
 
   const chainlinkLive = tick && Number.isFinite(tick.value) ? tick.value : null
-  const usingChainlink = !completed && chainlinkLive != null
+  // Gate "live" on socket liveness, not tick recency: a half-open feed keeps returning
+  // its last frozen tick forever, so without this the display freezes while REST still polls.
+  const feedFresh = chainlinkSocket.msSinceLastMessage() < STALE_DISPLAY_MS
+  const usingChainlink = !completed && chainlinkLive != null && feedFresh
 
-  // In-window: Chainlink WS for live UI; API close at resolution / when WS is off.
+  // In-window: Chainlink WS for live UI; API close at resolution / when WS is off or stale.
   const current = completed
     ? (apiClose ?? chainlinkLive)
     : usingChainlink
       ? chainlinkLive
       : (apiInProgressClose ?? chainlinkLive ?? apiClose)
+
+  // Settlement-grade resolution price for the OUTCOME LOG only. Chainlink-boundary-first
+  // to stay symmetric with the chainlink-first strike (so a near-tie can't sign-flip),
+  // unifying this with the useFairValue backfill onto ONE source. REST close is a fallback
+  // and only once upstream truly settled (completed && !incomplete): for non-rolling
+  // daily/1h the in-progress closePrice is a live print, and refetch stops on completed so
+  // a wrong latch would never self-correct. Null until one lands — a missing row beats a wrong one.
+  const settlementPrice =
+    (ended && pair ? chainlinkSocket.firstPriceAtOrAfter(pair, endMs, SETTLE_SLOP_MS) : null) ??
+    (query.data?.completed === true && query.data?.incomplete !== true
+      ? validPrice(query.data?.closePrice)
+      : null)
 
   const currentPhase: CurrentPhase = completed
     ? 'final'
@@ -184,5 +211,6 @@ export function useMarketSpot(
     currentPhase,
     delta,
     completed,
+    settlementPrice,
   }
 }
