@@ -98,6 +98,7 @@ async function main(): Promise<void> {
     config.strategy === 'swing'
       ? `swing/${config.swingTrigger} · src ${config.signalSource} · edge≥${config.swingEdgeMin}` +
         (config.swingTrigger === 'move' ? ` · move≥${config.swingMovePts}/${config.swingWindowSec}s` : '') +
+        ` · band ${config.swingMinPrice}-${config.swingMaxPrice}${config.swingSkipCalm ? ' · skipCalm' : ''}` +
         ` · TP ${config.swingTakeProfitPts}/SL ${config.swingStopLossPts} · timeStop ${config.swingTimeStopSec}s · ` +
         `fee ${config.feeRate}${config.feeSell ? '+sell' : ''}`
       : `value · entry ~T-${config.entryAtSec}s · edge≥${config.edgeThreshold}`
@@ -386,7 +387,14 @@ async function main(): Promise<void> {
   function refreshMarket(state: ScopeState, now: number): void {
     const ended = state.market ? now >= state.market.endDate.getTime() : true
     if (state.fetching) return
-    if (state.market && !ended && now - state.lastFetch < config.marketPollMs) return
+    // Poll faster while this scope holds an open swing position so the exit marks
+    // against a fresher book and the stop slips less past its target on a fast move.
+    const hasOpen =
+      config.strategy === 'swing' &&
+      state.market != null &&
+      db.openTradesForWindow(marketWindowKey(state.market)).length > 0
+    const pollMs = hasOpen ? config.swingOpenPollMs : config.marketPollMs
+    if (state.market && !ended && now - state.lastFetch < pollMs) return
     state.fetching = true
     void fetchCurrentMarket(state.coin, state.timeframe)
       .then((m) => {
