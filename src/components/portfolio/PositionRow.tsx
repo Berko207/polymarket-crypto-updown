@@ -93,7 +93,13 @@ export function PositionRow({
   const cost = avgPrice != null ? position.size * avgPrice : null
 
   return (
-    <li className="flex items-start justify-between gap-3 rounded-lg bg-secondary px-3 py-2">
+    <li
+      className={cn(
+        'flex items-start justify-between gap-3 rounded-lg bg-secondary px-3 py-2',
+        // Sell in flight — row stays until the exchange confirms the fill.
+        selling && 'animate-pulse opacity-70',
+      )}
+    >
       <div className="min-w-0 flex-1">
         <div className="flex items-center gap-2">
           <OutcomeBadge outcome={position.outcome} />
