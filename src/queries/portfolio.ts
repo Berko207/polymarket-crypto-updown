@@ -540,7 +540,8 @@ export function usePlaceOrder() {
       // Confirmation-gated sells: the position row stays in the panel (button
       // flips to "Selling…") until the exchange responds — nothing is hidden or
       // patched on click, so a failed sell never blinks the row out and back.
-      if (body.side === 'SELL') return undefined
+      // Resting limit orders likewise skip optimistic patches until the server reports a fill.
+      if (body.side === 'SELL' || body.orderType === 'limit') return undefined
       const estimate = resolveFillFromRequest(body)
       if (!estimate) return undefined
       const snapshot = captureFillSnapshot(qc)
@@ -548,8 +549,21 @@ export function usePlaceOrder() {
       return snapshot
     },
     onSuccess: (data, body, snapshot) => {
-      const fill = resolveFill(body, data) ?? resolveFillFromRequest(body)
       const status = (data.status ?? '').toLowerCase()
+
+      // A GTC limit order that rests comes back with a status ('live') but no making/taking,
+      // so the server reports no fillSize. resolveFill would otherwise fabricate a full fill
+      // from the request and wrongly hide the position — so only reconcile a limit order when
+      // the server actually reports a matched size; a resting order just refreshes open orders.
+      const serverReportedFill = data.fillSize != null && data.fillSize > 0 && data.fillPrice != null
+      if (body.orderType === 'limit' && !serverReportedFill) {
+        void qc.invalidateQueries({ queryKey: qk.orders })
+        void qc.invalidateQueries({ queryKey: qk.account })
+        schedulePortfolioRefetches(qc)
+        return
+      }
+
+      const fill = resolveFill(body, data) ?? resolveFillFromRequest(body)
       const filled = status !== 'unmatched' && status !== 'rejected'
       // "delayed" = accepted but not matched yet, NOT a confirmed fill. Sell
       // row-hides gate on this; buys keep treating delayed as filled (optimistic,
