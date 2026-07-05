@@ -96,6 +96,13 @@ export function decideSwingEntry(
   if (msRemaining <= (config.swingTimeStopSec + 5) * 1_000) return null
   if (pred.confidence !== 'ok') return null
   if (pred.regime === 'panic') return null
+  // Guardrail: the market beats the model in calm (Brier) — sit those out.
+  if (config.swingSkipCalm && pred.regime === 'calm') return null
+  // Guardrail: only scalp mid-market disagreements. Outside the band the side we'd
+  // buy is a favorite/longshot — that's near-expiry favorite-chasing, not a swing,
+  // and its high gamma whipsaws the tight stop. (Band is symmetric, so it bounds
+  // whichever side we take: buy-Up price ≈ marketP, buy-Down price ≈ 1 − marketP.)
+  if (pred.marketP < config.swingMinPrice || pred.marketP > config.swingMaxPrice) return null
 
   // Always buy the side the model underprices; require the edge to clear the bar.
   const edge = sourceEdge(pred, config.signalSource)

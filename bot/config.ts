@@ -72,6 +72,15 @@ export interface BotConfig {
   swingTimeStopSec: number
   /** Min gap after a close before re-entering the same window. */
   swingCooldownSec: number
+  // --- guardrails: keep it a mid-market scalp, not a favorite-chase ---
+  /** Skip entries when market P(Up) is below this (buying a longshot). */
+  swingMinPrice: number
+  /** Skip entries when market P(Up) is above this (buying a favorite). */
+  swingMaxPrice: number
+  /** Skip the calm regime, where the market out-predicts the model (Brier). */
+  swingSkipCalm: boolean
+  /** Poll cadence for a scope that holds an open position (tightens the stop). */
+  swingOpenPollMs: number
   // --- fee model (paper realism; see engine/fees.ts) ---
   /** Taker feeRate for the parabolic fee (crypto ≈ 0.07; 0 disables). */
   feeRate: number
@@ -146,6 +155,10 @@ export function loadConfig(): BotConfig {
     swingExitEdge: numNonNeg(env.BOT_SWING_EXIT_EDGE, 0.01),
     swingTimeStopSec: num(env.BOT_SWING_TIME_STOP_SEC, 20),
     swingCooldownSec: num(env.BOT_SWING_COOLDOWN_SEC, 30),
+    swingMinPrice: numNonNeg(env.BOT_SWING_MIN_PRICE, 0.2),
+    swingMaxPrice: num(env.BOT_SWING_MAX_PRICE, 0.8),
+    swingSkipCalm: env.BOT_SWING_SKIP_CALM !== '0',
+    swingOpenPollMs: num(env.BOT_SWING_OPEN_POLL_MS, 2_000),
     feeRate: numNonNeg(env.BOT_FEE_RATE, 0.07),
     feeSell: env.BOT_FEE_SELL === '1',
   }
