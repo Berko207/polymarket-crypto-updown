@@ -125,16 +125,16 @@ function main(): void {
     console.log(`  ${pad(`${s.coin}/${s.timeframe}`, 12)} ${padL(String(s.n), 7)} samples · ${s.windows} windows`)
   }
 
-  // --- dry paper-trading P&L (M2) ---
+  // --- dry paper-trading P&L (realized = settled to $0/$1 OR swing-closed) ---
   const t = raw
     .prepare(
       `SELECT
          COUNT(*) AS n,
-         SUM(CASE WHEN status='settled' THEN 1 ELSE 0 END) AS settled,
+         SUM(CASE WHEN status IN ('settled','closed') THEN 1 ELSE 0 END) AS settled,
          SUM(CASE WHEN status='open' THEN 1 ELSE 0 END) AS open,
-         SUM(CASE WHEN status='settled' AND pnl > 0 THEN 1 ELSE 0 END) AS wins,
-         SUM(CASE WHEN status='settled' THEN cost ELSE 0 END) AS staked,
-         SUM(CASE WHEN status='settled' THEN pnl ELSE 0 END) AS pnl
+         SUM(CASE WHEN status IN ('settled','closed') AND pnl > 0 THEN 1 ELSE 0 END) AS wins,
+         SUM(CASE WHEN status IN ('settled','closed') THEN cost ELSE 0 END) AS staked,
+         SUM(CASE WHEN status IN ('settled','closed') THEN pnl ELSE 0 END) AS pnl
        FROM trades WHERE mode='dry'`,
     )
     .get() as {
@@ -148,13 +148,13 @@ function main(): void {
 
   console.log('\ndry paper trades')
   if (!t.n) {
-    console.log('  none yet — run `pnpm bot:dry`')
+    console.log('  none yet — run `pnpm bot:dry` (or BOT_STRATEGY=swing pnpm bot:dry)')
   } else {
     const staked = t.staked ?? 0
     const pnl = t.pnl ?? 0
     const hit = t.settled ? ((t.wins / t.settled) * 100).toFixed(0) : '—'
     const roi = staked > 0 ? ((pnl / staked) * 100).toFixed(1) : '—'
-    console.log(`  ${t.n} entered · ${t.settled} settled · ${t.open} open`)
+    console.log(`  ${t.n} entered · ${t.settled} realized · ${t.open} open`)
     console.log(
       `  wins ${t.wins}/${t.settled} (${hit}% hit) · staked $${staked.toFixed(2)} · ` +
         `pnl ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)} (ROI ${roi}%)`,
@@ -162,9 +162,9 @@ function main(): void {
     const byReg = raw
       .prepare(
         `SELECT regime_entry AS regime,
-           SUM(CASE WHEN status='settled' THEN 1 ELSE 0 END) AS settled,
-           SUM(CASE WHEN status='settled' AND pnl>0 THEN 1 ELSE 0 END) AS wins,
-           SUM(CASE WHEN status='settled' THEN pnl ELSE 0 END) AS pnl
+           SUM(CASE WHEN status IN ('settled','closed') THEN 1 ELSE 0 END) AS settled,
+           SUM(CASE WHEN status IN ('settled','closed') AND pnl>0 THEN 1 ELSE 0 END) AS wins,
+           SUM(CASE WHEN status IN ('settled','closed') THEN pnl ELSE 0 END) AS pnl
          FROM trades WHERE mode='dry' GROUP BY regime_entry`,
       )
       .all() as { regime: string | null; settled: number; wins: number; pnl: number | null }[]
@@ -172,6 +172,25 @@ function main(): void {
       console.log(
         `    ${pad(r.regime ?? '—', 10)} ${r.wins}/${r.settled} win · pnl ${(r.pnl ?? 0) >= 0 ? '+' : ''}${(r.pnl ?? 0).toFixed(2)}`,
       )
+    }
+
+    // Swing exits broken out by reason — the scalp's health check.
+    const byReason = raw
+      .prepare(
+        `SELECT exit_reason AS reason, COUNT(*) AS n,
+           SUM(CASE WHEN pnl>0 THEN 1 ELSE 0 END) AS wins,
+           SUM(pnl) AS pnl
+         FROM trades WHERE mode='dry' AND status='closed' AND strategy='swing'
+         GROUP BY exit_reason ORDER BY n DESC`,
+      )
+      .all() as { reason: string | null; n: number; wins: number; pnl: number | null }[]
+    if (byReason.length) {
+      console.log('  swing exits by reason')
+      for (const r of byReason) {
+        console.log(
+          `    ${pad(r.reason ?? '—', 12)} ${r.wins}/${r.n} win · pnl ${(r.pnl ?? 0) >= 0 ? '+' : ''}${(r.pnl ?? 0).toFixed(2)}`,
+        )
+      }
     }
   }
   console.log('═════════════════════════════════════════════════════════════\n')
