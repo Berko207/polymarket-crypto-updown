@@ -4,6 +4,8 @@ import {
   setBotHalted,
   setBotMode,
   setBotStake,
+  setBotStrategy,
+  setBotTradeTimeframes,
   type BotMode,
   type BotStatus,
 } from '@/lib/botControl'
@@ -42,6 +44,22 @@ export function useBotStake() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: (stakeUsd: number) => setBotStake(stakeUsd),
+    onSuccess: (status: BotStatus) => qc.setQueryData(KEY, status),
+  })
+}
+
+export function useBotStrategy() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (strategy: 'value' | 'swing') => setBotStrategy(strategy),
+    onSuccess: (status: BotStatus) => qc.setQueryData(KEY, status),
+  })
+}
+
+export function useBotTradeTimeframes() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (timeframes: string[]) => setBotTradeTimeframes(timeframes),
     onSuccess: (status: BotStatus) => qc.setQueryData(KEY, status),
   })
 }

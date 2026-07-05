@@ -22,6 +22,9 @@ export interface BotStatus {
   /** Entries in the rolling 24h window; optional for older bot builds. */
   dailyTrades?: number
   maxDailyTrades?: number
+  /** Traded subset + full recorded universe; absent when talking to an older bot. */
+  tradeTimeframes?: string[]
+  availableTimeframes?: string[]
   swingExits?: { reason: string; n: number; wins: number; pnl: number }[]
   swingTrigger?: 'edge' | 'move'
   swingSource?: 'flat' | 'regime' | 'blend'
@@ -88,3 +91,7 @@ async function post(path: string, body: unknown): Promise<BotStatus> {
 export const setBotMode = (mode: BotMode): Promise<BotStatus> => post('/mode', { mode })
 export const setBotHalted = (halted: boolean): Promise<BotStatus> => post('/halt', { halted })
 export const setBotStake = (stakeUsd: number): Promise<BotStatus> => post('/stake', { stakeUsd })
+export const setBotStrategy = (strategy: 'value' | 'swing'): Promise<BotStatus> =>
+  post('/strategy', { strategy })
+export const setBotTradeTimeframes = (timeframes: string[]): Promise<BotStatus> =>
+  post('/timeframes', { timeframes })

@@ -87,6 +87,12 @@ async function main(): Promise<void> {
     })
     .filter((s): s is ScopeState => s != null)
 
+  // Timeframes entries currently fire on (a subset of the recorded scopes above).
+  // Mutable so the dashboard can widen/narrow trading without a restart; every
+  // timeframe is still recorded regardless of what's in here.
+  const recordedTf = new Set<TimeframeId>(scopes.map((s) => s.timeframe))
+  const tradeTf = new Set<TimeframeId>(config.tradeTimeframes.filter((tf) => recordedTf.has(tf)))
+
   const lastSample = new Map<string, number>()
   const tracked = new Map<string, TrackedWindow>()
   // Swing state: recent mids per window (swing detection), per-window re-entry
@@ -106,7 +112,9 @@ async function main(): Promise<void> {
       : `value · entry ~T-${config.entryAtSec}s · edge≥${config.edgeThreshold}`
   log(
     `${mode} up · db=${config.dbPath} · scopes=${scopes.map((s) => `${s.coin}/${s.timeframe}`).join(',')}` +
-      (mode !== 'record' ? ` · ${strategyBrief} · $${config.stakeUsd}` : ''),
+      (mode !== 'record'
+        ? ` · trade[${config.timeframes.filter((tf) => tradeTf.has(tf)).join(',') || 'none'}] · ${strategyBrief} · $${config.stakeUsd}`
+        : ''),
   )
 
   // --- LIVE arming: every guard must pass; returns an error instead of exiting
@@ -163,6 +171,42 @@ async function main(): Promise<void> {
     const prev = config.stakeUsd
     config.stakeUsd = next
     log(`stake $${prev} → $${next} (control)`)
+    return { ok: true }
+  }
+
+  function setStrategy(next: 'value' | 'swing'): { ok: boolean; error?: string } {
+    if (next !== 'value' && next !== 'swing') return { ok: false, error: 'strategy must be value|swing' }
+    if (next === config.strategy) return { ok: true }
+    const prev = config.strategy
+    config.strategy = next
+    log(`strategy ${prev} → ${next} (control)`)
+    // Switching to value stops managing open swing scalps' TP/stop — they ride to
+    // settlement (settleTrades is the safety net). Flag it so it isn't a surprise.
+    if (prev === 'swing' && next === 'value') {
+      const openSwing = db.openTrades().filter((t) => t.strategy === 'swing').length
+      if (openSwing > 0) {
+        log(`  ${openSwing} open swing position(s) will ride to settlement (no scalp exit in value mode)`)
+      }
+    }
+    return { ok: true }
+  }
+
+  function setTradeTimeframes(next: string[]): { ok: boolean; error?: string } {
+    if (!Array.isArray(next)) return { ok: false, error: 'timeframes must be an array' }
+    const uniq = [
+      ...new Set(
+        next
+          .map((t) => String(t).trim().toLowerCase())
+          .filter((t): t is TimeframeId => recordedTf.has(t as TimeframeId)),
+      ),
+    ]
+    if (uniq.length === 0) {
+      return { ok: false, error: 'select at least one recorded timeframe (use Halt to pause all entries)' }
+    }
+    tradeTf.clear()
+    for (const t of uniq) tradeTf.add(t)
+    config.tradeTimeframes = uniq
+    log(`trade timeframes → ${uniq.join(',')} (control)`)
     return { ok: true }
   }
 
@@ -364,9 +408,16 @@ async function main(): Promise<void> {
   }
 
   // Manage exits before entries so a stop/take-profit frees the per-window slot.
-  async function manageSwing(pred: Prediction, market: ParsedMarket, now: number): Promise<void> {
+  // Exits run even when this timeframe isn't currently tradable, so toggling a
+  // timeframe off from the dashboard never strands an open scalp mid-window.
+  async function manageSwing(
+    pred: Prediction,
+    market: ParsedMarket,
+    now: number,
+    canEnter: boolean,
+  ): Promise<void> {
     await swingExit(pred, market, now)
-    await swingEnter(pred, market, now)
+    if (canEnter) await swingEnter(pred, market, now)
   }
 
   function settleTrades(now: number): void {
@@ -465,12 +516,15 @@ async function main(): Promise<void> {
       })
     }
 
-    // Trade every tick (not throttled) so entries/exits land on time.
+    // Trade every tick (not throttled) so entries/exits land on time. Entries only
+    // fire on tradable timeframes; recorded-but-not-traded ones (e.g. 5m) still log
+    // predictions above but never enter. Swing exits are managed regardless.
     if (mode !== 'record') {
+      const canEnter = tradeTf.has(state.timeframe)
       if (config.strategy === 'swing') {
         recordMid(pred, now)
-        void manageSwing(pred, market, now)
-      } else {
+        void manageSwing(pred, market, now, canEnter)
+      } else if (canEnter) {
         void maybeTrade(pred, market, now)
       }
     }
@@ -580,6 +634,9 @@ async function main(): Promise<void> {
               summary: db.tradeSummary(),
               dailyTrades: db.countTradesSince(Date.now() - 86_400_000),
               maxDailyTrades: effectiveDailyCap(),
+              // Traded subset + the full recorded universe it can be toggled across.
+              tradeTimeframes: config.timeframes.filter((tf) => tradeTf.has(tf)),
+              availableTimeframes: config.timeframes.filter((tf) => recordedTf.has(tf)),
               swingExits: config.strategy === 'swing' ? db.swingExits() : [],
               swingTrigger: config.swingTrigger,
               swingSource: config.signalSource,
@@ -589,6 +646,8 @@ async function main(): Promise<void> {
             setMode,
             setHalted,
             setStakeUsd,
+            setStrategy,
+            setTradeTimeframes,
           },
           Number(process.env.BOT_CONTROL_PORT ?? 8790),
           process.env.BOT_CONTROL_TOKEN?.trim() || undefined,

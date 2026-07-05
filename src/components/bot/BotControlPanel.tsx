@@ -3,7 +3,14 @@ import { toast } from 'sonner'
 import { cn } from '@/lib/utils'
 import { MIN_BUY_USD } from '@/lib/api'
 import { Input } from '@/components/ui/input'
-import { useBotHalt, useBotMode, useBotStake, useBotStatus } from '@/queries/bot'
+import {
+  useBotHalt,
+  useBotMode,
+  useBotStake,
+  useBotStatus,
+  useBotStrategy,
+  useBotTradeTimeframes,
+} from '@/queries/bot'
 import { EXIT_META } from '@/lib/botFormat'
 import type { BotMode } from '@/lib/botControl'
 
@@ -31,12 +38,18 @@ export function BotControlPanel() {
   const mode = useBotMode()
   const halt = useBotHalt()
   const stake = useBotStake()
+  const strat = useBotStrategy()
+  const tradeTf = useBotTradeTimeframes()
   // TanStack keeps the last successful data while polling errors — without the
   // isError gate a killed bot would show "streaming" with stale PnL forever.
   const s = status.isError ? undefined : status.data
   const stakeSupported = s?.stakeUsd != null
   const serverStake = s?.stakeUsd ?? MIN_BUY_USD
   const [draftStake, setDraftStake] = useState(serverStake)
+  // Strategy + trade-timeframe control needs a bot new enough to report the universe.
+  const tfSupported = s?.availableTimeframes != null
+  const availableTf = s?.availableTimeframes ?? []
+  const tradedTf = s?.tradeTimeframes ?? []
 
   useEffect(() => {
     setDraftStake(serverStake)
@@ -64,6 +77,32 @@ export function BotControlPanel() {
     mode.mutate(next, {
       onError: (e) => toast.error(e instanceof Error ? e.message : 'mode switch failed'),
       onSuccess: () => toast.success(`Bot → ${modeLabel(next)}`),
+    })
+  }
+
+  const switchStrategy = (next: 'value' | 'swing') => {
+    if (!s || next === s.strategy || strat.isPending) return
+    strat.mutate(next, {
+      onError: (e) => {
+        const msg = e instanceof Error ? e.message : 'strategy switch failed'
+        toast.error(msg === 'not found' ? 'Restart the bot (pnpm bot:paper) to enable strategy control' : msg)
+      },
+      onSuccess: () => toast.success(`Strategy → ${next === 'swing' ? 'Swing' : 'Value'}`),
+    })
+  }
+
+  const toggleTf = (tf: string) => {
+    if (!s || tradeTf.isPending) return
+    const set = new Set(tradedTf)
+    if (set.has(tf)) set.delete(tf)
+    else set.add(tf)
+    const next = availableTf.filter((t) => set.has(t)) // keep canonical order
+    if (next.length === 0) {
+      toast.error('Keep at least one timeframe on — use Halt to pause all entries')
+      return
+    }
+    tradeTf.mutate(next, {
+      onError: (e) => toast.error(e instanceof Error ? e.message : 'timeframe update failed'),
     })
   }
 
@@ -149,6 +188,67 @@ export function BotControlPanel() {
           )
         })}
       </div>
+
+      {s && tfSupported && (
+        <div className="flex flex-col gap-2 rounded-lg bg-secondary px-3 py-2">
+          <div className="flex items-center justify-between gap-2">
+            <span className="text-xs font-medium text-muted-foreground">Strategy</span>
+            <div className="grid grid-cols-2 gap-0.5 rounded-md bg-background/60 p-0.5">
+              {(['value', 'swing'] as const).map((st) => (
+                <button
+                  key={st}
+                  type="button"
+                  disabled={strat.isPending}
+                  onClick={() => switchStrategy(st)}
+                  title={
+                    st === 'swing'
+                      ? 'Swing scalp — fade odds overshoot, auto take-profit/stop mid-window'
+                      : 'Value — late edge bet held to settlement'
+                  }
+                  className={cn(
+                    'rounded px-3 py-1 text-xs font-semibold transition disabled:opacity-40',
+                    strategy === st
+                      ? 'bg-background text-foreground shadow-sm'
+                      : 'text-muted-foreground hover:text-foreground',
+                  )}
+                >
+                  {st === 'swing' ? 'Swing' : 'Value'}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="flex flex-col gap-1">
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-xs font-medium text-muted-foreground">Trade timeframes</span>
+              <span className="text-[0.6rem] text-muted-foreground">off = recorded, not traded</span>
+            </div>
+            <div className="flex flex-wrap gap-1">
+              {availableTf.map((tf) => {
+                const on = tradedTf.includes(tf)
+                return (
+                  <button
+                    key={tf}
+                    type="button"
+                    disabled={tradeTf.isPending}
+                    onClick={() => toggleTf(tf)}
+                    aria-pressed={on}
+                    title={on ? `Trading ${tf} — click to record-only` : `${tf} recorded only — click to trade`}
+                    className={cn(
+                      'rounded px-2 py-0.5 text-[0.7rem] font-semibold tabular-nums transition disabled:opacity-40',
+                      on
+                        ? 'bg-primary/15 text-primary'
+                        : 'bg-background/40 text-muted-foreground line-through hover:text-foreground',
+                    )}
+                  >
+                    {tf}
+                  </button>
+                )
+              })}
+            </div>
+          </div>
+        </div>
+      )}
 
       {s && s.mode !== 'record' && (
         <div className="flex flex-col gap-1.5 rounded-lg bg-secondary px-3 py-2">
