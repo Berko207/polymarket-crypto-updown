@@ -1,11 +1,8 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node'
 
-const UPSTREAM = 'https://polymarket.com/api/crypto/crypto-price'
+const UPSTREAM = 'https://polymarket.com/api/crypto/price-history'
 const ALLOWED_SYMBOLS = new Set(['BTC', 'ETH', 'SOL', 'XRP', 'DOGE', 'BNB'])
-// Upstream window discriminators (names taken from polymarket.com's own event pages).
-// Without the right variant the API ignores endDate and anchors openPrice to the hour.
-// Client mapping lives in src/lib/cryptoPrice.ts — keep in sync.
-const ALLOWED_VARIANTS = new Set(['fiveminute', 'fifteen', 'fourhour', 'daily'])
+const ALLOWED_VARIANTS = new Set(['daily', 'hourly'])
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== 'GET') {
@@ -17,10 +14,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     .trim()
     .toUpperCase()
   const eventStartTime = String(req.query.eventStartTime ?? '').trim()
-  const endDate = String(req.query.endDate ?? '').trim()
-  const variant = String(req.query.variant ?? '')
-    .trim()
-    .toLowerCase()
+  const variant = String(req.query.variant ?? '').trim()
 
   if (!symbol || !ALLOWED_SYMBOLS.has(symbol)) {
     return res.status(400).json({ error: 'symbol must be one of BTC, ETH, SOL, XRP, DOGE, BNB' })
@@ -29,14 +23,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return res.status(400).json({ error: 'eventStartTime is required (ISO or unix seconds)' })
   }
   if (variant && !ALLOWED_VARIANTS.has(variant)) {
-    return res.status(400).json({ error: `variant must be one of ${[...ALLOWED_VARIANTS].join(', ')}` })
+    return res.status(400).json({ error: 'variant must be daily or hourly' })
   }
 
   const params = new URLSearchParams({ symbol, eventStartTime })
-  if (endDate) params.set('endDate', endDate)
-  // Without a variant, upstream resolves (symbol, eventStartTime) to the hourly
-  // market — a daily window sharing its start (noon ET) gets the wrong, already
-  // closed 1h window back (frozen "final price", completed=true mid-window).
   if (variant) params.set('variant', variant)
 
   try {
@@ -44,9 +34,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const body = await upstream.text()
     const contentType = upstream.headers.get('content-type')
     if (contentType) res.setHeader('Content-Type', contentType)
-    res.setHeader('Cache-Control', 'no-store')
+    res.setHeader('Cache-Control', 's-maxage=30, stale-while-revalidate=60')
     return res.status(upstream.status).send(body)
   } catch {
-    return res.status(502).json({ error: 'Upstream crypto price request failed' })
+    return res.status(502).json({ error: 'Upstream price history request failed' })
   }
 }

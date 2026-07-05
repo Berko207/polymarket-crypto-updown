@@ -44,8 +44,7 @@ export function isRollingSlug(eventSlug: string): boolean {
 /**
  * Upstream window discriminator (names lifted from polymarket.com's own event pages).
  * Without it the crypto-price API ignores endDate: openPrice anchors to the hour and
- * closePrice is just the live print — poison for per-slot strikes. Hourly needs none
- * (the hour anchor IS its open); daily is deliberately left alone (PR #13 revert).
+ * closePrice is just the live print — poison for per-slot strikes.
  */
 const CRYPTO_PRICE_VARIANT: Partial<Record<ParsedMarket['timeframe'], string>> = {
   '5m': 'fiveminute',
@@ -78,8 +77,20 @@ export function previousWindowParams(market: ParsedMarket): CryptoPriceWindowPar
   return {
     eventStartTime: new Date(startMs - durationMs).toISOString(),
     endDate: new Date(startMs).toISOString(),
-    variant: CRYPTO_PRICE_VARIANT[market.timeframe],
+    variant: windowVariant(market),
   }
+}
+
+/** Upstream discriminator: daily windows share their noon-ET start with hourly
+ * markets — without `variant=daily` the API returns the wrong closed hourly row. */
+export type CryptoPriceVariant = 'daily'
+
+export function cryptoPriceVariant(market: ParsedMarket): CryptoPriceVariant | undefined {
+  return market.timeframe === 'daily' ? 'daily' : undefined
+}
+
+function windowVariant(market: ParsedMarket): string | undefined {
+  return cryptoPriceVariant(market) ?? CRYPTO_PRICE_VARIANT[market.timeframe]
 }
 
 /** Params for Polymarket's Chainlink window API — one row per market window. */
@@ -96,7 +107,7 @@ export function cryptoPriceWindowParams(market: ParsedMarket): CryptoPriceWindow
   return {
     eventStartTime,
     endDate: market.endDate.toISOString(),
-    variant: CRYPTO_PRICE_VARIANT[market.timeframe],
+    variant: windowVariant(market),
   }
 }
 
@@ -127,6 +138,29 @@ export async function fetchCryptoPrice(
     completed: Boolean(data.completed),
     incomplete: Boolean(data.incomplete),
   }
+}
+
+export interface CryptoPricePoint {
+  timestamp: number
+  value: number
+}
+
+/** Chainlink path for a window, from its open — 1-min fidelity (5-min for daily). */
+export async function fetchCryptoPriceHistory(
+  symbol: string,
+  eventStartTime: string,
+  variant?: string,
+): Promise<CryptoPricePoint[]> {
+  const params = new URLSearchParams({ symbol, eventStartTime })
+  if (variant) params.set('variant', variant)
+
+  const res = await fetch(`/api/crypto-price-history?${params}`)
+  if (!res.ok) throw new Error(`Price history failed (${res.status})`)
+  const data = (await res.json()) as CryptoPricePoint[]
+  if (!Array.isArray(data)) throw new Error('Price history: unexpected response')
+  return data.filter(
+    (p) => Number.isFinite(Number(p?.timestamp)) && Number.isFinite(Number(p?.value)) && Number(p.value) > 0,
+  )
 }
 
 /** USD formatting aligned with Polymarket's Chainlink display. */
