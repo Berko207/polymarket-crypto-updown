@@ -180,13 +180,16 @@ async function main(): Promise<void> {
     const prev = config.strategy
     config.strategy = next
     log(`strategy ${prev} → ${next} (control)`)
-    // Switching to value stops managing open swing scalps' TP/stop — they ride to
-    // settlement (settleTrades is the safety net). Flag it so it isn't a surprise.
-    if (prev === 'swing' && next === 'value') {
-      const openSwing = db.openTrades().filter((t) => t.strategy === 'swing').length
-      if (openSwing > 0) {
-        log(`  ${openSwing} open swing position(s) will ride to settlement (no scalp exit in value mode)`)
-      }
+    // Market-close positions from the old regime so they realize now instead of
+    // riding to settlement. Fire-and-forget: the flip is instant, the closes land
+    // over the next tick(s); settleTrades still backstops anything with no live
+    // book to sell into.
+    const open = db.countOpenTrades()
+    if (open > 0) {
+      log(`  closing ${open} open position(s) at market (strategy-switch)`)
+      void closeOpenPositions('strategy-switch').catch((e) =>
+        log(`closeOpenPositions error — ${e instanceof Error ? e.message : String(e)}`),
+      )
     }
     return { ok: true }
   }
@@ -418,6 +421,65 @@ async function main(): Promise<void> {
   ): Promise<void> {
     await swingExit(pred, market, now)
     if (canEnter) await swingEnter(pred, market, now)
+  }
+
+  // Force-close every open position at the current market bid (used on a strategy
+  // switch so positions from the old regime realize now). Recorded as a normal
+  // `closed` trade with the given exit reason. Positions whose window has no live
+  // book to mark against are skipped and left for settleTrades. Mirrors swingExit.
+  async function closeOpenPositions(reason: string): Promise<void> {
+    const live = new Map<string, ParsedMarket>()
+    for (const sc of scopes) if (sc.market) live.set(marketWindowKey(sc.market), sc.market)
+    let closed = 0
+    let toSettle = 0
+    for (const pos of db.openTrades()) {
+      if (exitingTrades.has(pos.id)) continue
+      const market = live.get(pos.windowKey)
+      const tokenId = market ? (pos.side === 'up' ? market.upTokenId : market.downTokenId) : null
+      const mark = market ? bidForSide(deriveBook(market), pos.side) : null
+      // No live book to sell into (window no longer tracked) — leave it for settleTrades.
+      if (!market || !tokenId || !(mark != null && mark > 0)) {
+        toSettle += 1
+        continue
+      }
+      const sellOrder: SellOrder = {
+        side: pos.side,
+        tokenId,
+        size: pos.size,
+        sellPrice: mark,
+        tickSize: market.tickSize,
+        negRisk: market.negRisk,
+      }
+      exitingTrades.add(pos.id)
+      let fill
+      try {
+        fill = await executor.sell(sellOrder)
+      } catch (e) {
+        exitingTrades.delete(pos.id)
+        log(`${mode.toUpperCase()} CLOSE FAILED #${pos.id} ${pos.side} — ${e instanceof Error ? e.message : String(e)}`)
+        continue
+      }
+      exitingTrades.delete(pos.id)
+      if (!(fill.fillSize > 0 && fill.fillPrice > 0)) {
+        log(`${mode.toUpperCase()} CLOSE NO FILL #${pos.id} ${pos.side} (book empty / rejected)`)
+        continue
+      }
+      const now = Date.now()
+      const exitFee = config.feeSell ? takerFee(fill.fillPrice, fill.fillSize, config.feeRate) : 0
+      const payout = fill.fillPrice * fill.fillSize - exitFee
+      const pnl = payout - pos.cost
+      db.closeTrade({ id: pos.id, exitT: now, exitPrice: fill.fillPrice, exitReason: reason, exitFee, payout, pnl })
+      swingCooldown.set(pos.windowKey, now)
+      stats.settled += 1
+      closed += 1
+      log(
+        `${mode.toUpperCase()} CLOSE ${reason} ${pos.coin}/${pos.timeframe} ${pos.side} @ ${fill.fillPrice.toFixed(3)} · ` +
+          `pnl ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(3)}`,
+      )
+    }
+    if (closed || toSettle) {
+      log(`${mode.toUpperCase()} ${reason}: ${closed} closed at market, ${toSettle} left to settle`)
+    }
   }
 
   function settleTrades(now: number): void {

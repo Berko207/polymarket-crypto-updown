@@ -7,6 +7,7 @@ export const EXIT_META: Record<string, { label: string; cls: string }> = {
   'time-stop': { label: 'Time', cls: 'bg-secondary text-muted-foreground' },
   'edge-gone': { label: 'Edge', cls: 'bg-secondary text-muted-foreground' },
   'regime-panic': { label: 'Panic', cls: 'bg-amber-500/15 text-amber-300' },
+  'strategy-switch': { label: 'Switch', cls: 'bg-secondary text-muted-foreground' },
 }
 
 /** ms remaining → "m:ss" (— when unknown). */
