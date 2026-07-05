@@ -53,7 +53,7 @@ export function BotControlPanel() {
             <span
               title={
                 strategy === 'swing'
-                  ? 'Swing scalp — fade an odds overshoot, auto take-profit/stop'
+                  ? 'Swing scalp — buys the model’s underpriced side, auto take-profit/stop'
                   : 'Value — late edge bet held to settlement'
               }
               className={cn(
@@ -62,6 +62,18 @@ export function BotControlPanel() {
               )}
             >
               {strategy === 'swing' ? 'Swing' : 'Value'}
+            </span>
+          )}
+          {s && strategy === 'swing' && s.swingTrigger && (
+            <span
+              className="text-[0.6rem] text-muted-foreground"
+              title={
+                s.swingTrigger === 'edge'
+                  ? 'Trust the model: enter on model edge, no spike required'
+                  : 'Fade: only enter when a market spike confirms the edge'
+              }
+            >
+              {s.swingTrigger === 'edge' ? 'model' : 'fade'} · {s.swingSource}
             </span>
           )}
         </div>

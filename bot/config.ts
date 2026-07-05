@@ -7,6 +7,25 @@ import { COINS, getSeriesSlug } from '../src/lib/config'
 import { chainlinkPair } from '../src/lib/cryptoPrice'
 import type { CoinId, TimeframeId } from '../src/lib/types'
 
+/**
+ * Swing entry trigger:
+ *  'edge' = trust the model — enter as soon as |model − market| ≥ swingEdgeMin,
+ *           whichever side the model underprices (catches model-driven edges AND
+ *           market overshoots; does not wait for a spike).
+ *  'move' = only enter when a market spike ≥ swingMovePts confirms the edge (the
+ *           stricter fade — fewer, spike-confirmed entries).
+ */
+export type SwingTrigger = 'edge' | 'move'
+
+/**
+ * Which fair-value probability drives the edge:
+ *  'flat'   = the plain realized-vol model (modelP).
+ *  'regime' = the regime-conditional model (regimeP).
+ *  'blend'  = regimeP while vol is elevated/panic, else flat (lean on the regime
+ *             model only where it's most likely to be the more accurate one).
+ */
+export type SignalSource = 'flat' | 'regime' | 'blend'
+
 export interface BotConfig {
   coins: CoinId[]
   timeframes: TimeframeId[]
@@ -33,11 +52,15 @@ export interface BotConfig {
   maxDailyTrades: number
   maxConcurrent: number
   // --- swing scalp (strategy='swing') ---
-  /** Min market-mid move over swingWindowSec to count as a swing. */
+  /** How entries fire: trust the model ('edge') or require a spike ('move'). */
+  swingTrigger: SwingTrigger
+  /** Which fair-value probability drives the edge (flat / regime / blend). */
+  signalSource: SignalSource
+  /** Min market-mid move over swingWindowSec to count as a swing (trigger='move'). */
   swingMovePts: number
   /** Lookback for measuring the swing. */
   swingWindowSec: number
-  /** Model edge (for the faded side) required to confirm the overshoot. */
+  /** Min |model − market| edge to enter (and its side is the model's cheap side). */
   swingEdgeMin: number
   /** Exit when the mark rises this far above entry (bank the scalp). */
   swingTakeProfitPts: number
@@ -93,6 +116,11 @@ export function loadConfig(): BotConfig {
   const timeframes = parseList<TimeframeId>(env.BOT_TIMEFRAMES, KNOWN_TF, ['5m', '15m'])
   const strategy: 'value' | 'swing' =
     env.BOT_STRATEGY?.trim().toLowerCase() === 'swing' ? 'swing' : 'value'
+  const swingTrigger: SwingTrigger =
+    env.BOT_SWING_TRIGGER?.trim().toLowerCase() === 'move' ? 'move' : 'edge'
+  const sourceRaw = env.BOT_SIGNAL_SOURCE?.trim().toLowerCase()
+  const signalSource: SignalSource =
+    sourceRaw === 'regime' || sourceRaw === 'blend' ? sourceRaw : 'flat'
 
   return {
     coins,
@@ -102,6 +130,8 @@ export function loadConfig(): BotConfig {
     sampleMs: num(env.BOT_SAMPLE_MS, 10_000),
     marketPollMs: num(env.BOT_MARKET_POLL_MS, 5_000),
     strategy,
+    swingTrigger,
+    signalSource,
     entryAtSec: num(env.BOT_ENTRY_AT_SEC, 10),
     entryToleranceSec: num(env.BOT_ENTRY_TOLERANCE_SEC, 4),
     edgeThreshold: num(env.BOT_EDGE_THRESHOLD, 0.05),

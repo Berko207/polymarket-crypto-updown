@@ -21,6 +21,9 @@ export interface BotStatus {
   summary: { entered: number; settled: number; open: number; wins: number; staked: number; pnl: number }
   /** Closed swing trades by exit reason (empty for the value strategy). */
   swingExits: { reason: string; n: number; wins: number; pnl: number }[]
+  /** Active swing entry trigger + fair-value source (swing strategy only). */
+  swingTrigger: 'edge' | 'move'
+  swingSource: 'flat' | 'regime' | 'blend'
   /** Currently-open positions with live mark, unrealized P&L, and time left. */
   openPositions: {
     coin: string
