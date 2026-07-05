@@ -49,11 +49,15 @@ export interface TradeInsert {
   coin: string
   timeframe: string
   mode: string
+  strategy: string
   side: 'up' | 'down'
   entryT: number
   entryPrice: number
   size: number
+  /** Entry notional including the modeled entry fee. */
   cost: number
+  /** Modeled taker fee paid on entry (0 when the fee model is off). */
+  entryFee: number
   signalEdge: number
   regimeEntry: string | null
   status: string
@@ -65,6 +69,48 @@ export interface OpenTrade {
   side: 'up' | 'down'
   size: number
   cost: number
+  entryPrice: number
+  strategy: string
+}
+
+/** An open position, for the dashboard monitor (live unrealized P&L needs the mark). */
+export interface OpenTradeRow {
+  id: number
+  windowKey: string
+  coin: string
+  timeframe: string
+  side: 'up' | 'down'
+  size: number
+  cost: number
+  entryPrice: number
+  strategy: string
+  entryT: number
+}
+
+/** A finished trade for the monitor's activity feed. */
+export interface ClosedTradeRow {
+  coin: string
+  timeframe: string
+  side: 'up' | 'down'
+  strategy: string
+  entryPrice: number
+  exitPrice: number | null
+  exitReason: string | null
+  pnl: number
+  settleT: number
+  status: string
+}
+
+/** A mid-window close (swing auto-sell), as opposed to a hold-to-settle payout. */
+export interface TradeClose {
+  id: number
+  exitT: number
+  exitPrice: number
+  exitReason: string
+  exitFee: number
+  /** Sale proceeds net of the modeled exit fee. */
+  payout: number
+  pnl: number
 }
 
 const SCHEMA = `
@@ -113,12 +159,20 @@ export interface BotDb {
   tradeExists(windowKey: string): boolean
   openTradesForWindow(windowKey: string): OpenTrade[]
   settleTrade(id: number, settleT: number, payout: number, pnl: number): void
+  /** Close an open position mid-window at a sold price (swing auto-sell). */
+  closeTrade(row: TradeClose): void
   countOpenTrades(): number
   countTradesSince(sinceMs: number): number
   /** Open trades whose window already has a recorded outcome — ready to settle. */
   pendingSettlements(): { id: number; side: 'up' | 'down'; size: number; cost: number; outcome: 'up' | 'down' }[]
   /** Aggregate paper/live trade P&L for the status endpoint. */
   tradeSummary(): { entered: number; settled: number; open: number; wins: number; staked: number; pnl: number }
+  /** Closed swing trades grouped by exit reason — the scalp's health readout. */
+  swingExits(): { reason: string; n: number; wins: number; pnl: number }[]
+  /** All currently-open positions (for the dashboard monitor). */
+  openTrades(): OpenTradeRow[]
+  /** Most-recent finished trades, newest first (activity feed). */
+  recentClosed(limit: number): ClosedTradeRow[]
   close(): void
 }
 
@@ -129,6 +183,19 @@ export function openDb(path: string, readonly = false): BotDb {
     raw.pragma('journal_mode = WAL')
     raw.pragma('synchronous = NORMAL')
     raw.exec(SCHEMA)
+    // Additive migration for DBs created before the swing scalp (M2 recorded
+    // value trades only). ALTER ADD COLUMN is a no-op once present.
+    const cols = (raw.prepare('PRAGMA table_info(trades)').all() as { name: string }[]).map(
+      (c) => c.name,
+    )
+    const addColumn = (name: string, decl: string): void => {
+      if (!cols.includes(name)) raw.exec(`ALTER TABLE trades ADD COLUMN ${name} ${decl}`)
+    }
+    addColumn('strategy', "TEXT NOT NULL DEFAULT 'value'")
+    addColumn('entry_fee', 'REAL NOT NULL DEFAULT 0')
+    addColumn('exit_price', 'REAL')
+    addColumn('exit_reason', 'TEXT')
+    addColumn('exit_fee', 'REAL')
   }
 
   const insTick = raw.prepare(
@@ -152,19 +219,24 @@ export function openDb(path: string, readonly = false): BotDb {
 
   const insTrade = raw.prepare(`
     INSERT INTO trades
-      (window_key, coin, timeframe, mode, side, entry_t, entry_price, size, cost,
-       signal_edge, regime_entry, status, order_id)
+      (window_key, coin, timeframe, mode, strategy, side, entry_t, entry_price, size, cost,
+       entry_fee, signal_edge, regime_entry, status, order_id)
     VALUES
-      (@windowKey, @coin, @timeframe, @mode, @side, @entryT, @entryPrice, @size, @cost,
-       @signalEdge, @regimeEntry, @status, @orderId)
+      (@windowKey, @coin, @timeframe, @mode, @strategy, @side, @entryT, @entryPrice, @size, @cost,
+       @entryFee, @signalEdge, @regimeEntry, @status, @orderId)
   `)
   const tradeExistsStmt = raw.prepare('SELECT 1 FROM trades WHERE window_key = ? LIMIT 1')
   const openForWindow = raw.prepare(
-    "SELECT id, side, size, cost FROM trades WHERE window_key = ? AND status = 'open'",
+    "SELECT id, side, size, cost, entry_price AS entryPrice, strategy FROM trades WHERE window_key = ? AND status = 'open'",
   )
   const settleStmt = raw.prepare(
     "UPDATE trades SET status='settled', settle_t=@settleT, payout=@payout, pnl=@pnl WHERE id=@id",
   )
+  const closeStmt = raw.prepare(`
+    UPDATE trades SET status='closed', settle_t=@exitT, exit_price=@exitPrice,
+      exit_reason=@exitReason, exit_fee=@exitFee, payout=@payout, pnl=@pnl
+    WHERE id=@id
+  `)
   const openCountStmt = raw.prepare("SELECT COUNT(*) AS n FROM trades WHERE status='open'")
   const sinceCountStmt = raw.prepare('SELECT COUNT(*) AS n FROM trades WHERE entry_t >= ?')
   const pendingStmt = raw.prepare(`
@@ -172,15 +244,39 @@ export function openDb(path: string, readonly = false): BotDb {
     FROM trades t JOIN outcomes o ON o.window_key = t.window_key
     WHERE t.status = 'open'
   `)
+  // 'settled' (held to $0/$1) and 'closed' (swing auto-sell) are both realized.
   const summaryStmt = raw.prepare(`
     SELECT
       COUNT(*) AS entered,
-      COALESCE(SUM(CASE WHEN status='settled' THEN 1 ELSE 0 END), 0) AS settled,
+      COALESCE(SUM(CASE WHEN status IN ('settled','closed') THEN 1 ELSE 0 END), 0) AS settled,
       COALESCE(SUM(CASE WHEN status='open' THEN 1 ELSE 0 END), 0) AS open,
-      COALESCE(SUM(CASE WHEN status='settled' AND pnl>0 THEN 1 ELSE 0 END), 0) AS wins,
-      COALESCE(SUM(CASE WHEN status='settled' THEN cost ELSE 0 END), 0) AS staked,
-      COALESCE(SUM(CASE WHEN status='settled' THEN pnl ELSE 0 END), 0) AS pnl
+      COALESCE(SUM(CASE WHEN status IN ('settled','closed') AND pnl>0 THEN 1 ELSE 0 END), 0) AS wins,
+      COALESCE(SUM(CASE WHEN status IN ('settled','closed') THEN cost ELSE 0 END), 0) AS staked,
+      COALESCE(SUM(CASE WHEN status IN ('settled','closed') THEN pnl ELSE 0 END), 0) AS pnl
     FROM trades
+  `)
+  const swingExitsStmt = raw.prepare(`
+    SELECT
+      COALESCE(exit_reason, '—') AS reason,
+      COUNT(*) AS n,
+      COALESCE(SUM(CASE WHEN pnl>0 THEN 1 ELSE 0 END), 0) AS wins,
+      COALESCE(SUM(pnl), 0) AS pnl
+    FROM trades
+    WHERE status='closed' AND strategy='swing'
+    GROUP BY exit_reason
+    ORDER BY n DESC
+  `)
+  const openTradesStmt = raw.prepare(`
+    SELECT id, window_key AS windowKey, coin, timeframe, side, size, cost,
+           entry_price AS entryPrice, strategy, entry_t AS entryT
+    FROM trades WHERE status='open' ORDER BY entry_t DESC
+  `)
+  const recentClosedStmt = raw.prepare(`
+    SELECT coin, timeframe, side, strategy, entry_price AS entryPrice,
+           exit_price AS exitPrice, exit_reason AS exitReason, pnl,
+           settle_t AS settleT, status
+    FROM trades WHERE status IN ('settled','closed')
+    ORDER BY settle_t DESC LIMIT ?
   `)
 
   return {
@@ -193,6 +289,7 @@ export function openDb(path: string, readonly = false): BotDb {
     tradeExists: (windowKey) => tradeExistsStmt.get(windowKey) != null,
     openTradesForWindow: (windowKey) => openForWindow.all(windowKey) as OpenTrade[],
     settleTrade: (id, settleT, payout, pnl) => void settleStmt.run({ id, settleT, payout, pnl }),
+    closeTrade: (row) => void closeStmt.run(row),
     countOpenTrades: () => (openCountStmt.get() as { n: number }).n,
     countTradesSince: (sinceMs) => (sinceCountStmt.get(sinceMs) as { n: number }).n,
     pendingSettlements: () =>
@@ -206,6 +303,10 @@ export function openDb(path: string, readonly = false): BotDb {
         staked: number
         pnl: number
       },
+    swingExits: () =>
+      swingExitsStmt.all() as { reason: string; n: number; wins: number; pnl: number }[],
+    openTrades: () => openTradesStmt.all() as OpenTradeRow[],
+    recentClosed: (limit) => recentClosedStmt.all(limit) as ClosedTradeRow[],
     close: () => raw.close(),
   }
 }

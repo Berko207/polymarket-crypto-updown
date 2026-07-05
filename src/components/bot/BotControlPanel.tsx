@@ -1,6 +1,7 @@
 import { toast } from 'sonner'
 import { cn } from '@/lib/utils'
 import { useBotHalt, useBotMode, useBotStatus } from '@/queries/bot'
+import { EXIT_META } from '@/lib/botFormat'
 import type { BotMode } from '@/lib/botControl'
 
 // Record = observe/log only · Paper = simulated fills, no real money · Live =
@@ -38,13 +39,32 @@ export function BotControlPanel() {
 
   const roi = s && s.summary.staked > 0 ? (s.summary.pnl / s.summary.staked) * 100 : null
   const hit = s && s.summary.settled > 0 ? (s.summary.wins / s.summary.settled) * 100 : null
+  const strategy = s?.strategy ?? 'value'
+  const swingExits = s?.swingExits ?? []
 
   return (
     <div className="flex flex-col gap-3 rounded-xl border border-border bg-secondary/60 p-4">
       <div className="flex items-center justify-between">
-        <p className="text-[0.65rem] font-semibold uppercase tracking-wide text-muted-foreground">
-          Bot control
-        </p>
+        <div className="flex items-center gap-2">
+          <p className="text-[0.65rem] font-semibold uppercase tracking-wide text-muted-foreground">
+            Bot control
+          </p>
+          {s && (
+            <span
+              title={
+                strategy === 'swing'
+                  ? 'Swing scalp — fade an odds overshoot, auto take-profit/stop'
+                  : 'Value — late edge bet held to settlement'
+              }
+              className={cn(
+                'rounded px-1.5 py-0.5 text-[0.6rem] font-semibold uppercase tracking-wide',
+                strategy === 'swing' ? 'bg-primary/15 text-primary' : 'bg-secondary text-muted-foreground',
+              )}
+            >
+              {strategy === 'swing' ? 'Swing' : 'Value'}
+            </span>
+          )}
+        </div>
         <span className="flex items-center gap-1.5 text-[0.65rem] text-muted-foreground">
           <span className={cn('size-1.5 rounded-full', s?.connected ? 'bg-up' : 'bg-muted-foreground')} />
           {s ? `${s.connected ? 'streaming' : 'ws down'} · ${s.liveScopes}/${s.scopes.length} live` : 'offline'}
@@ -123,12 +143,29 @@ export function BotControlPanel() {
       {s && s.summary.settled > 0 && (
         <div className="flex items-center justify-between text-[0.7rem] tabular-nums text-muted-foreground">
           <span>
-            {s.summary.settled} settled · {hit?.toFixed(0)}% hit
+            {s.summary.settled} {strategy === 'swing' ? 'closed' : 'settled'} · {hit?.toFixed(0)}% hit
           </span>
           <span className={cn('font-semibold', s.summary.pnl >= 0 ? 'text-up' : 'text-down')}>
             {s.summary.pnl >= 0 ? '+' : ''}${s.summary.pnl.toFixed(2)}
             {roi != null ? ` · ${roi >= 0 ? '+' : ''}${roi.toFixed(1)}%` : ''}
           </span>
+        </div>
+      )}
+
+      {strategy === 'swing' && swingExits.length > 0 && (
+        <div className="flex flex-wrap gap-1" title="Swing exits by reason (count) — hover for win rate + P&L">
+          {swingExits.map((e) => {
+            const meta = EXIT_META[e.reason] ?? { label: e.reason, cls: 'bg-secondary text-muted-foreground' }
+            return (
+              <span
+                key={e.reason}
+                title={`${meta.label}: ${e.wins}/${e.n} win · pnl ${e.pnl >= 0 ? '+' : ''}$${e.pnl.toFixed(2)}`}
+                className={cn('rounded px-1.5 py-0.5 text-[0.6rem] font-semibold tabular-nums', meta.cls)}
+              >
+                {meta.label} {e.n}
+              </span>
+            )
+          })}
         </div>
       )}
     </div>

@@ -14,10 +14,13 @@ import { ChainlinkStream } from './sources/chainlink'
 import { fetchCurrentMarket } from './sources/gamma'
 import { predict, type Prediction } from './engine/predict'
 import { decideEntry } from './engine/strategy'
-import { dryExecutor, makeLiveExecutor } from './engine/executor'
+import { decideSwingEntry, decideExit, deriveBook, bidForSide, type MidPoint } from './engine/swing'
+import { takerFee } from './engine/fees'
+import { dryExecutor, makeLiveExecutor, type SellOrder } from './engine/executor'
 import { maxOrderCost, tradingEnabled } from './engine/guards'
 import { startControlServer, type BotMode } from './control'
 import { VOL_LOOKBACK_MS } from '../src/lib/fairValue'
+import { marketWindowKey } from '../src/lib/marketScope'
 import { chainlinkPair } from '../src/lib/cryptoPrice'
 import type { CoinId, ParsedMarket, TimeframeId } from '../src/lib/types'
 
@@ -84,12 +87,22 @@ async function main(): Promise<void> {
 
   const lastSample = new Map<string, number>()
   const tracked = new Map<string, TrackedWindow>()
+  // Swing state: recent mids per window (swing detection), per-window re-entry
+  // cooldown, and in-flight guards so an async buy/sell can't double-fire.
+  const midHistory = new Map<string, MidPoint[]>()
+  const swingCooldown = new Map<string, number>()
+  const enteringSwing = new Set<string>()
+  const exitingTrades = new Set<number>()
 
+  const strategyBrief =
+    config.strategy === 'swing'
+      ? `swing · move≥${config.swingMovePts}/${config.swingWindowSec}s · edge≥${config.swingEdgeMin} · ` +
+        `TP ${config.swingTakeProfitPts}/SL ${config.swingStopLossPts} · timeStop ${config.swingTimeStopSec}s · ` +
+        `fee ${config.feeRate}${config.feeSell ? '+sell' : ''}`
+      : `value · entry ~T-${config.entryAtSec}s · edge≥${config.edgeThreshold}`
   log(
     `${mode} up · db=${config.dbPath} · scopes=${scopes.map((s) => `${s.coin}/${s.timeframe}`).join(',')}` +
-      (mode !== 'record'
-        ? ` · entry ~T-${config.entryAtSec}s · edge≥${config.edgeThreshold} · $${config.stakeUsd}`
-        : ''),
+      (mode !== 'record' ? ` · ${strategyBrief} · $${config.stakeUsd}` : ''),
   )
 
   // --- LIVE arming: every guard must pass; returns an error instead of exiting
@@ -149,17 +162,23 @@ async function main(): Promise<void> {
     )
   }
 
-  // Entry: once per window, late (~T-10s), on a confident non-panic edge. Dry
-  // paper-fills; live places a real FAK BUY. `bot/STOP` halts new entries.
+  // Shared entry gate: halted flag or a `bot/STOP` file suspends all new entries.
   let stopLoggedAt = 0
-  async function maybeTrade(pred: Prediction, market: ParsedMarket, now: number): Promise<void> {
+  function entriesHalted(now: number): boolean {
     if (halted || existsSync(STOP_FILE)) {
       if (existsSync(STOP_FILE) && now - stopLoggedAt > 60_000) {
         stopLoggedAt = now
         log('STOP file present — entries halted')
       }
-      return
+      return true
     }
+    return false
+  }
+
+  // Value entry: once per window, late (~T-10s), on a confident non-panic edge.
+  // Dry paper-fills; live places a real FAK BUY. Held to settlement.
+  async function maybeTrade(pred: Prediction, market: ParsedMarket, now: number): Promise<void> {
+    if (entriesHalted(now)) return
     if (entered.has(pred.windowKey) || db.tradeExists(pred.windowKey)) return
     if (db.countOpenTrades() >= config.maxConcurrent) return
     if (db.countTradesSince(now - 86_400_000) >= config.maxDailyTrades) return
@@ -188,11 +207,13 @@ async function main(): Promise<void> {
       coin: pred.coin,
       timeframe: pred.timeframe,
       mode,
+      strategy: 'value',
       side: order.side,
       entryT: now,
       entryPrice: fill.fillPrice,
       size: fill.fillSize,
       cost,
+      entryFee: 0,
       signalEdge: pred.edge,
       regimeEntry: pred.regime,
       status: 'open',
@@ -206,6 +227,116 @@ async function main(): Promise<void> {
     )
   }
 
+  // --- Swing scalp: record the mid, manage open exits, then consider an entry. ---
+  function recordMid(pred: Prediction, now: number): void {
+    const hist = midHistory.get(pred.windowKey) ?? []
+    hist.push({ t: now, mid: pred.marketP })
+    // Keep a little more than the detection lookback.
+    const cutoff = now - (config.swingWindowSec + 10) * 1_000
+    while (hist.length && hist[0].t < cutoff) hist.shift()
+    midHistory.set(pred.windowKey, hist)
+  }
+
+  async function swingExit(pred: Prediction, market: ParsedMarket, now: number): Promise<void> {
+    for (const pos of db.openTradesForWindow(pred.windowKey)) {
+      if (pos.strategy !== 'swing' || exitingTrades.has(pos.id)) continue
+      const exit = decideExit(pos, pred, market, config, now)
+      if (!exit) continue
+      const tokenId = pos.side === 'up' ? market.upTokenId : market.downTokenId
+      if (!tokenId) continue
+      const sellOrder: SellOrder = {
+        side: pos.side,
+        tokenId,
+        size: pos.size,
+        sellPrice: exit.mark,
+        tickSize: market.tickSize,
+        negRisk: market.negRisk,
+      }
+      exitingTrades.add(pos.id)
+      let fill
+      try {
+        fill = await executor.sell(sellOrder)
+      } catch (e) {
+        exitingTrades.delete(pos.id)
+        log(`${mode.toUpperCase()} SELL FAILED #${pos.id} ${pos.side} — ${e instanceof Error ? e.message : String(e)}`)
+        continue
+      }
+      exitingTrades.delete(pos.id)
+      if (!(fill.fillSize > 0 && fill.fillPrice > 0)) {
+        log(`${mode.toUpperCase()} SELL NO FILL #${pos.id} ${pos.side} (book empty / rejected)`)
+        continue
+      }
+      const exitFee = config.feeSell ? takerFee(fill.fillPrice, fill.fillSize, config.feeRate) : 0
+      const payout = fill.fillPrice * fill.fillSize - exitFee
+      const pnl = payout - pos.cost
+      db.closeTrade({ id: pos.id, exitT: now, exitPrice: fill.fillPrice, exitReason: exit.reason, exitFee, payout, pnl })
+      swingCooldown.set(pred.windowKey, now)
+      stats.settled += 1
+      log(
+        `${mode.toUpperCase()} EXIT ${exit.reason} ${pred.coin}/${pred.timeframe} ${pos.side} @ ${fill.fillPrice.toFixed(3)} · ` +
+          `pnl ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(3)} · ${Math.round((market.endDate.getTime() - now) / 1000)}s left`,
+      )
+    }
+  }
+
+  async function swingEnter(pred: Prediction, market: ParsedMarket, now: number): Promise<void> {
+    if (entriesHalted(now)) return
+    if (enteringSwing.has(pred.windowKey)) return
+    // One open swing position per window at a time; cooldown after a close.
+    if (db.openTradesForWindow(pred.windowKey).some((t) => t.strategy === 'swing')) return
+    if (now - (swingCooldown.get(pred.windowKey) ?? 0) < config.swingCooldownSec * 1_000) return
+    if (db.countOpenTrades() >= config.maxConcurrent) return
+    if (db.countTradesSince(now - 86_400_000) >= config.maxDailyTrades) return
+    const order = decideSwingEntry(pred, market, midHistory.get(pred.windowKey) ?? [], config, now)
+    if (!order) return
+
+    enteringSwing.add(pred.windowKey)
+    let fill
+    try {
+      fill = await executor.buy(order)
+    } catch (e) {
+      enteringSwing.delete(pred.windowKey)
+      log(`${mode.toUpperCase()} ORDER FAILED ${pred.coin}/${pred.timeframe} ${order.side} — ${e instanceof Error ? e.message : String(e)}`)
+      return
+    }
+    enteringSwing.delete(pred.windowKey)
+    if (!(fill.fillSize > 0 && fill.fillPrice > 0)) {
+      log(`${mode.toUpperCase()} NO FILL ${pred.coin}/${pred.timeframe} ${order.side} (book empty / rejected)`)
+      return
+    }
+    const entryFee = takerFee(fill.fillPrice, fill.fillSize, config.feeRate)
+    const cost = fill.fillPrice * fill.fillSize + entryFee
+    db.insertTrade({
+      windowKey: pred.windowKey,
+      coin: pred.coin,
+      timeframe: pred.timeframe,
+      mode,
+      strategy: 'swing',
+      side: order.side,
+      entryT: now,
+      entryPrice: fill.fillPrice,
+      size: fill.fillSize,
+      cost,
+      entryFee,
+      signalEdge: pred.edge,
+      regimeEntry: pred.regime,
+      status: 'open',
+      orderId: fill.orderId,
+    })
+    stats.trades += 1
+    log(
+      `${mode.toUpperCase()} ENTER swing ${pred.coin}/${pred.timeframe} ${order.side} @ ${fill.fillPrice.toFixed(3)} · ` +
+        `size ${fill.fillSize.toFixed(1)} · cost $${cost.toFixed(2)} · edge ${pred.edge.toFixed(3)} · ${pred.regime} · ` +
+        `${Math.round((market.endDate.getTime() - now) / 1000)}s left`,
+    )
+  }
+
+  // Manage exits before entries so a stop/take-profit frees the per-window slot.
+  async function manageSwing(pred: Prediction, market: ParsedMarket, now: number): Promise<void> {
+    await swingExit(pred, market, now)
+    await swingEnter(pred, market, now)
+  }
+
   function settleTrades(now: number): void {
     for (const s of db.pendingSettlements()) {
       const won = s.side === s.outcome
@@ -215,6 +346,39 @@ async function main(): Promise<void> {
       stats.settled += 1
       log(`${mode.toUpperCase()} SETTLE ${s.side} ${won ? 'WIN ' : 'loss'} · pnl ${pnl >= 0 ? '+' : ''}${pnl.toFixed(3)}`)
     }
+  }
+
+  // Open positions enriched with the live mark (current bid for the held side) so
+  // the dashboard monitor can show unrealized P&L and time left in the window.
+  function openPositions(): {
+    coin: string
+    timeframe: string
+    side: 'up' | 'down'
+    strategy: string
+    entryPrice: number
+    size: number
+    mark: number | null
+    unrealizedPnl: number | null
+    msRemaining: number | null
+  }[] {
+    const now = Date.now()
+    const live = new Map<string, ParsedMarket>()
+    for (const s of scopes) if (s.market) live.set(marketWindowKey(s.market), s.market)
+    return db.openTrades().map((t) => {
+      const market = live.get(t.windowKey) ?? null
+      const mark = market ? bidForSide(deriveBook(market), t.side) : null
+      return {
+        coin: t.coin,
+        timeframe: t.timeframe,
+        side: t.side,
+        strategy: t.strategy,
+        entryPrice: t.entryPrice,
+        size: t.size,
+        mark,
+        unrealizedPnl: mark != null ? mark * t.size - t.cost : null,
+        msRemaining: market ? market.endDate.getTime() - now : null,
+      }
+    })
   }
 
   function refreshMarket(state: ScopeState, now: number): void {
@@ -261,8 +425,15 @@ async function main(): Promise<void> {
       })
     }
 
-    // Trade every tick (not throttled) so the late T-10s entry lands on time.
-    if (mode !== 'record') void maybeTrade(pred, market, now)
+    // Trade every tick (not throttled) so entries/exits land on time.
+    if (mode !== 'record') {
+      if (config.strategy === 'swing') {
+        recordMid(pred, now)
+        void manageSwing(pred, market, now)
+      } else {
+        void maybeTrade(pred, market, now)
+      }
+    }
 
     if (now - (lastSample.get(pred.windowKey) ?? 0) < config.sampleMs) return
     lastSample.set(pred.windowKey, now)
@@ -287,11 +458,18 @@ async function main(): Promise<void> {
     stats.predictions += 1
   }
 
+  // Drop a finished window from all in-memory per-window state.
+  const forget = (windowKey: string): void => {
+    tracked.delete(windowKey)
+    midHistory.delete(windowKey)
+    swingCooldown.delete(windowKey)
+  }
+
   function sweepOutcomes(now: number): void {
     for (const [windowKey, w] of tracked) {
       if (now <= w.endMs + 2_000) continue
       if (db.hasOutcome(windowKey)) {
-        tracked.delete(windowKey)
+        forget(windowKey)
         continue
       }
       const finalPrice = stream.firstPriceAtOrAfter(w.pair, w.endMs, OUTCOME_SLOP_MS)
@@ -307,9 +485,9 @@ async function main(): Promise<void> {
           recordedAt: now,
         })
         stats.outcomes += 1
-        tracked.delete(windowKey)
+        forget(windowKey)
       } else if (now > w.endMs + OUTCOME_GIVEUP_MS) {
-        tracked.delete(windowKey) // boundary tick never arrived
+        forget(windowKey) // boundary tick never arrived
       }
     }
   }
@@ -322,6 +500,7 @@ async function main(): Promise<void> {
           {
             getStatus: () => ({
               mode,
+              strategy: config.strategy,
               allowLive,
               halted,
               connected: stream.connected,
@@ -335,6 +514,9 @@ async function main(): Promise<void> {
                 settled: stats.settled,
               },
               summary: db.tradeSummary(),
+              swingExits: config.strategy === 'swing' ? db.swingExits() : [],
+              openPositions: openPositions(),
+              recentClosed: db.recentClosed(8),
             }),
             setMode,
             setHalted,

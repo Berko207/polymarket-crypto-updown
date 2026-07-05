@@ -8,6 +8,8 @@ export type BotMode = 'record' | 'dry' | 'live'
 
 export interface BotStatus {
   mode: BotMode
+  /** Optional so a bot predating the swing strategy still renders (defaults to value). */
+  strategy?: 'value' | 'swing'
   allowLive: boolean
   halted: boolean
   connected: boolean
@@ -15,6 +17,30 @@ export interface BotStatus {
   liveScopes: number
   stats: { ticks: number; predictions: number; outcomes: number; trades: number; settled: number }
   summary: { entered: number; settled: number; open: number; wins: number; staked: number; pnl: number }
+  swingExits?: { reason: string; n: number; wins: number; pnl: number }[]
+  openPositions?: {
+    coin: string
+    timeframe: string
+    side: 'up' | 'down'
+    strategy: string
+    entryPrice: number
+    size: number
+    mark: number | null
+    unrealizedPnl: number | null
+    msRemaining: number | null
+  }[]
+  recentClosed?: {
+    coin: string
+    timeframe: string
+    side: 'up' | 'down'
+    strategy: string
+    entryPrice: number
+    exitPrice: number | null
+    exitReason: string | null
+    pnl: number
+    settleT: number
+    status: string
+  }[]
 }
 
 const BASE =

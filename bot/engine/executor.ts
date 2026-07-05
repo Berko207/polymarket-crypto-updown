@@ -11,20 +11,41 @@ export interface Fill {
   orderId: string | null
 }
 
+/** Close (all or part) of an open position — the swing scalp's auto-sell. */
+export interface SellOrder {
+  side: 'up' | 'down'
+  tokenId: string
+  size: number
+  /** Best bid for the side: the paper fill and the live FAK floor hint. */
+  sellPrice: number
+  tickSize: number | null
+  negRisk: boolean | null
+}
+
 export interface Executor {
   buy(order: Order): Promise<Fill>
+  sell(order: SellOrder): Promise<Fill>
 }
 
 /**
- * Paper fill: a market FAK takes the resting ask in a normal book, so the paper
- * fill accepts the strategy's book price at face value. No network, no signing.
- * (Optimistic on thin books — the live executor records the realized fill.)
+ * Paper fills. A market FAK BUY takes the resting ask and a market FAK SELL hits
+ * the resting bid, so the paper fill accepts the strategy's book price at face
+ * value — buy-at-ask / sell-at-bid means paper P&L pays the real spread. No
+ * network, no signing. (Optimistic on thin books — the live executor records the
+ * realized fill.)
  */
 export const dryExecutor: Executor = {
   buy(order) {
     return Promise.resolve({
       fillPrice: order.fillPrice,
       fillSize: order.stakeUsd / order.fillPrice,
+      orderId: null,
+    })
+  },
+  sell(order) {
+    return Promise.resolve({
+      fillPrice: order.sellPrice,
+      fillSize: order.size,
       orderId: null,
     })
   },
@@ -38,14 +59,33 @@ export const dryExecutor: Executor = {
  */
 export function makeLiveExecutor(): Executor {
   let place: typeof import('../../api/_lib/clob').placeMarketOrder | null = null
+  const load = async (): Promise<typeof import('../../api/_lib/clob').placeMarketOrder> => {
+    if (!place) place = (await import('../../api/_lib/clob')).placeMarketOrder
+    return place
+  }
   return {
     async buy(order) {
-      if (!place) place = (await import('../../api/_lib/clob')).placeMarketOrder
-      const res = await place({
+      const res = await (await load())({
         tokenId: order.tokenId,
         side: 'BUY',
         amount: order.stakeUsd,
         price: order.fillPrice,
+        orderType: 'market',
+        tickSize: order.tickSize ?? undefined,
+        negRisk: order.negRisk ?? undefined,
+      })
+      const status = (res.status ?? '').toLowerCase()
+      if (!res.success || status === 'unmatched' || !res.fillSize || !res.fillPrice) {
+        return { fillPrice: 0, fillSize: 0, orderId: res.orderId ?? null }
+      }
+      return { fillPrice: res.fillPrice, fillSize: res.fillSize, orderId: res.orderId ?? null }
+    },
+    async sell(order) {
+      const res = await (await load())({
+        tokenId: order.tokenId,
+        side: 'SELL',
+        size: order.size,
+        price: order.sellPrice,
         orderType: 'market',
         tickSize: order.tickSize ?? undefined,
         negRisk: order.negRisk ?? undefined,
