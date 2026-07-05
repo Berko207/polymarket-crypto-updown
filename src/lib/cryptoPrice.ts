@@ -1,7 +1,7 @@
 import { getCoin } from './config'
 import type { CoinId, ParsedMarket } from './types'
 
-/** RTDS Chainlink symbols (doge/bnb verified streaming — probe RTDS before removing). */
+/** RTDS Chainlink symbols — all six coins stream on crypto_prices_chainlink (verified 2026-07). */
 export const CHAINLINK_PAIR: Partial<Record<CoinId, string>> = {
   btc: 'btc/usd',
   eth: 'eth/usd',
