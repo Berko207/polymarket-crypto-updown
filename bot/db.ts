@@ -139,6 +139,8 @@ export interface BotDb {
   pendingSettlements(): { id: number; side: 'up' | 'down'; size: number; cost: number; outcome: 'up' | 'down' }[]
   /** Aggregate paper/live trade P&L for the status endpoint. */
   tradeSummary(): { entered: number; settled: number; open: number; wins: number; staked: number; pnl: number }
+  /** Closed swing trades grouped by exit reason — the scalp's health readout. */
+  swingExits(): { reason: string; n: number; wins: number; pnl: number }[]
   close(): void
 }
 
@@ -221,6 +223,17 @@ export function openDb(path: string, readonly = false): BotDb {
       COALESCE(SUM(CASE WHEN status IN ('settled','closed') THEN pnl ELSE 0 END), 0) AS pnl
     FROM trades
   `)
+  const swingExitsStmt = raw.prepare(`
+    SELECT
+      COALESCE(exit_reason, '—') AS reason,
+      COUNT(*) AS n,
+      COALESCE(SUM(CASE WHEN pnl>0 THEN 1 ELSE 0 END), 0) AS wins,
+      COALESCE(SUM(pnl), 0) AS pnl
+    FROM trades
+    WHERE status='closed' AND strategy='swing'
+    GROUP BY exit_reason
+    ORDER BY n DESC
+  `)
 
   return {
     raw,
@@ -246,6 +259,8 @@ export function openDb(path: string, readonly = false): BotDb {
         staked: number
         pnl: number
       },
+    swingExits: () =>
+      swingExitsStmt.all() as { reason: string; n: number; wins: number; pnl: number }[],
     close: () => raw.close(),
   }
 }

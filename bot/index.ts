@@ -466,6 +466,7 @@ async function main(): Promise<void> {
           {
             getStatus: () => ({
               mode,
+              strategy: config.strategy,
               allowLive,
               halted,
               connected: stream.connected,
@@ -479,6 +480,7 @@ async function main(): Promise<void> {
                 settled: stats.settled,
               },
               summary: db.tradeSummary(),
+              swingExits: config.strategy === 'swing' ? db.swingExits() : [],
             }),
             setMode,
             setHalted,
