@@ -81,9 +81,10 @@ async function main(): Promise<void> {
   const stream = new ChainlinkStream()
 
   const stats = { ticks: 0, predictions: 0, outcomes: 0, trades: 0, settled: 0 }
-  /** Windows we've already entered this session — sync guard against the async
-   * entry double-firing across ticks (DB tradeExists guards across restarts). */
+  /** Windows successfully entered this session (DB tradeExists guards restarts). */
   const entered = new Set<string>()
+  /** In-flight value-entry guard — mirrors enteringSwing so a slow buy can't double-fire. */
+  const enteringValue = new Set<string>()
   /** dry paper executor by default; arming live swaps in the real one. */
   let executor = dryExecutor
   const STOP_FILE = resolve(process.cwd(), 'bot/STOP')
@@ -276,30 +277,39 @@ async function main(): Promise<void> {
   }
 
   // Value entry: once per window, late (~T-10s), on a confident non-panic edge.
-  // Dry paper-fills; live places a real FAK BUY. Held to settlement.
+  // Dry paper-fills; live places a real FAK BUY. Held to settlement. Retries each
+  // tick while the entry window and signal still qualify; gives up when decideEntry
+  // returns null (window closed / edge gone) or after a successful fill.
   async function maybeTrade(pred: Prediction, market: ParsedMarket, now: number): Promise<void> {
     if (entriesHalted(now)) return
     if (entered.has(pred.windowKey) || db.tradeExists(pred.windowKey)) return
+    if (enteringValue.has(pred.windowKey)) return
     if (db.countOpenTrades() >= config.maxConcurrent) return
     if (dailyCapReached(now)) return
     const order = decideEntry(pred, market, config, now)
     if (!order) return
-    entered.add(pred.windowKey) // claim before the await so the next tick can't double-enter
 
+    enteringValue.add(pred.windowKey)
     let fill
     try {
       fill = await executor.buy(order)
     } catch (e) {
+      enteringValue.delete(pred.windowKey)
       log(
         `${mode.toUpperCase()} ORDER FAILED ${pred.coin}/${pred.timeframe} ${order.side} — ` +
-          (e instanceof Error ? e.message : String(e)),
+          `${e instanceof Error ? e.message : String(e)} (will retry)`,
       )
       return
     }
+    enteringValue.delete(pred.windowKey)
     if (!(fill.fillSize > 0 && fill.fillPrice > 0)) {
-      log(`${mode.toUpperCase()} NO FILL ${pred.coin}/${pred.timeframe} ${order.side} (book empty / rejected)`)
+      log(
+        `${mode.toUpperCase()} NO FILL ${pred.coin}/${pred.timeframe} ${order.side} ` +
+          `(book empty / rejected — will retry while entry window open)`,
+      )
       return
     }
+    entered.add(pred.windowKey)
 
     const cost = fill.fillPrice * fill.fillSize
     db.insertTrade({
@@ -358,12 +368,15 @@ async function main(): Promise<void> {
         fill = await executor.sell(sellOrder)
       } catch (e) {
         exitingTrades.delete(pos.id)
-        log(`${mode.toUpperCase()} SELL FAILED #${pos.id} ${pos.side} — ${e instanceof Error ? e.message : String(e)}`)
+        log(
+          `${mode.toUpperCase()} SELL FAILED #${pos.id} ${pos.side} — ` +
+            `${e instanceof Error ? e.message : String(e)} (will retry)`,
+        )
         continue
       }
       exitingTrades.delete(pos.id)
       if (!(fill.fillSize > 0 && fill.fillPrice > 0)) {
-        log(`${mode.toUpperCase()} SELL NO FILL #${pos.id} ${pos.side} (book empty / rejected)`)
+        // Unmatched — empty/thin book. Retry next tick while exit conditions hold.
         continue
       }
       const exitFee = config.feeSell ? takerFee(fill.fillPrice, fill.fillSize, config.feeRate) : 0
@@ -396,12 +409,15 @@ async function main(): Promise<void> {
       fill = await executor.buy(order)
     } catch (e) {
       enteringSwing.delete(pred.windowKey)
-      log(`${mode.toUpperCase()} ORDER FAILED ${pred.coin}/${pred.timeframe} ${order.side} — ${e instanceof Error ? e.message : String(e)}`)
+      log(
+        `${mode.toUpperCase()} ORDER FAILED ${pred.coin}/${pred.timeframe} ${order.side} — ` +
+          `${e instanceof Error ? e.message : String(e)} (will retry)`,
+      )
       return
     }
     enteringSwing.delete(pred.windowKey)
     if (!(fill.fillSize > 0 && fill.fillPrice > 0)) {
-      log(`${mode.toUpperCase()} NO FILL ${pred.coin}/${pred.timeframe} ${order.side} (book empty / rejected)`)
+      // Retries next tick while decideSwingEntry still qualifies (edge/move/band).
       return
     }
     const entryFee = takerFee(fill.fillPrice, fill.fillSize, config.feeRate)
