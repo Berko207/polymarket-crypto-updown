@@ -173,6 +173,10 @@ export interface BotDb {
   openTrades(): OpenTradeRow[]
   /** Most-recent finished trades, newest first (activity feed). */
   recentClosed(limit: number): ClosedTradeRow[]
+  /** Last recorded strike for a window (from predictions), for outcome sweeps after restart. */
+  windowStrike(windowKey: string): number | null
+  /** First persisted tick at/after a boundary, within slop (survives bot restarts). */
+  tickAtOrAfter(symbol: string, boundaryMs: number, maxSlopMs: number): number | null
   close(): void
 }
 
@@ -278,6 +282,12 @@ export function openDb(path: string, readonly = false): BotDb {
     FROM trades WHERE status IN ('settled','closed')
     ORDER BY settle_t DESC LIMIT ?
   `)
+  const windowStrikeStmt = raw.prepare(
+    'SELECT strike FROM predictions WHERE window_key = ? ORDER BY t DESC LIMIT 1',
+  )
+  const tickAtOrAfterStmt = raw.prepare(
+    'SELECT value FROM ticks WHERE symbol = ? AND ts >= ? AND ts <= ? ORDER BY ts ASC LIMIT 1',
+  )
 
   return {
     raw,
@@ -307,6 +317,11 @@ export function openDb(path: string, readonly = false): BotDb {
       swingExitsStmt.all() as { reason: string; n: number; wins: number; pnl: number }[],
     openTrades: () => openTradesStmt.all() as OpenTradeRow[],
     recentClosed: (limit) => recentClosedStmt.all(limit) as ClosedTradeRow[],
+    windowStrike: (windowKey) =>
+      (windowStrikeStmt.get(windowKey) as { strike: number } | undefined)?.strike ?? null,
+    tickAtOrAfter: (symbol, boundaryMs, maxSlopMs) =>
+      (tickAtOrAfterStmt.get(symbol, boundaryMs, boundaryMs + maxSlopMs) as { value: number } | undefined)
+        ?.value ?? null,
     close: () => raw.close(),
   }
 }

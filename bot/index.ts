@@ -20,7 +20,7 @@ import { dryExecutor, makeLiveExecutor, type SellOrder } from './engine/executor
 import { maxOrderCost, tradingEnabled } from './engine/guards'
 import { startControlServer, type BotMode } from './control'
 import { VOL_LOOKBACK_MS } from '../src/lib/fairValue'
-import { marketWindowKey } from '../src/lib/marketScope'
+import { marketWindowKey, windowEndMsFromKey } from '../src/lib/marketScope'
 import { chainlinkPair } from '../src/lib/cryptoPrice'
 import type { CoinId, ParsedMarket, TimeframeId } from '../src/lib/types'
 
@@ -385,6 +385,7 @@ async function main(): Promise<void> {
     return db.openTrades().map((t) => {
       const market = live.get(t.windowKey) ?? null
       const mark = market ? bidForSide(deriveBook(market), t.side) : null
+      const endMs = market?.endDate.getTime() ?? windowEndMsFromKey(t.windowKey)
       return {
         coin: t.coin,
         timeframe: t.timeframe,
@@ -394,7 +395,7 @@ async function main(): Promise<void> {
         size: t.size,
         mark,
         unrealizedPnl: mark != null ? mark * t.size - t.cost : null,
-        msRemaining: market ? market.endDate.getTime() - now : null,
+        msRemaining: endMs != null ? endMs - now : null,
       }
     })
   }
@@ -490,6 +491,27 @@ async function main(): Promise<void> {
     swingCooldown.delete(windowKey)
   }
 
+  // After a restart, in-memory `tracked` is empty — re-seed from open trades so
+  // sweepOutcomes can still record outcomes and settleTrades can close orphans.
+  function seedTrackedFromOpen(): void {
+    for (const t of db.openTrades()) {
+      if (tracked.has(t.windowKey)) continue
+      const endMs = windowEndMsFromKey(t.windowKey)
+      if (endMs == null) continue
+      const pair = chainlinkPair(t.coin as CoinId)
+      if (!pair) continue
+      const strike = db.windowStrike(t.windowKey)
+      if (strike == null) continue
+      tracked.set(t.windowKey, {
+        pair,
+        coin: t.coin,
+        timeframe: t.timeframe,
+        strike,
+        endMs,
+      })
+    }
+  }
+
   function sweepOutcomes(now: number): void {
     for (const [windowKey, w] of tracked) {
       if (now <= w.endMs + 2_000) continue
@@ -497,7 +519,9 @@ async function main(): Promise<void> {
         forget(windowKey)
         continue
       }
-      const finalPrice = stream.firstPriceAtOrAfter(w.pair, w.endMs, OUTCOME_SLOP_MS)
+      let finalPrice =
+        stream.firstPriceAtOrAfter(w.pair, w.endMs, OUTCOME_SLOP_MS) ??
+        db.tickAtOrAfter(w.pair, w.endMs, OUTCOME_SLOP_MS)
       if (finalPrice != null) {
         db.upsertOutcome({
           windowKey,
@@ -555,6 +579,8 @@ async function main(): Promise<void> {
           log,
         )
 
+  seedTrackedFromOpen()
+
   let lastStatus = 0
   const timer = setInterval(() => {
     const now = Date.now()
@@ -562,6 +588,7 @@ async function main(): Promise<void> {
       refreshMarket(state, now)
       sampleScope(state, now)
     }
+    seedTrackedFromOpen()
     sweepOutcomes(now)
     if (mode !== 'record') settleTrades(now)
 
