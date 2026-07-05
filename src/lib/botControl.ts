@@ -19,6 +19,9 @@ export interface BotStatus {
   liveScopes: number
   stats: { ticks: number; predictions: number; outcomes: number; trades: number; settled: number }
   summary: { entered: number; settled: number; open: number; wins: number; staked: number; pnl: number }
+  /** Entries in the rolling 24h window; optional for older bot builds. */
+  dailyTrades?: number
+  maxDailyTrades?: number
   swingExits?: { reason: string; n: number; wins: number; pnl: number }[]
   swingTrigger?: 'edge' | 'move'
   swingSource?: 'flat' | 'regime' | 'blend'

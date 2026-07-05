@@ -44,6 +44,8 @@ interface TrackedWindow {
 const STATUS_MS = 30_000
 const OUTCOME_SLOP_MS = 120_000
 const OUTCOME_GIVEUP_MS = 150_000
+/** Live-only fallback when BOT_MAX_DAILY_TRADES is unset/0 — paper has no cap. */
+const LIVE_DEFAULT_DAILY_CAP = 50
 
 function log(...args: unknown[]): void {
   console.info(new Date().toISOString(), ...args)
@@ -174,7 +176,7 @@ async function main(): Promise<void> {
     }
     log(
       `⚠ LIVE ARMED · balance $${r.balance?.toFixed(2)} · stake $${config.stakeUsd} · ` +
-        `max/order $${maxOrderCost()} · maxDaily ${config.maxDailyTrades} · maxOpen ${config.maxConcurrent} · ` +
+        `max/order $${maxOrderCost()} · maxDaily ${effectiveDailyCap() || '∞'} · maxOpen ${config.maxConcurrent} · ` +
         `create ${STOP_FILE} to halt entries`,
     )
   }
@@ -192,13 +194,25 @@ async function main(): Promise<void> {
     return false
   }
 
+  /** 0 = unlimited (paper/record); live uses LIVE_DEFAULT_DAILY_CAP when unset. */
+  function effectiveDailyCap(): number {
+    if (config.maxDailyTrades > 0) return config.maxDailyTrades
+    return mode === 'live' ? LIVE_DEFAULT_DAILY_CAP : 0
+  }
+
+  function dailyCapReached(now: number): boolean {
+    const cap = effectiveDailyCap()
+    if (cap <= 0) return false
+    return db.countTradesSince(now - 86_400_000) >= cap
+  }
+
   // Value entry: once per window, late (~T-10s), on a confident non-panic edge.
   // Dry paper-fills; live places a real FAK BUY. Held to settlement.
   async function maybeTrade(pred: Prediction, market: ParsedMarket, now: number): Promise<void> {
     if (entriesHalted(now)) return
     if (entered.has(pred.windowKey) || db.tradeExists(pred.windowKey)) return
     if (db.countOpenTrades() >= config.maxConcurrent) return
-    if (db.countTradesSince(now - 86_400_000) >= config.maxDailyTrades) return
+    if (dailyCapReached(now)) return
     const order = decideEntry(pred, market, config, now)
     if (!order) return
     entered.add(pred.windowKey) // claim before the await so the next tick can't double-enter
@@ -303,7 +317,7 @@ async function main(): Promise<void> {
     if (db.openTradesForWindow(pred.windowKey).some((t) => t.strategy === 'swing')) return
     if (now - (swingCooldown.get(pred.windowKey) ?? 0) < config.swingCooldownSec * 1_000) return
     if (db.countOpenTrades() >= config.maxConcurrent) return
-    if (db.countTradesSince(now - 86_400_000) >= config.maxDailyTrades) return
+    if (dailyCapReached(now)) return
     const order = decideSwingEntry(pred, market, midHistory.get(pred.windowKey) ?? [], config, now)
     if (!order) return
 
@@ -564,6 +578,8 @@ async function main(): Promise<void> {
                 settled: stats.settled,
               },
               summary: db.tradeSummary(),
+              dailyTrades: db.countTradesSince(Date.now() - 86_400_000),
+              maxDailyTrades: effectiveDailyCap(),
               swingExits: config.strategy === 'swing' ? db.swingExits() : [],
               swingTrigger: config.swingTrigger,
               swingSource: config.signalSource,
@@ -595,11 +611,15 @@ async function main(): Promise<void> {
     if (now - lastStatus >= STATUS_MS) {
       lastStatus = now
       const live = scopes.filter((s) => s.market).length
+      const dailyTrades = db.countTradesSince(now - 86_400_000)
+      const cap = effectiveDailyCap()
+      const dailyCap = mode !== 'record' && cap > 0 && dailyTrades >= cap
       log(
         `[${mode}] ws=${stream.connected ? 'up' : 'down'} · live=${live}/${scopes.length} · ` +
           `ticks=${stats.ticks} preds=${stats.predictions} outcomes=${stats.outcomes}` +
           (mode !== 'record'
-            ? ` · trades=${stats.trades} settled=${stats.settled} open=${db.countOpenTrades()}`
+            ? ` · trades=${stats.trades} settled=${stats.settled} open=${db.countOpenTrades()}` +
+              ` · daily ${dailyTrades}/${cap || '∞'}${dailyCap ? ' CAP' : ''}`
             : '') +
           ` · pending=${tracked.size}`,
       )

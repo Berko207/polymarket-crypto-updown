@@ -21,6 +21,9 @@ export interface BotStatus {
   liveScopes: number
   stats: { ticks: number; predictions: number; outcomes: number; trades: number; settled: number }
   summary: { entered: number; settled: number; open: number; wins: number; staked: number; pnl: number }
+  /** Entries in the rolling 24h window vs the cap — when equal, new entries are blocked. */
+  dailyTrades: number
+  maxDailyTrades: number
   /** Closed swing trades by exit reason (empty for the value strategy). */
   swingExits: { reason: string; n: number; wins: number; pnl: number }[]
   /** Active swing entry trigger + fair-value source (swing strategy only). */

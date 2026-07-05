@@ -71,6 +71,11 @@ export function BotControlPanel() {
   const hit = s && s.summary.settled > 0 ? (s.summary.wins / s.summary.settled) * 100 : null
   const strategy = s?.strategy ?? 'value'
   const swingExits = s?.swingExits ?? []
+  const dailyCap =
+    s?.dailyTrades != null &&
+    s.maxDailyTrades != null &&
+    s.maxDailyTrades > 0 &&
+    s.dailyTrades >= s.maxDailyTrades
 
   return (
     <div className="flex flex-col gap-3 rounded-xl border border-border bg-secondary/60 p-4">
@@ -199,6 +204,14 @@ export function BotControlPanel() {
       {!s && (
         <p className="text-center text-[0.7rem] text-muted-foreground">
           offline · run <code className="rounded bg-secondary px-1 py-0.5">pnpm bot:paper</code> to control the bot
+        </p>
+      )}
+
+      {dailyCap && (
+        <p className="rounded-lg bg-amber-500/15 px-3 py-1.5 text-center text-[0.7rem] font-semibold text-amber-300">
+          Daily cap reached ({s!.dailyTrades}/{s!.maxDailyTrades} entries in 24h) — no new trades until
+          older ones roll off, or restart with a higher{' '}
+          <code className="rounded bg-secondary px-1 py-0.5">BOT_MAX_DAILY_TRADES</code>
         </p>
       )}
 

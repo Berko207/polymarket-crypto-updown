@@ -49,6 +49,7 @@ export interface BotConfig {
   entryToleranceSec: number
   edgeThreshold: number
   stakeUsd: number
+  /** Max entries in a rolling 24h window; 0 = unlimited (paper default). Live falls back to 50. */
   maxDailyTrades: number
   maxConcurrent: number
   // --- swing scalp (strategy='swing') ---
@@ -89,10 +90,8 @@ export interface BotConfig {
 }
 
 const ALL_COINS = COINS.map((c) => c.id)
-/** Default bot universe — the coins the edge model was calibrated/forward-tested on.
- * doge/bnb DO stream on RTDS now, but stay opt-in (BOT_COINS=...,doge,bnb) so adding
- * a Chainlink pair for the dashboard can never silently widen live trading scope. */
-const DEFAULT_COINS: CoinId[] = ['btc', 'eth', 'sol', 'xrp']
+/** Default bot universe — all Chainlink-streamed up/down coins. Override with BOT_COINS. */
+const DEFAULT_COINS: CoinId[] = ['btc', 'eth', 'sol', 'xrp', 'doge', 'bnb']
 const KNOWN_TF: TimeframeId[] = ['5m', '15m', '1h', '4h', 'daily']
 
 function parseList<T extends string>(raw: string | undefined, valid: T[], fallback: T[]): T[] {
@@ -145,7 +144,7 @@ export function loadConfig(): BotConfig {
     entryToleranceSec: num(env.BOT_ENTRY_TOLERANCE_SEC, 4),
     edgeThreshold: num(env.BOT_EDGE_THRESHOLD, 0.05),
     stakeUsd: num(env.BOT_STAKE_USD, 1),
-    maxDailyTrades: num(env.BOT_MAX_DAILY_TRADES, 50),
+    maxDailyTrades: numNonNeg(env.BOT_MAX_DAILY_TRADES, 0),
     maxConcurrent: num(env.BOT_MAX_CONCURRENT, 5),
     swingMovePts: num(env.BOT_SWING_MOVE_PTS, 0.04),
     swingWindowSec: num(env.BOT_SWING_WINDOW_SEC, 20),
