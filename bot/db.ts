@@ -73,6 +73,34 @@ export interface OpenTrade {
   strategy: string
 }
 
+/** An open position, for the dashboard monitor (live unrealized P&L needs the mark). */
+export interface OpenTradeRow {
+  id: number
+  windowKey: string
+  coin: string
+  timeframe: string
+  side: 'up' | 'down'
+  size: number
+  cost: number
+  entryPrice: number
+  strategy: string
+  entryT: number
+}
+
+/** A finished trade for the monitor's activity feed. */
+export interface ClosedTradeRow {
+  coin: string
+  timeframe: string
+  side: 'up' | 'down'
+  strategy: string
+  entryPrice: number
+  exitPrice: number | null
+  exitReason: string | null
+  pnl: number
+  settleT: number
+  status: string
+}
+
 /** A mid-window close (swing auto-sell), as opposed to a hold-to-settle payout. */
 export interface TradeClose {
   id: number
@@ -141,6 +169,10 @@ export interface BotDb {
   tradeSummary(): { entered: number; settled: number; open: number; wins: number; staked: number; pnl: number }
   /** Closed swing trades grouped by exit reason — the scalp's health readout. */
   swingExits(): { reason: string; n: number; wins: number; pnl: number }[]
+  /** All currently-open positions (for the dashboard monitor). */
+  openTrades(): OpenTradeRow[]
+  /** Most-recent finished trades, newest first (activity feed). */
+  recentClosed(limit: number): ClosedTradeRow[]
   close(): void
 }
 
@@ -234,6 +266,18 @@ export function openDb(path: string, readonly = false): BotDb {
     GROUP BY exit_reason
     ORDER BY n DESC
   `)
+  const openTradesStmt = raw.prepare(`
+    SELECT id, window_key AS windowKey, coin, timeframe, side, size, cost,
+           entry_price AS entryPrice, strategy, entry_t AS entryT
+    FROM trades WHERE status='open' ORDER BY entry_t DESC
+  `)
+  const recentClosedStmt = raw.prepare(`
+    SELECT coin, timeframe, side, strategy, entry_price AS entryPrice,
+           exit_price AS exitPrice, exit_reason AS exitReason, pnl,
+           settle_t AS settleT, status
+    FROM trades WHERE status IN ('settled','closed')
+    ORDER BY settle_t DESC LIMIT ?
+  `)
 
   return {
     raw,
@@ -261,6 +305,8 @@ export function openDb(path: string, readonly = false): BotDb {
       },
     swingExits: () =>
       swingExitsStmt.all() as { reason: string; n: number; wins: number; pnl: number }[],
+    openTrades: () => openTradesStmt.all() as OpenTradeRow[],
+    recentClosed: (limit) => recentClosedStmt.all(limit) as ClosedTradeRow[],
     close: () => raw.close(),
   }
 }

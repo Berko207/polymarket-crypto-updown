@@ -1,6 +1,7 @@
 import { toast } from 'sonner'
 import { cn } from '@/lib/utils'
 import { useBotHalt, useBotMode, useBotStatus } from '@/queries/bot'
+import { EXIT_META } from '@/lib/botFormat'
 import type { BotMode } from '@/lib/botControl'
 
 // Record = observe/log only · Paper = simulated fills, no real money · Live =
@@ -12,15 +13,6 @@ const MODES: { id: BotMode; label: string }[] = [
 ]
 
 const modeLabel = (id: BotMode): string => MODES.find((m) => m.id === id)?.label ?? id
-
-// Swing exit reasons → short label + accent (green take-profit, red stop, amber panic).
-const EXIT_META: Record<string, { label: string; cls: string }> = {
-  'take-profit': { label: 'TP', cls: 'bg-up-soft text-up' },
-  'stop-loss': { label: 'Stop', cls: 'bg-down-soft text-down' },
-  'time-stop': { label: 'Time', cls: 'bg-secondary text-muted-foreground' },
-  'edge-gone': { label: 'Edge', cls: 'bg-secondary text-muted-foreground' },
-  'regime-panic': { label: 'Panic', cls: 'bg-amber-500/15 text-amber-300' },
-}
 
 /**
  * Bot execution-mode switch + live status for the local bot. Talks to the bot's

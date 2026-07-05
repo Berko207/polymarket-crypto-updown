@@ -14,12 +14,13 @@ import { ChainlinkStream } from './sources/chainlink'
 import { fetchCurrentMarket } from './sources/gamma'
 import { predict, type Prediction } from './engine/predict'
 import { decideEntry } from './engine/strategy'
-import { decideSwingEntry, decideExit, type MidPoint } from './engine/swing'
+import { decideSwingEntry, decideExit, deriveBook, bidForSide, type MidPoint } from './engine/swing'
 import { takerFee } from './engine/fees'
 import { dryExecutor, makeLiveExecutor, type SellOrder } from './engine/executor'
 import { maxOrderCost, tradingEnabled } from './engine/guards'
 import { startControlServer, type BotMode } from './control'
 import { VOL_LOOKBACK_MS } from '../src/lib/fairValue'
+import { marketWindowKey } from '../src/lib/marketScope'
 import { chainlinkPair } from '../src/lib/cryptoPrice'
 import type { CoinId, ParsedMarket, TimeframeId } from '../src/lib/types'
 
@@ -347,6 +348,39 @@ async function main(): Promise<void> {
     }
   }
 
+  // Open positions enriched with the live mark (current bid for the held side) so
+  // the dashboard monitor can show unrealized P&L and time left in the window.
+  function openPositions(): {
+    coin: string
+    timeframe: string
+    side: 'up' | 'down'
+    strategy: string
+    entryPrice: number
+    size: number
+    mark: number | null
+    unrealizedPnl: number | null
+    msRemaining: number | null
+  }[] {
+    const now = Date.now()
+    const live = new Map<string, ParsedMarket>()
+    for (const s of scopes) if (s.market) live.set(marketWindowKey(s.market), s.market)
+    return db.openTrades().map((t) => {
+      const market = live.get(t.windowKey) ?? null
+      const mark = market ? bidForSide(deriveBook(market), t.side) : null
+      return {
+        coin: t.coin,
+        timeframe: t.timeframe,
+        side: t.side,
+        strategy: t.strategy,
+        entryPrice: t.entryPrice,
+        size: t.size,
+        mark,
+        unrealizedPnl: mark != null ? mark * t.size - t.cost : null,
+        msRemaining: market ? market.endDate.getTime() - now : null,
+      }
+    })
+  }
+
   function refreshMarket(state: ScopeState, now: number): void {
     const ended = state.market ? now >= state.market.endDate.getTime() : true
     if (state.fetching) return
@@ -481,6 +515,8 @@ async function main(): Promise<void> {
               },
               summary: db.tradeSummary(),
               swingExits: config.strategy === 'swing' ? db.swingExits() : [],
+              openPositions: openPositions(),
+              recentClosed: db.recentClosed(8),
             }),
             setMode,
             setHalted,
