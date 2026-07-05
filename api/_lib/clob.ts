@@ -333,6 +333,16 @@ export async function placeMarketOrder(params: PlaceOrderParams): Promise<PlaceO
   const metaHint = clientMarketParamsHint(params)
   const clob = createClobClient(config)
 
+  // Hinted BUY only: walk the book NOW, concurrently with prepareOrder and the first
+  // post. If the hint is stale and the FOK comes back unmatched, this fresh price is
+  // already in hand, so the retry skips a sequential book-walk round trip and pays
+  // only the re-post. The walk runs hidden under the order's 250ms taker delay, so it
+  // never slows a fill; the hot-path price still comes from the hint. (Backlog #4.)
+  const fallbackBuyPrice =
+    params.side === 'BUY' && hint != null
+      ? rawMarketBuyPrice(clob, params.tokenId, amount).catch(() => null)
+      : null
+
   const [{ client, tickSize, negRisk }, bookPrice] = await Promise.all([
     prepareOrder(config, params.tokenId, metaHint),
     hint == null && params.side === 'BUY'
@@ -372,13 +382,23 @@ export async function placeMarketOrder(params: PlaceOrderParams): Promise<PlaceO
 
   let result = unwrapOrderResult(response, params.side)
   if (params.side === 'BUY' && (result.status ?? '').toLowerCase() === 'unmatched') {
-    // Book moved past the first ceiling — retry once with 2× slippage pad. No book-walk
-    // (that adds a round trip and throws "no match" on empty asks).
-    const base = hint ?? bookPrice
-    if (base != null) {
-      orderArgs.price = bufferMarketBuyPrice(base, tickSize, 2)
-      response = await client.createAndPostMarketOrder(orderArgs, { tickSize, negRisk }, marketOrderType)
-      result = unwrapOrderResult(response, params.side)
+    if (hint != null) {
+      try {
+        const walked = (await fallbackBuyPrice) ?? (await rawMarketBuyPrice(client, params.tokenId, amount))
+        orderArgs.price = bufferMarketBuyPrice(walked, tickSize)
+        response = await client.createAndPostMarketOrder(orderArgs, { tickSize, negRisk }, marketOrderType)
+        result = unwrapOrderResult(response, params.side)
+      } catch {
+        // Book walk failed — fall through to slippage retry
+      }
+    }
+    if ((result.status ?? '').toLowerCase() === 'unmatched') {
+      const base = hint ?? bookPrice
+      if (base != null) {
+        orderArgs.price = bufferMarketBuyPrice(base, tickSize, 2)
+        response = await client.createAndPostMarketOrder(orderArgs, { tickSize, negRisk }, marketOrderType)
+        result = unwrapOrderResult(response, params.side)
+      }
     }
   } else if (
     params.side === 'SELL' &&
