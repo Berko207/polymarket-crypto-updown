@@ -46,6 +46,8 @@ const OUTCOME_SLOP_MS = 120_000
 const OUTCOME_GIVEUP_MS = 150_000
 /** Live-only fallback when BOT_MAX_DAILY_TRADES is unset/0 — paper has no cap. */
 const LIVE_DEFAULT_DAILY_CAP = 50
+/** Retry cadence for force-closing a position that couldn't fill (empty/thin book). */
+const CLOSE_RETRY_MS = 3_000
 
 function log(...args: unknown[]): void {
   console.info(new Date().toISOString(), ...args)
@@ -101,6 +103,11 @@ async function main(): Promise<void> {
   const swingCooldown = new Map<string, number>()
   const enteringSwing = new Set<string>()
   const exitingTrades = new Set<number>()
+  // Positions queued to force-close at market (strategy switch): id → exit reason.
+  // Retried every CLOSE_RETRY_MS until each fills or its window ends.
+  const pendingClose = new Map<number, string>()
+  let draining = false
+  let lastCloseDrain = 0
 
   const strategyBrief =
     config.strategy === 'swing'
@@ -181,16 +188,9 @@ async function main(): Promise<void> {
     config.strategy = next
     log(`strategy ${prev} → ${next} (control)`)
     // Market-close positions from the old regime so they realize now instead of
-    // riding to settlement. Fire-and-forget: the flip is instant, the closes land
-    // over the next tick(s); settleTrades still backstops anything with no live
-    // book to sell into.
-    const open = db.countOpenTrades()
-    if (open > 0) {
-      log(`  closing ${open} open position(s) at market (strategy-switch)`)
-      void closeOpenPositions('strategy-switch').catch((e) =>
-        log(`closeOpenPositions error — ${e instanceof Error ? e.message : String(e)}`),
-      )
-    }
+    // riding to settlement. The flip is instant; drainPendingCloses keeps retrying
+    // the sells (empty/thin book) each cycle until filled or the window settles.
+    if (db.countOpenTrades() > 0) requestCloseAllOpen('strategy-switch')
     return { ok: true }
   }
 
@@ -423,62 +423,92 @@ async function main(): Promise<void> {
     if (canEnter) await swingEnter(pred, market, now)
   }
 
-  // Force-close every open position at the current market bid (used on a strategy
-  // switch so positions from the old regime realize now). Recorded as a normal
-  // `closed` trade with the given exit reason. Positions whose window has no live
-  // book to mark against are skipped and left for settleTrades. Mirrors swingExit.
-  async function closeOpenPositions(reason: string): Promise<void> {
-    const live = new Map<string, ParsedMarket>()
-    for (const sc of scopes) if (sc.market) live.set(marketWindowKey(sc.market), sc.market)
-    let closed = 0
-    let toSettle = 0
-    for (const pos of db.openTrades()) {
-      if (exitingTrades.has(pos.id)) continue
-      const market = live.get(pos.windowKey)
-      const tokenId = market ? (pos.side === 'up' ? market.upTokenId : market.downTokenId) : null
-      const mark = market ? bidForSide(deriveBook(market), pos.side) : null
-      // No live book to sell into (window no longer tracked) — leave it for settleTrades.
-      if (!market || !tokenId || !(mark != null && mark > 0)) {
-        toSettle += 1
-        continue
+  // Queue every open position to be force-closed at market (used on a strategy
+  // switch). The selling is retried each cycle by drainPendingCloses until each
+  // fills or its window ends, so an empty/thin book doesn't strand the switch.
+  function requestCloseAllOpen(reason: string): void {
+    let n = 0
+    for (const t of db.openTrades()) {
+      if (!pendingClose.has(t.id)) {
+        pendingClose.set(t.id, reason)
+        n += 1
       }
-      const sellOrder: SellOrder = {
-        side: pos.side,
-        tokenId,
-        size: pos.size,
-        sellPrice: mark,
-        tickSize: market.tickSize,
-        negRisk: market.negRisk,
-      }
-      exitingTrades.add(pos.id)
-      let fill
-      try {
-        fill = await executor.sell(sellOrder)
-      } catch (e) {
-        exitingTrades.delete(pos.id)
-        log(`${mode.toUpperCase()} CLOSE FAILED #${pos.id} ${pos.side} — ${e instanceof Error ? e.message : String(e)}`)
-        continue
-      }
-      exitingTrades.delete(pos.id)
-      if (!(fill.fillSize > 0 && fill.fillPrice > 0)) {
-        log(`${mode.toUpperCase()} CLOSE NO FILL #${pos.id} ${pos.side} (book empty / rejected)`)
-        continue
-      }
-      const now = Date.now()
-      const exitFee = config.feeSell ? takerFee(fill.fillPrice, fill.fillSize, config.feeRate) : 0
-      const payout = fill.fillPrice * fill.fillSize - exitFee
-      const pnl = payout - pos.cost
-      db.closeTrade({ id: pos.id, exitT: now, exitPrice: fill.fillPrice, exitReason: reason, exitFee, payout, pnl })
-      swingCooldown.set(pos.windowKey, now)
-      stats.settled += 1
-      closed += 1
-      log(
-        `${mode.toUpperCase()} CLOSE ${reason} ${pos.coin}/${pos.timeframe} ${pos.side} @ ${fill.fillPrice.toFixed(3)} · ` +
-          `pnl ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(3)}`,
-      )
     }
-    if (closed || toSettle) {
-      log(`${mode.toUpperCase()} ${reason}: ${closed} closed at market, ${toSettle} left to settle`)
+    if (n > 0) {
+      log(`  queued ${n} open position(s) to close at market (${reason}) — retrying until filled or settled`)
+      void drainPendingCloses()
+    }
+  }
+
+  // Attempt to market-close each queued position at the current bid. One that
+  // can't fill now (no/thin book) stays queued and is retried next cycle; once its
+  // window ends it's dropped (settleTrades resolves it). Mirrors swingExit's sell.
+  async function drainPendingCloses(): Promise<void> {
+    if (draining || pendingClose.size === 0) return
+    draining = true
+    try {
+      const live = new Map<string, ParsedMarket>()
+      for (const sc of scopes) if (sc.market) live.set(marketWindowKey(sc.market), sc.market)
+      const openById = new Map(db.openTrades().map((t) => [t.id, t] as const))
+      for (const [id, reason] of [...pendingClose]) {
+        if (exitingTrades.has(id)) continue
+        const pos = openById.get(id)
+        if (!pos) {
+          pendingClose.delete(id) // already closed/settled elsewhere
+          continue
+        }
+        const market = live.get(pos.windowKey)
+        const tokenId = market ? (pos.side === 'up' ? market.upTokenId : market.downTokenId) : null
+        const mark = market ? bidForSide(deriveBook(market), pos.side) : null
+        if (!market || !tokenId || !(mark != null && mark > 0)) {
+          // No book to sell into right now. Keep retrying while the window is open;
+          // once it ends, settleTrades takes over, so stop tracking it.
+          const endMs = market?.endDate.getTime() ?? windowEndMsFromKey(pos.windowKey)
+          if (endMs != null && Date.now() > endMs) {
+            pendingClose.delete(id)
+            log(`${mode.toUpperCase()} CLOSE give-up #${id} ${pos.coin}/${pos.timeframe} — no book, leaving to settle`)
+          }
+          continue
+        }
+        const sellOrder: SellOrder = {
+          side: pos.side,
+          tokenId,
+          size: pos.size,
+          sellPrice: mark,
+          tickSize: market.tickSize,
+          negRisk: market.negRisk,
+        }
+        exitingTrades.add(id)
+        let fill
+        try {
+          fill = await executor.sell(sellOrder)
+        } catch (e) {
+          exitingTrades.delete(id)
+          log(`${mode.toUpperCase()} CLOSE FAILED #${id} ${pos.side} — ${e instanceof Error ? e.message : String(e)} (will retry)`)
+          continue
+        }
+        exitingTrades.delete(id)
+        if (!(fill.fillSize > 0 && fill.fillPrice > 0)) {
+          // Unmatched — empty/thin book. Stay queued and retry next cycle.
+          continue
+        }
+        const now = Date.now()
+        const exitFee = config.feeSell ? takerFee(fill.fillPrice, fill.fillSize, config.feeRate) : 0
+        const payout = fill.fillPrice * fill.fillSize - exitFee
+        const pnl = payout - pos.cost
+        db.closeTrade({ id, exitT: now, exitPrice: fill.fillPrice, exitReason: reason, exitFee, payout, pnl })
+        swingCooldown.set(pos.windowKey, now)
+        stats.settled += 1
+        pendingClose.delete(id)
+        log(
+          `${mode.toUpperCase()} CLOSE ${reason} ${pos.coin}/${pos.timeframe} ${pos.side} @ ${fill.fillPrice.toFixed(3)} · ` +
+            `pnl ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(3)}`,
+        )
+      }
+    } catch (e) {
+      log(`drainPendingCloses error — ${e instanceof Error ? e.message : String(e)}`)
+    } finally {
+      draining = false
     }
   }
 
@@ -699,6 +729,8 @@ async function main(): Promise<void> {
               // Traded subset + the full recorded universe it can be toggled across.
               tradeTimeframes: config.timeframes.filter((tf) => tradeTf.has(tf)),
               availableTimeframes: config.timeframes.filter((tf) => recordedTf.has(tf)),
+              // Positions still being force-closed at market (strategy switch retries).
+              pendingCloses: pendingClose.size,
               swingExits: config.strategy === 'swing' ? db.swingExits() : [],
               swingTrigger: config.swingTrigger,
               swingSource: config.signalSource,
@@ -729,6 +761,11 @@ async function main(): Promise<void> {
     seedTrackedFromOpen()
     sweepOutcomes(now)
     if (mode !== 'record') settleTrades(now)
+    // Retry any queued force-closes (strategy switch) whose book was empty/thin.
+    if (mode !== 'record' && pendingClose.size > 0 && now - lastCloseDrain >= CLOSE_RETRY_MS) {
+      lastCloseDrain = now
+      void drainPendingCloses()
+    }
 
     if (now - lastStatus >= STATUS_MS) {
       lastStatus = now

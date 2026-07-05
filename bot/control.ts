@@ -29,6 +29,8 @@ export interface BotStatus {
   tradeTimeframes: string[]
   /** Every recorded timeframe — the toggleable universe for trade selection. */
   availableTimeframes: string[]
+  /** Open positions still being force-closed at market after a strategy switch. */
+  pendingCloses: number
   /** Closed swing trades by exit reason (empty for the value strategy). */
   swingExits: { reason: string; n: number; wins: number; pnl: number }[]
   /** Active swing entry trigger + fair-value source (swing strategy only). */

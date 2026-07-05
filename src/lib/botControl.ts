@@ -25,6 +25,8 @@ export interface BotStatus {
   /** Traded subset + full recorded universe; absent when talking to an older bot. */
   tradeTimeframes?: string[]
   availableTimeframes?: string[]
+  /** Positions still being force-closed at market (strategy-switch retries). */
+  pendingCloses?: number
   swingExits?: { reason: string; n: number; wins: number; pnl: number }[]
   swingTrigger?: 'edge' | 'move'
   swingSource?: 'flat' | 'regime' | 'blend'

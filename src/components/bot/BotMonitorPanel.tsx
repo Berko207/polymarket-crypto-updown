@@ -33,6 +33,9 @@ export function BotMonitorPanel() {
       <div className="flex flex-col gap-1.5">
         <p className="text-[0.6rem] font-semibold uppercase tracking-wide text-muted-foreground/70">
           Open · {open.length}
+          {s.pendingCloses ? (
+            <span className="ml-1 text-amber-300">· closing {s.pendingCloses}</span>
+          ) : null}
         </p>
         {open.length === 0 ? (
           <p className="text-[0.7rem] text-muted-foreground">no open positions</p>
