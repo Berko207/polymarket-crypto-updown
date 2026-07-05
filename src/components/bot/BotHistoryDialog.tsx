@@ -14,15 +14,17 @@ import type { HistoryFilters, TradeHistoryRow } from '@/lib/botControl'
 
 const PAGE = 100
 
+// MODE = real vs simulated money (dry/live). Kept verbose so it can't be read as
+// a strategy — "Live" (real $) is a mode, "Value" (below) is a strategy.
 const MODE_OPTS = [
-  { v: 'dry', label: 'Paper' },
-  { v: 'live', label: 'Live' },
+  { v: 'dry', label: 'Paper (simulated $)' },
+  { v: 'live', label: 'Live (real $)' },
   { v: 'all', label: 'All modes' },
 ]
 const STRAT_OPTS = [
   { v: 'all', label: 'Any strategy' },
-  { v: 'swing', label: 'Swing' },
-  { v: 'value', label: 'Value' },
+  { v: 'swing', label: 'Swing strategy' },
+  { v: 'value', label: 'Value strategy' },
 ]
 const STATUS_OPTS = [
   { v: 'all', label: 'Any status' },
