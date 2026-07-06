@@ -146,36 +146,68 @@ export async function warmOrderPath(tokenIds: string[]): Promise<void> {
   ])
 }
 
-/** Parse CLOB making/taking amounts (micro-units) into human fill price + size. */
+/**
+ * Parse CLOB making/taking amounts into human fill price + size.
+ * USDC (collateral) is always 6-decimal micro-units; conditional-token amounts
+ * may arrive as micro-units OR whole shares depending on the API response shape.
+ */
 function parseOrderFill(
   side: 'BUY' | 'SELL',
   record: Record<string, unknown> | null,
+  intendedUsdc?: number,
 ): Pick<PlaceOrderResult, 'fillPrice' | 'fillSize'> {
   const make = Number(record?.makingAmount)
   const take = Number(record?.takingAmount)
   if (!Number.isFinite(make) || !Number.isFinite(take) || make <= 0 || take <= 0) return {}
 
-  const makeN = make / 1e6
-  const takeN = take / 1e6
+  const usdc = (side === 'BUY' ? make : take) / 1e6
+  const tokenRaw = side === 'BUY' ? take : make
 
-  if (side === 'BUY') {
-    const fillSize = takeN
-    const fillPrice = fillSize > 0 ? makeN / fillSize : undefined
-    return fillPrice != null && fillPrice > 0 && fillPrice < 1 ? { fillSize, fillPrice } : {}
+  const candidates: Pick<PlaceOrderResult, 'fillPrice' | 'fillSize'>[] = []
+  for (const shares of [tokenRaw / 1e6, tokenRaw]) {
+    if (!Number.isFinite(shares) || shares <= 0) continue
+    const fillPrice = usdc / shares
+    if (fillPrice > 0 && fillPrice < 1) candidates.push({ fillSize: shares, fillPrice })
+  }
+  if (!candidates.length) return {}
+
+  // Conditional amounts may be micro-units or whole shares — pick the parse whose
+  // cost best matches the USDC leg (avoids dust fills that zero out bot P&L).
+  candidates.sort(
+    (a, b) =>
+      Math.abs(a.fillSize! * a.fillPrice! - usdc) - Math.abs(b.fillSize! * b.fillPrice! - usdc),
+  )
+  const best = candidates[0]!
+
+  // CLOB sometimes returns dust makingAmount on a full market buy — trust the
+  // order's intended USDC when the parsed cost is far below what we sent.
+  if (
+    side === 'BUY' &&
+    intendedUsdc != null &&
+    intendedUsdc > 0 &&
+    best.fillPrice! > 0 &&
+    best.fillPrice! < 1
+  ) {
+    const reported = best.fillSize! * best.fillPrice!
+    if (reported < intendedUsdc * 0.5) {
+      return { fillPrice: best.fillPrice, fillSize: intendedUsdc / best.fillPrice! }
+    }
   }
 
-  const fillSize = makeN
-  const fillPrice = fillSize > 0 ? takeN / fillSize : undefined
-  return fillPrice != null && fillPrice > 0 && fillPrice < 1 ? { fillSize, fillPrice } : {}
+  return best
 }
 
-function unwrapOrderResult(response: unknown, side?: 'BUY' | 'SELL'): PlaceOrderResult {
+function unwrapOrderResult(
+  response: unknown,
+  side?: 'BUY' | 'SELL',
+  intendedUsdc?: number,
+): PlaceOrderResult {
   const record = response as Record<string, unknown> | null
   return {
     success: true,
     orderId: typeof record?.orderID === 'string' ? record.orderID : undefined,
     status: typeof record?.status === 'string' ? record.status : undefined,
-    ...(side ? parseOrderFill(side, record) : {}),
+    ...(side ? parseOrderFill(side, record, intendedUsdc) : {}),
   }
 }
 
@@ -380,14 +412,14 @@ export async function placeMarketOrder(params: PlaceOrderParams): Promise<PlaceO
     marketOrderType,
   )
 
-  let result = unwrapOrderResult(response, params.side)
+  let result = unwrapOrderResult(response, params.side, params.side === 'BUY' ? amount : undefined)
   if (params.side === 'BUY' && (result.status ?? '').toLowerCase() === 'unmatched') {
     if (hint != null) {
       try {
         const walked = (await fallbackBuyPrice) ?? (await rawMarketBuyPrice(client, params.tokenId, amount))
         orderArgs.price = bufferMarketBuyPrice(walked, tickSize)
         response = await client.createAndPostMarketOrder(orderArgs, { tickSize, negRisk }, marketOrderType)
-        result = unwrapOrderResult(response, params.side)
+        result = unwrapOrderResult(response, params.side, amount)
       } catch {
         // Book walk failed — fall through to slippage retry
       }
@@ -397,7 +429,7 @@ export async function placeMarketOrder(params: PlaceOrderParams): Promise<PlaceO
       if (base != null) {
         orderArgs.price = bufferMarketBuyPrice(base, tickSize, 2)
         response = await client.createAndPostMarketOrder(orderArgs, { tickSize, negRisk }, marketOrderType)
-        result = unwrapOrderResult(response, params.side)
+        result = unwrapOrderResult(response, params.side, amount)
       }
     }
   } else if (
@@ -449,13 +481,20 @@ export async function placeLimitOrder(params: PlaceOrderParams): Promise<PlaceOr
     OrderType.GTC,
   )
 
-  return unwrapOrderResult(response, params.side)
+  return unwrapOrderResult(
+    response,
+    params.side,
+    params.side === 'BUY' && price != null && size != null ? price * size : undefined,
+  )
 }
 
 function enrichOrderErrorMessage(message: string): string {
   const lower = message.toLowerCase()
   if (lower.includes('no match')) {
     return 'No resting liquidity on the book — wait for live quotes, then try again'
+  }
+  if (lower.includes('not enough balance') || lower.includes('insufficient usdc')) {
+    return 'Insufficient USDC — deposit funds or lower order size (balance may be locked in open orders)'
   }
   if (lower.includes('maker address not allowed') || lower.includes('deposit wallet')) {
     return (

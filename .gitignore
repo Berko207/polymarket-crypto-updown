@@ -28,7 +28,7 @@ dist
 # Claude
 .claude
 
-bot/data.db
-bot/data.db-*
+bot/*.db
+bot/*.db-*
 bot/runtime.json
 bot/STOP

@@ -64,6 +64,39 @@ export interface TradeInsert {
   orderId: string | null
 }
 
+/** One simulated maker fill (docs/maker-paper-strategy.md §12) — the honest ledger. */
+export interface MakerFillRow {
+  windowKey: string
+  coin: string
+  timeframe: string
+  mode: string
+  tokenSide: 'up' | 'down'
+  fillT: number
+  price: number
+  size: number
+  rebate: number
+  fillModel: string
+  orderId: string | null
+}
+
+/** A finished maker window, synthesized into one settled `trades` row for the summaries. */
+export interface MakerTradeRow {
+  windowKey: string
+  coin: string
+  timeframe: string
+  mode: string
+  side: 'up' | 'down'
+  entryT: number
+  entryPrice: number
+  size: number
+  cost: number
+  entryFee: number
+  regimeEntry: string | null
+  settleT: number
+  payout: number
+  pnl: number
+}
+
 export interface OpenTrade {
   id: number
   side: 'up' | 'down'
@@ -89,6 +122,7 @@ export interface OpenTradeRow {
 
 /** A finished trade for the monitor's activity feed. */
 export interface ClosedTradeRow {
+  mode: string
   coin: string
   timeframe: string
   side: 'up' | 'down'
@@ -197,6 +231,14 @@ CREATE TABLE IF NOT EXISTS trades (
 );
 CREATE INDEX IF NOT EXISTS idx_trades_window ON trades(window_key);
 CREATE INDEX IF NOT EXISTS idx_trades_status ON trades(status);
+CREATE TABLE IF NOT EXISTS maker_fills (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  window_key TEXT NOT NULL, coin TEXT, timeframe TEXT, mode TEXT,
+  token_side TEXT NOT NULL, fill_t INTEGER NOT NULL,
+  price REAL NOT NULL, size REAL NOT NULL, rebate REAL NOT NULL DEFAULT 0,
+  fill_model TEXT NOT NULL, order_id TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_makerfills_window ON maker_fills(window_key);
 `
 
 export interface BotDb {
@@ -205,7 +247,13 @@ export interface BotDb {
   insertPrediction(row: PredictionRow): void
   upsertOutcome(row: OutcomeRow): void
   hasOutcome(windowKey: string): boolean
+  /** Recorded outcome for a window, or null if not yet settled. */
+  outcomeFor(windowKey: string): 'up' | 'down' | null
   insertTrade(row: TradeInsert): void
+  /** Append one simulated maker fill to the ledger. */
+  insertMakerFill(row: MakerFillRow): void
+  /** Write a finished maker window as one settled trades row (for the summaries/history). */
+  insertMakerTrade(row: MakerTradeRow): void
   tradeExists(windowKey: string): boolean
   openTradesForWindow(windowKey: string): OpenTrade[]
   settleTrade(id: number, settleT: number, payout: number, pnl: number): void
@@ -217,12 +265,15 @@ export interface BotDb {
   pendingSettlements(): { id: number; side: 'up' | 'down'; size: number; cost: number; outcome: 'up' | 'down' }[]
   /** Aggregate paper/live trade P&L for the status endpoint. */
   tradeSummary(): { entered: number; settled: number; open: number; wins: number; staked: number; pnl: number }
+  tradeSummaryForMode(mode: string): { entered: number; settled: number; open: number; wins: number; staked: number; pnl: number }
   /** Closed swing trades grouped by exit reason — the scalp's health readout. */
   swingExits(): { reason: string; n: number; wins: number; pnl: number }[]
   /** All currently-open positions (for the dashboard monitor). */
   openTrades(): OpenTradeRow[]
   /** Most-recent finished trades, newest first (activity feed). */
-  recentClosed(limit: number): ClosedTradeRow[]
+  recentClosed(limit: number, mode?: string): ClosedTradeRow[]
+  /** Fix live rows where CLOB dust fills zeroed out cost/size/pnl. */
+  repairDustLiveFills(stakeUsd: number): number
   /** Filtered, paged trade history for the dashboard grid (newest first). */
   queryTrades(query: TradeQuery): TradeHistoryPage
   /** Last recorded strike for a window (from predictions), for outcome sweeps after restart. */
@@ -272,6 +323,7 @@ export function openDb(path: string, readonly = false): BotDb {
     ON CONFLICT(window_key) DO NOTHING
   `)
   const outCount = raw.prepare('SELECT 1 FROM outcomes WHERE window_key = ? LIMIT 1')
+  const outcomeForStmt = raw.prepare('SELECT outcome FROM outcomes WHERE window_key = ? LIMIT 1')
 
   const insTrade = raw.prepare(`
     INSERT INTO trades
@@ -280,6 +332,20 @@ export function openDb(path: string, readonly = false): BotDb {
     VALUES
       (@windowKey, @coin, @timeframe, @mode, @strategy, @side, @entryT, @entryPrice, @size, @cost,
        @entryFee, @signalEdge, @regimeEntry, @status, @orderId)
+  `)
+  const insMakerFill = raw.prepare(`
+    INSERT INTO maker_fills
+      (window_key, coin, timeframe, mode, token_side, fill_t, price, size, rebate, fill_model, order_id)
+    VALUES
+      (@windowKey, @coin, @timeframe, @mode, @tokenSide, @fillT, @price, @size, @rebate, @fillModel, @orderId)
+  `)
+  const insMakerTrade = raw.prepare(`
+    INSERT INTO trades
+      (window_key, coin, timeframe, mode, strategy, side, entry_t, entry_price, size, cost,
+       entry_fee, signal_edge, regime_entry, status, settle_t, payout, pnl)
+    VALUES
+      (@windowKey, @coin, @timeframe, @mode, 'maker', @side, @entryT, @entryPrice, @size, @cost,
+       @entryFee, 0, @regimeEntry, 'settled', @settleT, @payout, @pnl)
   `)
   const tradeExistsStmt = raw.prepare('SELECT 1 FROM trades WHERE window_key = ? LIMIT 1')
   const openForWindow = raw.prepare(
@@ -311,6 +377,16 @@ export function openDb(path: string, readonly = false): BotDb {
       COALESCE(SUM(CASE WHEN status IN ('settled','closed') THEN pnl ELSE 0 END), 0) AS pnl
     FROM trades
   `)
+  const summaryByModeStmt = raw.prepare(`
+    SELECT
+      COUNT(*) AS entered,
+      COALESCE(SUM(CASE WHEN status IN ('settled','closed') THEN 1 ELSE 0 END), 0) AS settled,
+      COALESCE(SUM(CASE WHEN status='open' THEN 1 ELSE 0 END), 0) AS open,
+      COALESCE(SUM(CASE WHEN status IN ('settled','closed') AND pnl>0 THEN 1 ELSE 0 END), 0) AS wins,
+      COALESCE(SUM(CASE WHEN status IN ('settled','closed') THEN cost ELSE 0 END), 0) AS staked,
+      COALESCE(SUM(CASE WHEN status IN ('settled','closed') THEN pnl ELSE 0 END), 0) AS pnl
+    FROM trades WHERE mode = @mode
+  `)
   const swingExitsStmt = raw.prepare(`
     SELECT
       COALESCE(exit_reason, '—') AS reason,
@@ -328,11 +404,18 @@ export function openDb(path: string, readonly = false): BotDb {
     FROM trades WHERE status='open' ORDER BY entry_t DESC
   `)
   const recentClosedStmt = raw.prepare(`
-    SELECT coin, timeframe, side, strategy, entry_price AS entryPrice,
+    SELECT mode, coin, timeframe, side, strategy, entry_price AS entryPrice,
            exit_price AS exitPrice, exit_reason AS exitReason, pnl,
            settle_t AS settleT, status
     FROM trades WHERE status IN ('settled','closed')
     ORDER BY settle_t DESC LIMIT ?
+  `)
+  const recentClosedByModeStmt = raw.prepare(`
+    SELECT mode, coin, timeframe, side, strategy, entry_price AS entryPrice,
+           exit_price AS exitPrice, exit_reason AS exitReason, pnl,
+           settle_t AS settleT, status
+    FROM trades WHERE status IN ('settled','closed') AND mode = @mode
+    ORDER BY settle_t DESC LIMIT @limit
   `)
   const windowStrikeStmt = raw.prepare(
     'SELECT strike FROM predictions WHERE window_key = ? ORDER BY t DESC LIMIT 1',
@@ -347,7 +430,11 @@ export function openDb(path: string, readonly = false): BotDb {
     insertPrediction: (row) => void insPred.run(row),
     upsertOutcome: (row) => void upsOutcome.run(row),
     hasOutcome: (windowKey) => outCount.get(windowKey) != null,
+    outcomeFor: (windowKey) =>
+      (outcomeForStmt.get(windowKey) as { outcome: 'up' | 'down' } | undefined)?.outcome ?? null,
     insertTrade: (row) => void insTrade.run(row),
+    insertMakerFill: (row) => void insMakerFill.run(row),
+    insertMakerTrade: (row) => void insMakerTrade.run(row),
     tradeExists: (windowKey) => tradeExistsStmt.get(windowKey) != null,
     openTradesForWindow: (windowKey) => openForWindow.all(windowKey) as OpenTrade[],
     settleTrade: (id, settleT, payout, pnl) => void settleStmt.run({ id, settleT, payout, pnl }),
@@ -365,10 +452,57 @@ export function openDb(path: string, readonly = false): BotDb {
         staked: number
         pnl: number
       },
+    tradeSummaryForMode: (mode) =>
+      summaryByModeStmt.get({ mode }) as {
+        entered: number
+        settled: number
+        open: number
+        wins: number
+        staked: number
+        pnl: number
+      },
     swingExits: () =>
       swingExitsStmt.all() as { reason: string; n: number; wins: number; pnl: number }[],
     openTrades: () => openTradesStmt.all() as OpenTradeRow[],
-    recentClosed: (limit) => recentClosedStmt.all(limit) as ClosedTradeRow[],
+    recentClosed: (limit, mode) =>
+      mode
+        ? (recentClosedByModeStmt.all({ mode, limit }) as ClosedTradeRow[])
+        : (recentClosedStmt.all(limit) as ClosedTradeRow[]),
+    repairDustLiveFills: (stakeUsd) => {
+      const dust = 0.01
+      const rows = raw
+        .prepare(
+          `SELECT t.id, t.side, t.entry_price AS entryPrice, t.status, o.outcome
+           FROM trades t
+           LEFT JOIN outcomes o ON o.window_key = t.window_key
+           WHERE t.mode = 'live' AND t.cost < @dust AND t.entry_price > 0 AND t.entry_price < 1`,
+        )
+        .all({ dust }) as {
+        id: number
+        side: 'up' | 'down'
+        entryPrice: number
+        status: string
+        outcome: 'up' | 'down' | null
+      }[]
+      const upd = raw.prepare(
+        `UPDATE trades SET size=@size, cost=@cost, payout=@payout, pnl=@pnl WHERE id=@id`,
+      )
+      let n = 0
+      for (const r of rows) {
+        const cost = stakeUsd
+        const size = cost / r.entryPrice
+        let payout: number | null = null
+        let pnl: number | null = null
+        if (r.status === 'settled' || r.status === 'closed') {
+          const won = r.outcome != null && r.side === r.outcome
+          payout = won ? size : 0
+          pnl = payout - cost
+        }
+        upd.run({ id: r.id, size, cost, payout, pnl })
+        n += 1
+      }
+      return n
+    },
     queryTrades: (q) => {
       // Build the WHERE dynamically; every value is a bound param (never interpolated).
       const where: string[] = []

@@ -8,9 +8,11 @@ import {
   setBotMaxDailyTrades,
   setBotStrategy,
   setBotTradeTimeframes,
+  setBotMaker,
   type BotMode,
   type BotStatus,
   type HistoryFilters,
+  type MakerPatch,
 } from '@/lib/botControl'
 
 const KEY = ['bot', 'status'] as const
@@ -62,7 +64,7 @@ export function useBotMaxDailyTrades() {
 export function useBotStrategy() {
   const qc = useQueryClient()
   return useMutation({
-    mutationFn: (strategy: 'value' | 'swing') => setBotStrategy(strategy),
+    mutationFn: (strategy: 'value' | 'swing' | 'maker') => setBotStrategy(strategy),
     onSuccess: (status: BotStatus) => qc.setQueryData(KEY, status),
   })
 }
@@ -71,6 +73,14 @@ export function useBotTradeTimeframes() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: (timeframes: string[]) => setBotTradeTimeframes(timeframes),
+    onSuccess: (status: BotStatus) => qc.setQueryData(KEY, status),
+  })
+}
+
+export function useBotMaker() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (patch: MakerPatch) => setBotMaker(patch),
     onSuccess: (status: BotStatus) => qc.setQueryData(KEY, status),
   })
 }

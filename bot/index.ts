@@ -1,8 +1,7 @@
 /**
  * Bot entry. Streams Chainlink ticks + gamma odds for every in-scope market,
- * logs flat+regime predictions and outcomes to SQLite, and (dry/live) trades the
- * late T-10s edge signal. Mode is runtime-switchable via the control server so
- * the dashboard can flip Dry/Live without a restart.
+ * logs flat+regime predictions and outcomes to SQLite, and (dry/live) trades value
+ * entries (model edge on the cheap side, hold to settlement). Mode is runtime-switchable
  *   record → log only · dry → paper-trade · live → real FAK orders (gated)
  */
 import '../api/_lib/loadEnv' // side effect: load .env.local (POLY_* for live, BOT_* overrides)
@@ -14,12 +13,16 @@ import { loadRuntimeSettings, saveRuntimeSettings } from './runtime'
 import { ChainlinkStream } from './sources/chainlink'
 import { fetchCurrentMarket } from './sources/gamma'
 import { predict, type Prediction } from './engine/predict'
-import { decideEntry } from './engine/strategy'
+import { decideEntry, entryBlockReason } from './engine/strategy'
 import { decideSwingEntry, decideExit, deriveBook, bidForSide, sourceEdge, type MidPoint } from './engine/swing'
 import { takerFee } from './engine/fees'
-import { dryExecutor, makeLiveExecutor, type SellOrder } from './engine/executor'
+import { dryExecutor, isInsufficientBalanceError, makeLiveExecutor, type SellOrder } from './engine/executor'
+import { ClobMarketStream, type TradePrint } from './sources/clobMarket'
+import { MakerSimExecutor, type MakerFill, type MakerQuote } from './engine/makerExecutor'
+import { decideQuotes, type MakerContext, type MakerInventory } from './engine/maker'
+import { emptyAccount, applyFill, flatten as flattenAccount, settle as settleAccount } from './engine/makerAccount'
 import { maxOrderCost, tradingEnabled } from './engine/guards'
-import { startControlServer, type BotMode } from './control'
+import { startControlServer, type BotMode, type BotStatus } from './control'
 import { VOL_LOOKBACK_MS } from '../src/lib/fairValue'
 import { marketWindowKey, windowEndMsFromKey } from '../src/lib/marketScope'
 import { chainlinkPair } from '../src/lib/cryptoPrice'
@@ -78,15 +81,66 @@ async function main(): Promise<void> {
     process.env.BOT_ALLOW_LIVE === '1'
   let halted = false
   const db = openDb(config.dbPath)
+  const repaired = db.repairDustLiveFills(config.stakeUsd)
+  if (repaired > 0) log(`repaired ${repaired} dust live fill(s) in trade history`)
   const stream = new ChainlinkStream()
 
-  const stats = { ticks: 0, predictions: 0, outcomes: 0, trades: 0, settled: 0 }
+  // --- maker strategy infra (strategy='maker'). The CLOB market socket supplies
+  // the depth + trade tape the fill sim needs; only subscribed while maker is active. ---
+  const makerStream = new ClobMarketStream()
+  makerStream.start()
+  const makerExec = new MakerSimExecutor({
+    fillModel: config.makerFillModel,
+    rebateRate: config.makerRebateRate,
+  })
+  /** Net inventory (shares) per window. */
+  const makerInv = new Map<string, MakerInventory>()
+  /** Per-window running accounting (cash out, rebate, flatten proceeds, fees). */
+  interface MakerAcct {
+    coin: string
+    timeframe: string
+    regime: string | null
+    entryT: number
+    cashSpent: number
+    rebate: number
+    flatten: number
+    fees: number
+    grossShares: number
+  }
+  const makerAcct = new Map<string, MakerAcct>()
+  /** Per-window meta captured while quoting (tokens/tick/end), for fills + settlement. */
+  interface MakerMeta {
+    coin: string
+    timeframe: string
+    regime: string | null
+    upTokenId: string | null
+    downTokenId: string | null
+    tickSize: number | null
+    endMs: number
+  }
+  const makerMeta = new Map<string, MakerMeta>()
+  /** `${windowKey}:${side}` → last requote ts (rate-limit). */
+  const makerLastRequote = new Map<string, number>()
+  let makerStepAt = 0
+
+  const stats = { ticks: 0, predictions: 0, outcomes: 0, trades: 0, settled: 0, makerFills: 0 }
   /** Windows successfully entered this session (DB tradeExists guards restarts). */
   const entered = new Set<string>()
   /** In-flight value-entry guard — mirrors enteringSwing so a slow buy can't double-fire. */
   const enteringValue = new Set<string>()
   /** dry paper executor by default; arming live swaps in the real one. */
   let executor = dryExecutor
+  /** Last known CLOB USDC balance — refreshed when arming live and after fills. */
+  let cachedUsdcBalance: number | null = null
+  /** Per-window backoff after a genuine insufficient-USDC rejection (avoids log spam). */
+  const balanceBlockedUntil = new Map<string, number>()
+  /** One skip-reason line per window per session (entry-window diagnostics). */
+  const entrySkipLogged = new Set<string>()
+  /** Back off retries after an empty-book NO FILL (edge can persist with no asks). */
+  const entryRetryAfter = new Map<string, number>()
+  const entryAttemptCount = new Map<string, number>()
+  const ENTRY_NO_FILL_BACKOFF_MS = 3_000
+  const ENTRY_MAX_ATTEMPTS = 4
   const STOP_FILE = resolve(process.cwd(), 'bot/STOP')
   stream.start((symbol, tick) => {
     db.insertTick({ symbol, ts: tick.timestamp, value: tick.value, carried: tick.carried ? 1 : 0 })
@@ -127,7 +181,11 @@ async function main(): Promise<void> {
         ` · band ${config.swingMinPrice}-${config.swingMaxPrice}${config.swingSkipCalm ? ' · skipCalm' : ''}` +
         ` · TP ${config.swingTakeProfitPts}/SL ${config.swingStopLossPts} · timeStop ${config.swingTimeStopSec}s · ` +
         `fee ${config.feeRate}${config.feeSell ? '+sell' : ''}`
-      : `value · entry ~T-${config.entryAtSec}s · edge≥${config.edgeThreshold}`
+      : config.strategy === 'maker'
+        ? `maker/${config.makerFillModel} · src ${config.signalSource} · spread±${config.makerBaseSpread} ` +
+          `(+${config.makerVolCoef}σ) · clip $${config.makerClipUsd} · maxInv ${config.makerMaxInventory} · ` +
+          `skew ${config.makerInvSkew} · rebate ${config.makerRebateRate} · pull ${config.makerPullSec}s/flatten ${config.makerFlattenSec}s`
+        : `value · edge≥${config.edgeThreshold} · ask≤${config.valueMaxEntryPrice}`
   log(
     `${mode} up · db=${config.dbPath} · scopes=${scopes.map((s) => `${s.coin}/${s.timeframe}`).join(',')}` +
       (mode !== 'record'
@@ -138,7 +196,7 @@ async function main(): Promise<void> {
   // --- LIVE arming: every guard must pass; returns an error instead of exiting
   // so the same path serves both startup and a runtime switch. ---
   async function armLive(): Promise<{ ok: boolean; error?: string; balance?: number }> {
-    if (!allowLive) return { ok: false, error: 'live not permitted — start the bot with --allow-live' }
+    if (!allowLive) return { ok: false, error: 'live not permitted — run pnpm bot:live (or restart with --allow-live)' }
     if (!tradingEnabled()) return { ok: false, error: 'POLY_TRADING_ENABLED is 0/false' }
     if (config.stakeUsd > maxOrderCost()) {
       return { ok: false, error: `stake $${config.stakeUsd} exceeds POLY_MAX_ORDER_COST $${maxOrderCost()}` }
@@ -152,6 +210,13 @@ async function main(): Promise<void> {
     }
     if (!snap.canTrade) return { ok: false, error: `wallet not ready: ${snap.walletSetupIssue ?? 'missing signer/key'}` }
     if (!(snap.usdcBalance > 0)) return { ok: false, error: 'zero USDC balance' }
+    if (config.stakeUsd > snap.usdcBalance) {
+      return {
+        ok: false,
+        error: `stake $${config.stakeUsd} exceeds USDC balance $${snap.usdcBalance.toFixed(2)}`,
+      }
+    }
+    cachedUsdcBalance = snap.usdcBalance
     executor = makeLiveExecutor()
     return { ok: true, balance: snap.usdcBalance }
   }
@@ -185,6 +250,12 @@ async function main(): Promise<void> {
     }
     const cap = maxOrderCost()
     if (next > cap) return { ok: false, error: `stake $${next} exceeds max order cost $${cap}` }
+    if (mode === 'live' && cachedUsdcBalance != null && next > cachedUsdcBalance) {
+      return {
+        ok: false,
+        error: `stake $${next} exceeds USDC balance $${cachedUsdcBalance.toFixed(2)}`,
+      }
+    }
     if (next === config.stakeUsd) return { ok: true }
     const prev = config.stakeUsd
     config.stakeUsd = next
@@ -192,12 +263,20 @@ async function main(): Promise<void> {
     return { ok: true }
   }
 
-  function setStrategy(next: 'value' | 'swing'): { ok: boolean; error?: string } {
-    if (next !== 'value' && next !== 'swing') return { ok: false, error: 'strategy must be value|swing' }
+  function setStrategy(next: 'value' | 'swing' | 'maker'): { ok: boolean; error?: string } {
+    if (next !== 'value' && next !== 'swing' && next !== 'maker') {
+      return { ok: false, error: 'strategy must be value|swing|maker' }
+    }
     if (next === config.strategy) return { ok: true }
     const prev = config.strategy
     config.strategy = next
     log(`strategy ${prev} → ${next} (control)`)
+    // Leaving maker: cancel resting quotes and unsubscribe the CLOB feed. Any open
+    // maker inventory is finalized on its window end by finalizeMakerWindows.
+    if (prev === 'maker' && next !== 'maker') {
+      makerExec.cancelAll()
+      makerStream.setTokens([])
+    }
     // Market-close positions from the old regime so they realize now instead of
     // riding to settlement. The flip is instant; drainPendingCloses keeps retrying
     // the sells (empty/thin book) each cycle until filled or the window settles.
@@ -221,6 +300,48 @@ async function main(): Promise<void> {
     for (const t of uniq) tradeTf.add(t)
     config.tradeTimeframes = uniq
     log(`trade timeframes → ${uniq.join(',')} (control)`)
+    return { ok: true }
+  }
+
+  function setMaker(patch: {
+    baseSpread?: number
+    clipUsd?: number
+    maxInventory?: number
+    fillModel?: 'L1' | 'L2'
+    rebateRate?: number
+  }): { ok: boolean; error?: string } {
+    const applied: string[] = []
+    if (patch.baseSpread != null) {
+      if (!(patch.baseSpread > 0 && patch.baseSpread < 0.5)) {
+        return { ok: false, error: 'half-spread must be between 0 and 0.5' }
+      }
+      config.makerBaseSpread = patch.baseSpread
+      applied.push(`spread±${patch.baseSpread}`)
+    }
+    if (patch.clipUsd != null) {
+      if (!(patch.clipUsd > 0)) return { ok: false, error: 'clip must be > 0' }
+      config.makerClipUsd = patch.clipUsd
+      applied.push(`clip $${patch.clipUsd}`)
+    }
+    if (patch.maxInventory != null) {
+      if (!(patch.maxInventory > 0)) return { ok: false, error: 'max inventory must be > 0' }
+      config.makerMaxInventory = patch.maxInventory
+      applied.push(`maxInv ${patch.maxInventory}`)
+    }
+    if (patch.rebateRate != null) {
+      if (!(patch.rebateRate >= 0)) return { ok: false, error: 'rebate must be ≥ 0' }
+      config.makerRebateRate = patch.rebateRate
+      applied.push(`rebate ${patch.rebateRate}`)
+    }
+    if (patch.fillModel != null) {
+      config.makerFillModel = patch.fillModel
+      applied.push(`fill ${patch.fillModel}`)
+    }
+    if (applied.length === 0) return { ok: false, error: 'no maker fields to update' }
+    // spread/clip/maxInv are read fresh from config by decideQuotes each tick;
+    // fillModel + rebateRate are cached inside the sim executor — sync them.
+    makerExec.setOptions({ fillModel: config.makerFillModel, rebateRate: config.makerRebateRate })
+    log(`maker config → ${applied.join(' · ')} (control)`)
     return { ok: true }
   }
 
@@ -276,18 +397,41 @@ async function main(): Promise<void> {
     return db.countTradesSince(now - 86_400_000) >= cap
   }
 
-  // Value entry: once per window, late (~T-10s), on a confident non-panic edge.
-  // Dry paper-fills; live places a real FAK BUY. Held to settlement. Retries each
-  // tick while the entry window and signal still qualify; gives up when decideEntry
-  // returns null (window closed / edge gone) or after a successful fill.
+  // Value entry: once per window when edge clears and the ask is cheap enough.
+  // Dry paper-fills; live places a real FAK BUY. Retries a few times with backoff
+  // after NO FILL so an empty book isn't hammered every tick.
   async function maybeTrade(pred: Prediction, market: ParsedMarket, now: number): Promise<void> {
     if (entriesHalted(now)) return
     if (entered.has(pred.windowKey) || db.tradeExists(pred.windowKey)) return
     if (enteringValue.has(pred.windowKey)) return
+    if ((balanceBlockedUntil.get(pred.windowKey) ?? 0) > now) return
+    if ((entryRetryAfter.get(pred.windowKey) ?? 0) > now) return
+    if ((entryAttemptCount.get(pred.windowKey) ?? 0) >= ENTRY_MAX_ATTEMPTS) return
     if (db.countOpenTrades() >= config.maxConcurrent) return
     if (dailyCapReached(now)) return
     const order = decideEntry(pred, market, config, now)
-    if (!order) return
+    if (!order) {
+      const block = entryBlockReason(pred, market, config, now)
+      if (block) {
+        const key = `${pred.windowKey}:${block}`
+        if (!entrySkipLogged.has(key)) {
+          entrySkipLogged.add(key)
+          log(
+            `${mode.toUpperCase()} SKIP ${pred.coin}/${pred.timeframe} — ${block} · ` +
+              `${Math.round((market.endDate.getTime() - now) / 1000)}s left`,
+          )
+        }
+      }
+      return
+    }
+
+    const secLeft = Math.round((market.endDate.getTime() - now) / 1000)
+    const attempt = (entryAttemptCount.get(pred.windowKey) ?? 0) + 1
+    entryAttemptCount.set(pred.windowKey, attempt)
+    log(
+      `${mode.toUpperCase()} ATTEMPT ${pred.coin}/${pred.timeframe} ${order.side} @ ${order.fillPrice.toFixed(3)} · ` +
+        `$${order.stakeUsd} · edge ${pred.edge.toFixed(3)} · ${pred.regime ?? '—'} · ${secLeft}s left · try ${attempt}/${ENTRY_MAX_ATTEMPTS}`,
+    )
 
     enteringValue.add(pred.windowKey)
     let fill
@@ -295,23 +439,44 @@ async function main(): Promise<void> {
       fill = await executor.buy(order)
     } catch (e) {
       enteringValue.delete(pred.windowKey)
+      const msg = e instanceof Error ? e.message : String(e)
+      if (isInsufficientBalanceError(msg)) {
+        balanceBlockedUntil.set(pred.windowKey, now + 30_000)
+        log(
+          `${mode.toUpperCase()} SKIP ${pred.coin}/${pred.timeframe} ${order.side} — ${msg} ` +
+            `(deposit or lower stake; pausing retries 30s)`,
+        )
+        return
+      }
       log(
-        `${mode.toUpperCase()} ORDER FAILED ${pred.coin}/${pred.timeframe} ${order.side} — ` +
-          `${e instanceof Error ? e.message : String(e)} (will retry)`,
+        `${mode.toUpperCase()} ORDER FAILED ${pred.coin}/${pred.timeframe} ${order.side} @ ${order.fillPrice.toFixed(3)} · ` +
+          `$${order.stakeUsd} · ${secLeft}s left — ${msg}` +
+          (attempt < ENTRY_MAX_ATTEMPTS ? ` (retry in ${ENTRY_NO_FILL_BACKOFF_MS / 1000}s)` : ' (max attempts)'),
       )
+      if (attempt < ENTRY_MAX_ATTEMPTS) entryRetryAfter.set(pred.windowKey, now + ENTRY_NO_FILL_BACKOFF_MS)
       return
     }
     enteringValue.delete(pred.windowKey)
     if (!(fill.fillSize > 0 && fill.fillPrice > 0)) {
       log(
+        `${mode.toUpperCase()} NO FILL ${pred.coin}/${pred.timeframe} ${order.side} @ ${order.fillPrice.toFixed(3)} · ` +
+          `$${order.stakeUsd} · ${secLeft}s left — book empty / FAK killed` +
+          (attempt < ENTRY_MAX_ATTEMPTS ? ` (retry in ${ENTRY_NO_FILL_BACKOFF_MS / 1000}s)` : ' (max attempts)'),
+      )
+      if (attempt < ENTRY_MAX_ATTEMPTS) entryRetryAfter.set(pred.windowKey, now + ENTRY_NO_FILL_BACKOFF_MS)
+      return
+    }
+
+    const cost = fill.fillPrice * fill.fillSize
+    if (mode === 'live' && cost < order.stakeUsd * 0.9) {
+      log(
         `${mode.toUpperCase()} NO FILL ${pred.coin}/${pred.timeframe} ${order.side} ` +
-          `(book empty / rejected — will retry while entry window open)`,
+          `(dust fill $${cost.toFixed(4)} on $${order.stakeUsd} order — not recording)`,
       )
       return
     }
     entered.add(pred.windowKey)
-
-    const cost = fill.fillPrice * fill.fillSize
+    if (mode === 'live') cachedUsdcBalance = cachedUsdcBalance == null ? null : cachedUsdcBalance - cost
     db.insertTrade({
       windowKey: pred.windowKey,
       coin: pred.coin,
@@ -409,9 +574,18 @@ async function main(): Promise<void> {
       fill = await executor.buy(order)
     } catch (e) {
       enteringSwing.delete(pred.windowKey)
+      const msg = e instanceof Error ? e.message : String(e)
+      if (isInsufficientBalanceError(msg)) {
+        balanceBlockedUntil.set(pred.windowKey, now + 30_000)
+        log(
+          `${mode.toUpperCase()} SKIP swing ${pred.coin}/${pred.timeframe} ${order.side} — ${msg} ` +
+            `(deposit or lower stake; pausing retries 30s)`,
+        )
+        return
+      }
       log(
         `${mode.toUpperCase()} ORDER FAILED ${pred.coin}/${pred.timeframe} ${order.side} — ` +
-          `${e instanceof Error ? e.message : String(e)} (will retry)`,
+          `${msg} (will retry)`,
       )
       return
     }
@@ -422,6 +596,10 @@ async function main(): Promise<void> {
     }
     const entryFee = takerFee(fill.fillPrice, fill.fillSize, config.feeRate)
     const cost = fill.fillPrice * fill.fillSize + entryFee
+    if (mode === 'live' && fill.fillPrice * fill.fillSize < order.stakeUsd * 0.9) {
+      return
+    }
+    if (mode === 'live') cachedUsdcBalance = cachedUsdcBalance == null ? null : cachedUsdcBalance - cost
     const signalEdge = sourceEdge(pred, config.signalSource)
     db.insertTrade({
       windowKey: pred.windowKey,
@@ -459,6 +637,201 @@ async function main(): Promise<void> {
   ): Promise<void> {
     await swingExit(pred, market, now)
     if (canEnter) await swingEnter(pred, market, now)
+  }
+
+  // --- Maker strategy (strategy='maker'): post two-sided passive quotes, book
+  // simulated fills off the trade tape, flatten near the boundary, settle at end.
+  // See docs/maker-paper-strategy.md. ---
+
+  /** Advance the fill sim against trade prints since the last step; book any fills. */
+  function makerStep(now: number): void {
+    const orders = makerExec.open()
+    if (orders.length === 0) {
+      makerStepAt = now
+      return
+    }
+    const since = makerStepAt || now - 3_000
+    const byToken = new Map<string, TradePrint[]>()
+    for (const o of orders) {
+      if (!byToken.has(o.tokenId)) byToken.set(o.tokenId, makerStream.tradesSince(o.tokenId, since))
+    }
+    const fills = makerExec.step(byToken)
+    makerStepAt = now
+    for (const fill of fills) applyMakerFill(fill, now)
+  }
+
+  function applyMakerFill(fill: MakerFill, now: number): void {
+    const inv = makerInv.get(fill.windowKey) ?? { upShares: 0, downShares: 0 }
+    const meta = makerMeta.get(fill.windowKey)
+    const acct =
+      makerAcct.get(fill.windowKey) ??
+      ({
+        coin: meta?.coin ?? fill.windowKey,
+        timeframe: meta?.timeframe ?? '',
+        regime: meta?.regime ?? null,
+        entryT: now,
+        ...emptyAccount(),
+      } satisfies MakerAcct)
+    applyFill(acct, inv, fill)
+    makerInv.set(fill.windowKey, inv)
+    makerAcct.set(fill.windowKey, acct)
+
+    db.insertMakerFill({
+      windowKey: fill.windowKey,
+      coin: acct.coin,
+      timeframe: acct.timeframe,
+      mode,
+      tokenSide: fill.side,
+      fillT: fill.t,
+      price: fill.price,
+      size: fill.size,
+      rebate: fill.rebate,
+      fillModel: config.makerFillModel,
+      orderId: fill.orderId,
+    })
+    stats.makerFills += 1
+  }
+
+  /** Seed L2 queue-ahead from live depth at the quote's price (0 under L1). */
+  function postMakerQuote(q: MakerQuote, now: number): void {
+    const qAhead = config.makerFillModel === 'L2' ? makerStream.depthAt(q.tokenId, 'bid', q.price) : 0
+    makerExec.post(q, now, qAhead)
+  }
+
+  /** Diff desired quotes against resting ones: cancel stale, keep matches, post new. */
+  function reconcileMakerQuotes(windowKey: string, desired: MakerQuote[], now: number): void {
+    const resting = makerExec.open(windowKey)
+    const want = new Set(desired.map((d) => d.side))
+    for (const o of resting) if (!want.has(o.side)) makerExec.cancel(o.id)
+    const bySide = new Map(resting.map((o) => [o.side, o] as const))
+    for (const d of desired) {
+      const cur = bySide.get(d.side)
+      const key = `${windowKey}:${d.side}`
+      if (!cur) {
+        postMakerQuote(d, now)
+        makerLastRequote.set(key, now)
+        continue
+      }
+      const priceMoved = Math.abs(cur.price - d.price) >= config.makerRequoteEdge
+      const canRequote = now - (makerLastRequote.get(key) ?? 0) >= config.makerMinRequoteMs
+      if (priceMoved && canRequote) {
+        // Cancel-replace resets queue position — the modeled cost of over-requoting.
+        makerExec.cancel(cur.id)
+        postMakerQuote(d, now)
+        makerLastRequote.set(key, now)
+      }
+    }
+  }
+
+  /** Per-window each tick: capture meta, manage the boundary, then (re)quote. */
+  function manageMaker(pred: Prediction, market: ParsedMarket, now: number, canEnter: boolean): void {
+    makerMeta.set(pred.windowKey, {
+      coin: pred.coin,
+      timeframe: pred.timeframe,
+      regime: pred.regime,
+      upTokenId: market.upTokenId,
+      downTokenId: market.downTokenId,
+      tickSize: market.tickSize,
+      endMs: market.endDate.getTime(),
+    })
+    const msRemaining = market.endDate.getTime() - now
+    // Flatten residual inventory just before close (unless holding to settlement).
+    if (!config.makerLetRide && msRemaining <= config.makerFlattenSec * 1_000) {
+      makerExec.cancelWindow(pred.windowKey)
+      flattenMakerWindow(pred.windowKey, now)
+      return
+    }
+    // Stop quoting when pulled, halted, or this timeframe isn't currently traded.
+    if (msRemaining <= config.makerPullSec * 1_000 || entriesHalted(now) || !canEnter) {
+      makerExec.cancelWindow(pred.windowKey)
+      return
+    }
+    const inv = makerInv.get(pred.windowKey) ?? { upShares: 0, downShares: 0 }
+    const ctx: MakerContext = {
+      pred,
+      upBook: market.upTokenId ? makerStream.book(market.upTokenId) : null,
+      downBook: market.downTokenId ? makerStream.book(market.downTokenId) : null,
+      upTokenId: market.upTokenId,
+      downTokenId: market.downTokenId,
+      tickSize: market.tickSize,
+      msRemaining,
+    }
+    reconcileMakerQuotes(pred.windowKey, decideQuotes(ctx, inv, config), now)
+  }
+
+  /** Cross the spread to flatten the net position at the book bid (a sell → fee-exempt today). */
+  function flattenMakerWindow(windowKey: string, now: number): void {
+    const inv = makerInv.get(windowKey)
+    const acct = makerAcct.get(windowKey)
+    const meta = makerMeta.get(windowKey)
+    if (!inv || !acct || !meta) return
+    const q = inv.upShares - inv.downShares
+    if (Math.abs(q) < 1e-6) return
+    const sellSide: 'up' | 'down' = q > 0 ? 'up' : 'down'
+    const tokenId = sellSide === 'up' ? meta.upTokenId : meta.downTokenId
+    const bid = tokenId ? makerStream.book(tokenId)?.bestBid ?? null : null
+    const leg = flattenAccount(acct, inv, bid, config.feeRate, config.feeSell)
+    if (!leg) return // no book to sell into → residual settles at the boundary
+    makerInv.set(windowKey, inv)
+    db.insertMakerFill({
+      windowKey,
+      coin: acct.coin,
+      timeframe: acct.timeframe,
+      mode,
+      tokenSide: leg.side,
+      fillT: now,
+      price: leg.price,
+      size: -leg.qty, // negative size marks a flatten sell in the ledger
+      rebate: 0,
+      fillModel: `${config.makerFillModel}-flatten`,
+      orderId: null,
+    })
+    log(
+      `${mode.toUpperCase()} MAKER FLATTEN ${acct.coin}/${acct.timeframe} sold ${leg.qty.toFixed(1)} ${leg.side} @ ${leg.price.toFixed(3)}`,
+    )
+  }
+
+  /** After a window ends, settle residual inventory ($1/$0) and write one summary row. */
+  function finalizeMakerWindows(now: number): void {
+    for (const [windowKey, acct] of makerAcct) {
+      const endMs = makerMeta.get(windowKey)?.endMs ?? windowEndMsFromKey(windowKey)
+      if (endMs == null || now <= endMs + 2_000) continue
+      const inv = makerInv.get(windowKey) ?? { upShares: 0, downShares: 0 }
+      const residual = Math.abs(inv.upShares - inv.downShares)
+      const outcome = db.outcomeFor(windowKey)
+      // Wait for the boundary outcome before settling residual inventory (give up late).
+      if (residual > 1e-6 && outcome == null && now <= endMs + OUTCOME_GIVEUP_MS) continue
+
+      const s = settleAccount(acct, inv, outcome)
+      db.insertMakerTrade({
+        windowKey,
+        coin: acct.coin,
+        timeframe: acct.timeframe,
+        mode,
+        side: s.side,
+        entryT: acct.entryT,
+        entryPrice: s.entryPrice,
+        size: s.size,
+        cost: s.cost,
+        entryFee: acct.fees,
+        regimeEntry: acct.regime,
+        settleT: now,
+        payout: s.payout,
+        pnl: s.pnl,
+      })
+      makerAcct.delete(windowKey)
+      makerInv.delete(windowKey)
+      makerMeta.delete(windowKey)
+      makerLastRequote.delete(`${windowKey}:up`)
+      makerLastRequote.delete(`${windowKey}:down`)
+      makerExec.cancelWindow(windowKey)
+      stats.settled += 1
+      log(
+        `${mode.toUpperCase()} MAKER SETTLE ${acct.coin}/${acct.timeframe} · ` +
+          `fills ${acct.grossShares.toFixed(1)}sh · staked $${s.cost.toFixed(2)} · ` +
+          `rebate $${acct.rebate.toFixed(3)} · pnl ${s.pnl >= 0 ? '+' : ''}$${s.pnl.toFixed(3)}`,
+      )
+    }
   }
 
   // Queue every open position to be force-closed at market (used on a strategy
@@ -654,6 +1027,8 @@ async function main(): Promise<void> {
       if (config.strategy === 'swing') {
         recordMid(pred, now)
         void manageSwing(pred, market, now, canEnter)
+      } else if (config.strategy === 'maker') {
+        manageMaker(pred, market, now, canEnter)
       } else if (canEnter) {
         void maybeTrade(pred, market, now)
       }
@@ -739,6 +1114,42 @@ async function main(): Promise<void> {
     }
   }
 
+  // Maker live state for the dashboard monitor (only meaningful while strategy='maker').
+  function makerStatus(): NonNullable<BotStatus['maker']> {
+    const inventory = [...makerInv.entries()].map(([wk, inv]) => {
+      const meta = makerMeta.get(wk)
+      return {
+        coin: meta?.coin ?? '?',
+        timeframe: meta?.timeframe ?? '?',
+        net: inv.upShares - inv.downShares,
+        upShares: inv.upShares,
+        downShares: inv.downShares,
+      }
+    })
+    const quotes = makerExec.open().map((o) => {
+      const meta = makerMeta.get(o.windowKey)
+      return {
+        coin: meta?.coin ?? '?',
+        timeframe: meta?.timeframe ?? '?',
+        side: o.side,
+        price: o.price,
+        size: o.size - o.filled,
+      }
+    })
+    return {
+      fillModel: config.makerFillModel,
+      baseSpread: config.makerBaseSpread,
+      clipUsd: config.makerClipUsd,
+      maxInventory: config.makerMaxInventory,
+      rebateRate: config.makerRebateRate,
+      feedConnected: makerStream.connected,
+      fills: stats.makerFills,
+      openQuotes: quotes.length,
+      inventory,
+      quotes,
+    }
+  }
+
   // --- control server for the dashboard Dry/Live switch ---
   const controlServer =
     process.env.BOT_CONTROL === '0'
@@ -748,6 +1159,7 @@ async function main(): Promise<void> {
             getStatus: () => ({
               mode,
               stakeUsd: config.stakeUsd,
+              usdcBalance: mode === 'live' ? cachedUsdcBalance : null,
               strategy: config.strategy,
               allowLive,
               halted,
@@ -761,7 +1173,7 @@ async function main(): Promise<void> {
                 trades: stats.trades,
                 settled: stats.settled,
               },
-              summary: db.tradeSummary(),
+              summary: db.tradeSummaryForMode(mode),
               dailyTrades: db.countTradesSince(Date.now() - 86_400_000),
               maxDailyTrades: effectiveDailyCap(),
               // Traded subset + the full recorded universe it can be toggled across.
@@ -773,7 +1185,8 @@ async function main(): Promise<void> {
               swingTrigger: config.swingTrigger,
               swingSource: config.signalSource,
               openPositions: openPositions(),
-              recentClosed: db.recentClosed(8),
+              recentClosed: db.recentClosed(8, mode),
+              maker: config.strategy === 'maker' ? makerStatus() : undefined,
             }),
             setMode,
             setHalted,
@@ -781,6 +1194,7 @@ async function main(): Promise<void> {
             setMaxDailyTrades,
             setStrategy,
             setTradeTimeframes,
+            setMaker,
             getHistory: (query) => db.queryTrades(query),
           },
           Number(process.env.BOT_CONTROL_PORT ?? 8790),
@@ -791,19 +1205,46 @@ async function main(): Promise<void> {
   seedTrackedFromOpen()
 
   let lastStatus = 0
+  let lastBalanceRefresh = 0
+  const BALANCE_REFRESH_MS = 60_000
   const timer = setInterval(() => {
     const now = Date.now()
+    // Maker: keep the CLOB feed subscribed to tradable tokens and advance the fill
+    // sim BEFORE quoting happens inside sampleScope (fills update inventory first).
+    if (mode !== 'record' && config.strategy === 'maker') {
+      const ids: string[] = []
+      for (const s of scopes) {
+        if (!s.market || !tradeTf.has(s.timeframe)) continue
+        if (s.market.upTokenId) ids.push(s.market.upTokenId)
+        if (s.market.downTokenId) ids.push(s.market.downTokenId)
+      }
+      makerStream.setTokens(ids)
+      makerStep(now)
+    }
     for (const state of scopes) {
       refreshMarket(state, now)
       sampleScope(state, now)
     }
     seedTrackedFromOpen()
     sweepOutcomes(now)
+    // Finalize maker windows regardless of the current strategy so a switch-away
+    // still settles inventory once the boundary outcome lands.
+    if (mode !== 'record') finalizeMakerWindows(now)
     if (mode !== 'record') settleTrades(now)
     // Retry any queued force-closes (strategy switch) whose book was empty/thin.
     if (mode !== 'record' && pendingClose.size > 0 && now - lastCloseDrain >= CLOSE_RETRY_MS) {
       lastCloseDrain = now
       void drainPendingCloses()
+    }
+
+    if (mode === 'live' && now - lastBalanceRefresh >= BALANCE_REFRESH_MS) {
+      lastBalanceRefresh = now
+      void import('../api/_lib/clob')
+        .then(({ fetchUsdcBalance }) => fetchUsdcBalance())
+        .then((b) => {
+          cachedUsdcBalance = b
+        })
+        .catch(() => {})
     }
 
     if (now - lastStatus >= STATUS_MS) {
@@ -812,6 +1253,11 @@ async function main(): Promise<void> {
       const dailyTrades = db.countTradesSince(now - 86_400_000)
       const cap = effectiveDailyCap()
       const dailyCap = mode !== 'record' && cap > 0 && dailyTrades >= cap
+      const makerBrief =
+        config.strategy === 'maker' && mode !== 'record'
+          ? ` · maker[cw=${makerStream.connected ? 'up' : 'down'} quotes=${makerExec.open().length}` +
+            ` fills=${stats.makerFills} invWin=${makerInv.size}]`
+          : ''
       log(
         `[${mode}] ws=${stream.connected ? 'up' : 'down'} · live=${live}/${scopes.length} · ` +
           `ticks=${stats.ticks} preds=${stats.predictions} outcomes=${stats.outcomes}` +
@@ -819,6 +1265,7 @@ async function main(): Promise<void> {
             ? ` · trades=${stats.trades} settled=${stats.settled} open=${db.countOpenTrades()}` +
               ` · daily ${dailyTrades}/${cap || '∞'}${dailyCap ? ' CAP' : ''}`
             : '') +
+          makerBrief +
           ` · pending=${tracked.size}`,
       )
     }
@@ -828,6 +1275,7 @@ async function main(): Promise<void> {
     clearInterval(timer)
     controlServer?.close()
     stream.stop()
+    makerStream.stop()
     db.close()
     log(`${mode} stopped`)
     process.exit(0)

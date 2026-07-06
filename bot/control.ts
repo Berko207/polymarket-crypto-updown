@@ -13,8 +13,10 @@ export interface BotStatus {
   mode: BotMode
   /** USDC stake per automated entry (runtime-adjustable via POST /stake). */
   stakeUsd: number
+  /** CLOB USDC balance when live (null in record/dry or before first arm). */
+  usdcBalance: number | null
   /** Active entry/exit family — runtime-switchable from the dashboard (POST /strategy). */
-  strategy: 'value' | 'swing'
+  strategy: 'value' | 'swing' | 'maker'
   allowLive: boolean
   halted: boolean
   connected: boolean
@@ -50,6 +52,7 @@ export interface BotStatus {
   }[]
   /** Most-recent finished trades, newest first (activity feed). */
   recentClosed: {
+    mode: string
     coin: string
     timeframe: string
     side: 'up' | 'down'
@@ -61,6 +64,24 @@ export interface BotStatus {
     settleT: number
     status: string
   }[]
+  /** Maker-strategy live state — present only while strategy='maker'. */
+  maker?: {
+    fillModel: 'L1' | 'L2'
+    baseSpread: number
+    clipUsd: number
+    maxInventory: number
+    rebateRate: number
+    /** CLOB depth/tape feed connected. */
+    feedConnected: boolean
+    /** Simulated fills booked this session. */
+    fills: number
+    /** Resting quotes currently on the (simulated) book. */
+    openQuotes: number
+    /** Net inventory per open window. */
+    inventory: { coin: string; timeframe: string; net: number; upShares: number; downShares: number }[]
+    /** The resting quotes themselves (remaining size). */
+    quotes: { coin: string; timeframe: string; side: 'up' | 'down'; price: number; size: number }[]
+  }
 }
 
 export interface BotRuntime {
@@ -70,8 +91,16 @@ export interface BotRuntime {
   setStakeUsd(stakeUsd: number): { ok: boolean; error?: string }
   /** 0 = mode default (50 live, unlimited paper). */
   setMaxDailyTrades(maxDailyTrades: number): { ok: boolean; error?: string }
-  setStrategy(strategy: 'value' | 'swing'): { ok: boolean; error?: string }
+  setStrategy(strategy: 'value' | 'swing' | 'maker'): { ok: boolean; error?: string }
   setTradeTimeframes(timeframes: string[]): { ok: boolean; error?: string }
+  /** Runtime maker tuning — any subset of the knobs. */
+  setMaker(patch: {
+    baseSpread?: number
+    clipUsd?: number
+    maxInventory?: number
+    fillModel?: 'L1' | 'L2'
+    rebateRate?: number
+  }): { ok: boolean; error?: string }
   getHistory(query: TradeQuery): TradeHistoryPage
 }
 
@@ -182,8 +211,8 @@ export function startControlServer(
           }
           if (url.pathname === '/strategy') {
             const strategy = body.strategy
-            if (strategy !== 'value' && strategy !== 'swing') {
-              return send(400, { error: 'strategy must be value|swing' })
+            if (strategy !== 'value' && strategy !== 'swing' && strategy !== 'maker') {
+              return send(400, { error: 'strategy must be value|swing|maker' })
             }
             const r = runtime.setStrategy(strategy)
             return r.ok ? send(200, runtime.getStatus()) : send(400, { error: r.error })
@@ -193,6 +222,25 @@ export function startControlServer(
               return send(400, { error: 'timeframes must be an array' })
             }
             const r = runtime.setTradeTimeframes(body.timeframes.map(String))
+            return r.ok ? send(200, runtime.getStatus()) : send(400, { error: r.error })
+          }
+          if (url.pathname === '/maker') {
+            const num = (v: unknown): number | undefined => {
+              if (v == null || v === '') return undefined
+              const n = Number(v)
+              return Number.isFinite(n) ? n : undefined
+            }
+            const patch: Parameters<BotRuntime['setMaker']>[0] = {}
+            const bs = num(body.baseSpread)
+            if (bs != null) patch.baseSpread = bs
+            const cl = num(body.clipUsd)
+            if (cl != null) patch.clipUsd = cl
+            const mi = num(body.maxInventory)
+            if (mi != null) patch.maxInventory = mi
+            const rb = num(body.rebateRate)
+            if (rb != null) patch.rebateRate = rb
+            if (body.fillModel === 'L1' || body.fillModel === 'L2') patch.fillModel = body.fillModel
+            const r = runtime.setMaker(patch)
             return r.ok ? send(200, runtime.getStatus()) : send(400, { error: r.error })
           }
         }
