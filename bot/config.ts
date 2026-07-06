@@ -1,7 +1,6 @@
 /**
  * Bot configuration from BOT_* env, with defaults. M1 uses the recorder-relevant
- * fields; the strategy fields are locked now (entry fires late, ~T-10s per the
- * operator's steer) so M2 inherits them without a re-decision.
+ * fields; strategy fields are shared by M2 (value = cheap-side edge to settlement).
  */
 import { COINS, getSeriesSlug } from '../src/lib/config'
 import { chainlinkPair } from '../src/lib/cryptoPrice'
@@ -38,7 +37,7 @@ export interface BotConfig {
    */
   tradeTimeframes: TimeframeId[]
   dbPath: string
-  /** Main loop cadence — must be ≤ a few s so M2 can fire at T-10s. */
+  /** Main loop cadence — must be ≤ a few s so entries can fire mid-window. */
   tickMs: number
   /** Min gap between persisted prediction samples per window. */
   sampleMs: number
@@ -46,16 +45,15 @@ export interface BotConfig {
   marketPollMs: number
   /**
    * Entry/exit family:
-   *  'value' = late ~T-10s edge bet, held to settlement ($0/$1) — the original.
+   *  'value' = model edge on the cheap side, held to settlement ($0/$1).
    *  'swing' = fade a fresh odds overshoot, auto take-profit/stop mid-window.
+   *  'maker' = post two-sided passive limit quotes; capture spread + rebate (paper).
    */
-  strategy: 'value' | 'swing'
-  // --- value strategy (fires late, ~T-10s) ---
-  /** Fire the entry when this many seconds remain (late, near settle). */
-  entryAtSec: number
-  /** Tolerance around entryAtSec — the loop only sees discrete ticks. */
-  entryToleranceSec: number
+  strategy: 'value' | 'swing' | 'maker'
+  // --- value strategy (edge + cheap ask, any time in window) ---
   edgeThreshold: number
+  /** Skip value entries when the buy ask is above this (avoids 90¢ favorites). */
+  valueMaxEntryPrice: number
   stakeUsd: number
   /** Max entries in a rolling 24h window; 0 = unlimited (paper default). Live falls back to 50. */
   maxDailyTrades: number
@@ -90,6 +88,37 @@ export interface BotConfig {
   swingSkipCalm: boolean
   /** Poll cadence for a scope that holds an open position (tightens the stop). */
   swingOpenPollMs: number
+  // --- maker strategy (strategy='maker'; see engine/maker.ts + docs/maker-paper-strategy.md) ---
+  /** Fill-sim fidelity: 'L1' trade-through, 'L2' also models queue-ahead. */
+  makerFillModel: 'L1' | 'L2'
+  /** Half-spread floor (pts) each quote sits off the reservation price. */
+  makerBaseSpread: number
+  /** Widen the half-spread per unit of sigmaWindow. */
+  makerVolCoef: number
+  /** Widen the half-spread per unit of toxicity (adverse flow; Phase 2). */
+  makerToxCoef: number
+  /** Reservation-price skew at full inventory (shifts quotes to shed inventory). */
+  makerInvSkew: number
+  /** Notional ($) per quote; shares = clip / price, scaled by inventory room. */
+  makerClipUsd: number
+  /** Net-share inventory cap per window (also the kill trigger). */
+  makerMaxInventory: number
+  /** Weight on the book microprice when blending fair value (0 = pure model). */
+  makerMicropriceWeight: number
+  /** Rebate per filled share — 0 by default (see makerFees.ts / spec open Q1). */
+  makerRebateRate: number
+  /** FV move that forces a cancel-replace of a resting quote. */
+  makerRequoteEdge: number
+  /** Min gap between requotes on a side (ms). */
+  makerMinRequoteMs: number
+  /** Start widening quotes once the window is within this many seconds of close. */
+  makerWidenSec: number
+  /** Pull all quotes once within this many seconds of close. */
+  makerPullSec: number
+  /** Flatten residual inventory at market this many seconds before close. */
+  makerFlattenSec: number
+  /** Hold residual inventory to $0/$1 settlement instead of flattening (A/B variant). */
+  makerLetRide: boolean
   // --- fee model (paper realism; see engine/fees.ts) ---
   /** Taker feeRate for the parabolic fee (crypto ≈ 0.07; 0 disables). */
   feeRate: number
@@ -103,8 +132,8 @@ const DEFAULT_COINS: CoinId[] = ['btc', 'eth', 'sol', 'xrp', 'doge', 'bnb']
 const KNOWN_TF: TimeframeId[] = ['5m', '15m', '1h', '4h', 'daily']
 /** Recorded by default — 5m kept for its dataset even though it's not traded. */
 const DEFAULT_RECORD_TF: TimeframeId[] = ['5m', '15m', '1h', '4h']
-/** Traded by default — windows long enough for the swing to work; excludes 5m. */
-const DEFAULT_TRADE_TF: TimeframeId[] = ['15m', '1h', '4h']
+/** Traded by default — 5m/15m/1h; 4h excluded (slow, low upside at favorites). */
+const DEFAULT_TRADE_TF: TimeframeId[] = ['5m', '15m', '1h']
 
 function parseList<T extends string>(raw: string | undefined, valid: T[], fallback: T[]): T[] {
   if (!raw) return fallback
@@ -141,8 +170,11 @@ export function loadConfig(): BotConfig {
   const tradeWanted = parseList<TimeframeId>(env.BOT_TRADE_TIMEFRAMES, KNOWN_TF, DEFAULT_TRADE_TF)
   const tradeIntersect = tradeWanted.filter((tf) => timeframes.includes(tf))
   const tradeTimeframes = tradeIntersect.length ? tradeIntersect : timeframes
-  const strategy: 'value' | 'swing' =
-    env.BOT_STRATEGY?.trim().toLowerCase() === 'swing' ? 'swing' : 'value'
+  const strategyRaw = env.BOT_STRATEGY?.trim().toLowerCase()
+  const strategy: 'value' | 'swing' | 'maker' =
+    strategyRaw === 'swing' ? 'swing' : strategyRaw === 'maker' ? 'maker' : 'value'
+  const makerFillModel: 'L1' | 'L2' =
+    env.BOT_MAKER_FILL_MODEL?.trim().toUpperCase() === 'L2' ? 'L2' : 'L1'
   const swingTrigger: SwingTrigger =
     env.BOT_SWING_TRIGGER?.trim().toLowerCase() === 'move' ? 'move' : 'edge'
   const sourceRaw = env.BOT_SIGNAL_SOURCE?.trim().toLowerCase()
@@ -160,9 +192,8 @@ export function loadConfig(): BotConfig {
     strategy,
     swingTrigger,
     signalSource,
-    entryAtSec: num(env.BOT_ENTRY_AT_SEC, 10),
-    entryToleranceSec: num(env.BOT_ENTRY_TOLERANCE_SEC, 4),
     edgeThreshold: num(env.BOT_EDGE_THRESHOLD, 0.05),
+    valueMaxEntryPrice: num(env.BOT_VALUE_MAX_ENTRY_PRICE, 0.5),
     stakeUsd: num(env.BOT_STAKE_USD, 1),
     maxDailyTrades: numNonNeg(env.BOT_MAX_DAILY_TRADES, 0),
     maxConcurrent: num(env.BOT_MAX_CONCURRENT, 5),
@@ -178,6 +209,21 @@ export function loadConfig(): BotConfig {
     swingMaxPrice: num(env.BOT_SWING_MAX_PRICE, 0.8),
     swingSkipCalm: env.BOT_SWING_SKIP_CALM !== '0',
     swingOpenPollMs: num(env.BOT_SWING_OPEN_POLL_MS, 2_000),
+    makerFillModel,
+    makerBaseSpread: num(env.BOT_MAKER_BASE_SPREAD, 0.02),
+    makerVolCoef: numNonNeg(env.BOT_MAKER_VOL_COEF, 0.5),
+    makerToxCoef: numNonNeg(env.BOT_MAKER_TOX_COEF, 0.3),
+    makerInvSkew: numNonNeg(env.BOT_MAKER_INV_SKEW, 0.02),
+    makerClipUsd: num(env.BOT_MAKER_CLIP_USD, 1),
+    makerMaxInventory: num(env.BOT_MAKER_MAX_INVENTORY, 20),
+    makerMicropriceWeight: numNonNeg(env.BOT_MAKER_MICROPRICE_WEIGHT, 0),
+    makerRebateRate: numNonNeg(env.BOT_MAKER_REBATE_RATE, 0),
+    makerRequoteEdge: num(env.BOT_MAKER_REQUOTE_EDGE, 0.01),
+    makerMinRequoteMs: num(env.BOT_MAKER_MIN_REQUOTE_MS, 1_500),
+    makerWidenSec: num(env.BOT_MAKER_WIDEN_SEC, 60),
+    makerPullSec: num(env.BOT_MAKER_PULL_SEC, 20),
+    makerFlattenSec: num(env.BOT_MAKER_FLATTEN_SEC, 15),
+    makerLetRide: env.BOT_MAKER_LET_RIDE === '1',
     feeRate: numNonNeg(env.BOT_FEE_RATE, 0.07),
     feeSell: env.BOT_FEE_SELL === '1',
   }

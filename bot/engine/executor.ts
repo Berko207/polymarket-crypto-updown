@@ -57,28 +57,65 @@ export const dryExecutor: Executor = {
  * is dynamically imported on first use so record/dry never load viem/clob-client.
  * A no-fill (unmatched/failed) returns fillSize 0 — the caller records nothing.
  */
+export function isInsufficientBalanceError(message: string): boolean {
+  const lower = message.toLowerCase()
+  return lower.includes('not enough balance') || lower.includes('insufficient usdc')
+}
+
 export function makeLiveExecutor(): Executor {
   let place: typeof import('../../api/_lib/clob').placeMarketOrder | null = null
+  let fetchBal: typeof import('../../api/_lib/clob').fetchUsdcBalance | null = null
   const load = async (): Promise<typeof import('../../api/_lib/clob').placeMarketOrder> => {
     if (!place) place = (await import('../../api/_lib/clob')).placeMarketOrder
     return place
   }
+  const loadBal = async (): Promise<typeof import('../../api/_lib/clob').fetchUsdcBalance> => {
+    if (!fetchBal) fetchBal = (await import('../../api/_lib/clob')).fetchUsdcBalance
+    return fetchBal
+  }
+  // One live buy at a time — parallel entry ticks across coins were racing on the
+  // same USDC balance and CLOB was rejecting with "sum of matched orders" errors.
+  let buyChain: Promise<unknown> = Promise.resolve()
   return {
     async buy(order) {
-      const res = await (await load())({
-        tokenId: order.tokenId,
-        side: 'BUY',
-        amount: order.stakeUsd,
-        price: order.fillPrice,
-        orderType: 'market',
-        tickSize: order.tickSize ?? undefined,
-        negRisk: order.negRisk ?? undefined,
-      })
-      const status = (res.status ?? '').toLowerCase()
-      if (!res.success || status === 'unmatched' || !res.fillSize || !res.fillPrice) {
-        return { fillPrice: 0, fillSize: 0, orderId: res.orderId ?? null }
+      const run = async (): Promise<Fill> => {
+        const bal = await (await loadBal())()
+        if (order.stakeUsd > bal) {
+          throw new Error(
+            `insufficient USDC (need $${order.stakeUsd.toFixed(2)}, have $${bal.toFixed(2)})`,
+          )
+        }
+        const res = await (await load())({
+          tokenId: order.tokenId,
+          side: 'BUY',
+          amount: order.stakeUsd,
+          price: order.fillPrice,
+          orderType: 'market',
+          tickSize: order.tickSize ?? undefined,
+          negRisk: order.negRisk ?? undefined,
+        })
+        const status = (res.status ?? '').toLowerCase()
+        let fillPrice = res.fillPrice ?? 0
+        let fillSize = res.fillSize ?? 0
+        const matched =
+          res.success && status !== 'unmatched' && order.fillPrice > 0 && order.fillPrice < 1
+        const reportedCost = fillPrice > 0 && fillSize > 0 ? fillPrice * fillSize : 0
+        // Fallback when CLOB omits amounts or reports a dust fill on a full $stake order.
+        if (
+          matched &&
+          (reportedCost < order.stakeUsd * 0.9 || !fillPrice || !fillSize)
+        ) {
+          fillPrice = fillPrice > 0 && fillPrice < 1 ? fillPrice : order.fillPrice
+          fillSize = order.stakeUsd / fillPrice
+        }
+        if (!res.success || status === 'unmatched' || !fillSize || !fillPrice) {
+          return { fillPrice: 0, fillSize: 0, orderId: res.orderId ?? null }
+        }
+        return { fillPrice, fillSize, orderId: res.orderId ?? null }
       }
-      return { fillPrice: res.fillPrice, fillSize: res.fillSize, orderId: res.orderId ?? null }
+      const p = buyChain.then(run, run)
+      buyChain = p.catch(() => {})
+      return p
     },
     async sell(order) {
       const res = await (await load())({

@@ -5,6 +5,7 @@ import { MIN_BUY_USD } from '@/lib/api'
 import { Input } from '@/components/ui/input'
 import {
   useBotHalt,
+  useBotMaker,
   useBotMaxDailyTrades,
   useBotMode,
   useBotStake,
@@ -13,7 +14,7 @@ import {
   useBotTradeTimeframes,
 } from '@/queries/bot'
 import { EXIT_META } from '@/lib/botFormat'
-import type { BotMode } from '@/lib/botControl'
+import type { BotMode, MakerPatch } from '@/lib/botControl'
 
 // Record = observe/log only · Paper = simulated fills, no real money · Live =
 // real orders (gated). "Paper" is the wire id 'dry' — the bot/DB keep that id.
@@ -27,6 +28,24 @@ const modeLabel = (id: BotMode): string => MODES.find((m) => m.id === id)?.label
 
 const STAKE_PRESETS = [1, 5, 10, 25] as const
 const DAILY_CAP_PRESETS = [50, 100, 250, 500, 1000] as const
+
+const STRAT_META: Record<'value' | 'swing' | 'maker', { label: string; title: string; badge: string }> = {
+  value: {
+    label: 'Value',
+    title: 'Value — late edge bet held to settlement',
+    badge: 'bg-secondary text-muted-foreground',
+  },
+  swing: {
+    label: 'Swing',
+    title: 'Swing scalp — buys the model’s underpriced side, auto take-profit/stop',
+    badge: 'bg-primary/15 text-primary',
+  },
+  maker: {
+    label: 'Maker',
+    title: 'Maker — two-sided passive quotes; capture spread + rebate (paper simulation)',
+    badge: 'bg-sky-500/15 text-sky-300',
+  },
+}
 
 /**
  * Bot execution-mode switch + live status for the local bot. Talks to the bot's
@@ -43,6 +62,7 @@ export function BotControlPanel() {
   const dailyCapMut = useBotMaxDailyTrades()
   const strat = useBotStrategy()
   const tradeTf = useBotTradeTimeframes()
+  const makerMut = useBotMaker()
   // TanStack keeps the last successful data while polling errors — without the
   // isError gate a killed bot would show "streaming" with stale PnL forever.
   const s = status.isError ? undefined : status.data
@@ -52,6 +72,13 @@ export function BotControlPanel() {
   const serverDailyCap = s?.maxDailyTrades ?? 0
   const [draftStake, setDraftStake] = useState(serverStake)
   const [draftDailyCap, setDraftDailyCap] = useState(serverDailyCap)
+  const maker = s?.maker
+  const mkSpread = maker?.baseSpread
+  const mkClip = maker?.clipUsd
+  const mkMaxInv = maker?.maxInventory
+  const [draftSpread, setDraftSpread] = useState(0.02)
+  const [draftClip, setDraftClip] = useState(1)
+  const [draftMaxInv, setDraftMaxInv] = useState(20)
   // Strategy + trade-timeframe control needs a bot new enough to report the universe.
   const tfSupported = s?.availableTimeframes != null
   const availableTf = s?.availableTimeframes ?? []
@@ -64,6 +91,27 @@ export function BotControlPanel() {
   useEffect(() => {
     setDraftDailyCap(serverDailyCap)
   }, [serverDailyCap])
+
+  useEffect(() => {
+    if (mkSpread != null) setDraftSpread(mkSpread)
+  }, [mkSpread])
+  useEffect(() => {
+    if (mkClip != null) setDraftClip(mkClip)
+  }, [mkClip])
+  useEffect(() => {
+    if (mkMaxInv != null) setDraftMaxInv(mkMaxInv)
+  }, [mkMaxInv])
+
+  const commitMaker = (patch: MakerPatch, label: string) => {
+    if (!maker || makerMut.isPending) return
+    makerMut.mutate(patch, {
+      onError: (e) => {
+        const msg = e instanceof Error ? e.message : 'maker update failed'
+        toast.error(msg === 'not found' ? 'Restart the bot to enable maker controls' : msg)
+      },
+      onSuccess: () => toast.success(label),
+    })
+  }
 
   const commitStake = (raw: number) => {
     if (!stakeSupported) {
@@ -107,14 +155,14 @@ export function BotControlPanel() {
     })
   }
 
-  const switchStrategy = (next: 'value' | 'swing') => {
+  const switchStrategy = (next: 'value' | 'swing' | 'maker') => {
     if (!s || next === s.strategy || strat.isPending) return
     strat.mutate(next, {
       onError: (e) => {
         const msg = e instanceof Error ? e.message : 'strategy switch failed'
         toast.error(msg === 'not found' ? 'Restart the bot (pnpm bot:paper) to enable strategy control' : msg)
       },
-      onSuccess: () => toast.success(`Strategy → ${next === 'swing' ? 'Swing' : 'Value'}`),
+      onSuccess: () => toast.success(`Strategy → ${STRAT_META[next].label}`),
     })
   }
 
@@ -152,17 +200,13 @@ export function BotControlPanel() {
           </p>
           {s && (
             <span
-              title={
-                strategy === 'swing'
-                  ? 'Swing scalp — buys the model’s underpriced side, auto take-profit/stop'
-                  : 'Value — late edge bet held to settlement'
-              }
+              title={STRAT_META[strategy].title}
               className={cn(
                 'rounded px-1.5 py-0.5 text-[0.6rem] font-semibold uppercase tracking-wide',
-                strategy === 'swing' ? 'bg-primary/15 text-primary' : 'bg-secondary text-muted-foreground',
+                STRAT_META[strategy].badge,
               )}
             >
-              {strategy === 'swing' ? 'Swing' : 'Value'}
+              {STRAT_META[strategy].label}
             </span>
           )}
           {s && strategy === 'swing' && s.swingTrigger && (
@@ -175,6 +219,14 @@ export function BotControlPanel() {
               }
             >
               {s.swingTrigger === 'edge' ? 'model' : 'fade'} · {s.swingSource}
+            </span>
+          )}
+          {s && strategy === 'maker' && s.maker && (
+            <span
+              className="text-[0.6rem] tabular-nums text-muted-foreground"
+              title="Fill model + half-spread the maker is quoting (paper simulation)"
+            >
+              {s.maker.fillModel} · spread±{s.maker.baseSpread} · clip ${s.maker.clipUsd}
             </span>
           )}
         </div>
@@ -198,7 +250,7 @@ export function BotControlPanel() {
                 !s
                   ? 'bot offline — run pnpm bot:paper'
                   : m.id === 'live' && !s.allowLive
-                    ? 'launch the bot with --allow-live to enable'
+                    ? 'Live disabled in paper mode — run pnpm bot:live in a separate terminal'
                     : undefined
               }
               className={cn(
@@ -220,26 +272,22 @@ export function BotControlPanel() {
         <div className="flex flex-col gap-2 rounded-lg bg-secondary px-3 py-2">
           <div className="flex items-center justify-between gap-2">
             <span className="text-xs font-medium text-muted-foreground">Strategy</span>
-            <div className="grid grid-cols-2 gap-0.5 rounded-md bg-background/60 p-0.5">
-              {(['value', 'swing'] as const).map((st) => (
+            <div className="grid grid-cols-3 gap-0.5 rounded-md bg-background/60 p-0.5">
+              {(['value', 'swing', 'maker'] as const).map((st) => (
                 <button
                   key={st}
                   type="button"
                   disabled={strat.isPending}
                   onClick={() => switchStrategy(st)}
-                  title={
-                    st === 'swing'
-                      ? 'Swing scalp — fade odds overshoot, auto take-profit/stop mid-window'
-                      : 'Value — late edge bet held to settlement'
-                  }
+                  title={STRAT_META[st].title}
                   className={cn(
-                    'rounded px-3 py-1 text-xs font-semibold transition disabled:opacity-40',
+                    'rounded px-2 py-1 text-xs font-semibold transition disabled:opacity-40',
                     strategy === st
                       ? 'bg-background text-foreground shadow-sm'
                       : 'text-muted-foreground hover:text-foreground',
                   )}
                 >
-                  {st === 'swing' ? 'Swing' : 'Value'}
+                  {STRAT_META[st].label}
                 </button>
               ))}
             </div>
@@ -273,6 +321,105 @@ export function BotControlPanel() {
                 )
               })}
             </div>
+          </div>
+        </div>
+      )}
+
+      {s && strategy === 'maker' && maker && s.mode !== 'record' && (
+        <div className="flex flex-col gap-2 rounded-lg bg-secondary px-3 py-2">
+          <div className="flex items-center justify-between gap-2">
+            <span className="text-xs font-medium text-muted-foreground">Fill model</span>
+            <div className="grid grid-cols-2 gap-0.5 rounded-md bg-background/60 p-0.5">
+              {(['L1', 'L2'] as const).map((fm) => (
+                <button
+                  key={fm}
+                  type="button"
+                  disabled={makerMut.isPending}
+                  onClick={() => maker.fillModel !== fm && commitMaker({ fillModel: fm }, `Fill model → ${fm}`)}
+                  title={
+                    fm === 'L1'
+                      ? 'L1 — trade-through, assumes front of queue (optimistic on fill rate)'
+                      : 'L2 — also models queue depth ahead of you (more realistic, fewer fills)'
+                  }
+                  className={cn(
+                    'rounded px-3 py-1 text-xs font-semibold transition disabled:opacity-40',
+                    maker.fillModel === fm
+                      ? 'bg-background text-foreground shadow-sm'
+                      : 'text-muted-foreground hover:text-foreground',
+                  )}
+                >
+                  {fm}
+                </button>
+              ))}
+            </div>
+          </div>
+          <div className="grid grid-cols-3 gap-2">
+            <label className="flex flex-col gap-1">
+              <span className="text-[0.6rem] font-medium uppercase tracking-wide text-muted-foreground">
+                Half-spread
+              </span>
+              <Input
+                type="number"
+                inputMode="decimal"
+                className="h-7 text-right text-xs font-bold tabular-nums"
+                min={0.005}
+                max={0.4}
+                step={0.005}
+                value={draftSpread}
+                disabled={makerMut.isPending}
+                onChange={(e) => setDraftSpread(Number(e.target.value) || 0)}
+                onBlur={() => {
+                  if (draftSpread > 0 && draftSpread !== maker.baseSpread) {
+                    commitMaker({ baseSpread: draftSpread }, `Spread → ±${draftSpread}`)
+                  }
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') e.currentTarget.blur()
+                }}
+              />
+            </label>
+            <label className="flex flex-col gap-1">
+              <span className="text-[0.6rem] font-medium uppercase tracking-wide text-muted-foreground">Clip $</span>
+              <Input
+                type="number"
+                inputMode="decimal"
+                className="h-7 text-right text-xs font-bold tabular-nums"
+                min={1}
+                step={1}
+                value={draftClip}
+                disabled={makerMut.isPending}
+                onChange={(e) => setDraftClip(Number(e.target.value) || 0)}
+                onBlur={() => {
+                  if (draftClip > 0 && draftClip !== maker.clipUsd) {
+                    commitMaker({ clipUsd: draftClip }, `Clip → $${draftClip}`)
+                  }
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') e.currentTarget.blur()
+                }}
+              />
+            </label>
+            <label className="flex flex-col gap-1">
+              <span className="text-[0.6rem] font-medium uppercase tracking-wide text-muted-foreground">Max inv</span>
+              <Input
+                type="number"
+                inputMode="numeric"
+                className="h-7 text-right text-xs font-bold tabular-nums"
+                min={1}
+                step={1}
+                value={draftMaxInv}
+                disabled={makerMut.isPending}
+                onChange={(e) => setDraftMaxInv(Number(e.target.value) || 0)}
+                onBlur={() => {
+                  if (draftMaxInv > 0 && draftMaxInv !== maker.maxInventory) {
+                    commitMaker({ maxInventory: draftMaxInv }, `Max inv → ${draftMaxInv}`)
+                  }
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') e.currentTarget.blur()
+                }}
+              />
+            </label>
           </div>
         </div>
       )}
@@ -404,7 +551,8 @@ export function BotControlPanel() {
 
       {!s && (
         <p className="text-center text-[0.7rem] text-muted-foreground">
-          offline · run <code className="rounded bg-secondary px-1 py-0.5">pnpm bot:paper</code> to control the bot
+          offline · run <code className="rounded bg-secondary px-1 py-0.5">pnpm dev</code> for the UI,{' '}
+          <code className="rounded bg-secondary px-1 py-0.5">pnpm bot:live</code> for real orders
         </p>
       )}
 

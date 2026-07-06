@@ -10,8 +10,10 @@ export interface BotStatus {
   mode: BotMode
   /** USDC stake per automated entry; defaults to 1 when talking to an older bot. */
   stakeUsd?: number
+  /** CLOB USDC when live; optional for older bot builds. */
+  usdcBalance?: number | null
   /** Optional so a bot predating the swing strategy still renders (defaults to value). */
-  strategy?: 'value' | 'swing'
+  strategy?: 'value' | 'swing' | 'maker'
   allowLive: boolean
   halted: boolean
   connected: boolean
@@ -42,6 +44,7 @@ export interface BotStatus {
     msRemaining: number | null
   }[]
   recentClosed?: {
+    mode?: string
     coin: string
     timeframe: string
     side: 'up' | 'down'
@@ -53,6 +56,19 @@ export interface BotStatus {
     settleT: number
     status: string
   }[]
+  /** Maker-strategy live state — present only while strategy='maker'. */
+  maker?: {
+    fillModel: 'L1' | 'L2'
+    baseSpread: number
+    clipUsd: number
+    maxInventory: number
+    rebateRate: number
+    feedConnected: boolean
+    fills: number
+    openQuotes: number
+    inventory: { coin: string; timeframe: string; net: number; upShares: number; downShares: number }[]
+    quotes: { coin: string; timeframe: string; side: 'up' | 'down'; price: number; size: number }[]
+  }
 }
 
 const BASE =
@@ -95,10 +111,18 @@ export const setBotHalted = (halted: boolean): Promise<BotStatus> => post('/halt
 export const setBotStake = (stakeUsd: number): Promise<BotStatus> => post('/stake', { stakeUsd })
 export const setBotMaxDailyTrades = (maxDailyTrades: number): Promise<BotStatus> =>
   post('/daily-cap', { maxDailyTrades })
-export const setBotStrategy = (strategy: 'value' | 'swing'): Promise<BotStatus> =>
+export const setBotStrategy = (strategy: 'value' | 'swing' | 'maker'): Promise<BotStatus> =>
   post('/strategy', { strategy })
 export const setBotTradeTimeframes = (timeframes: string[]): Promise<BotStatus> =>
   post('/timeframes', { timeframes })
+export interface MakerPatch {
+  baseSpread?: number
+  clipUsd?: number
+  maxInventory?: number
+  fillModel?: 'L1' | 'L2'
+  rebateRate?: number
+}
+export const setBotMaker = (patch: MakerPatch): Promise<BotStatus> => post('/maker', patch)
 
 /** One trade row in the history grid — mirrors the bot's TradeHistoryRow. */
 export interface TradeHistoryRow {

@@ -75,14 +75,52 @@ const server = createServer(async (req, res) => {
 })
 
 let vite: ChildProcess | null = null
+let bot: ChildProcess | null = null
 
 function shutdown(code = 0) {
+  bot?.kill('SIGTERM')
   vite?.kill('SIGTERM')
   server.close(() => process.exit(code))
 }
 
+const BOT_CONTROL_PORT = Number(process.env.BOT_CONTROL_PORT || 8790)
+
+async function botControlReachable(): Promise<boolean> {
+  try {
+    const res = await fetch(`http://127.0.0.1:${BOT_CONTROL_PORT}/status`, {
+      signal: AbortSignal.timeout(800),
+    })
+    return res.ok
+  } catch {
+    return false
+  }
+}
+
 server.listen(API_PORT, () => {
   console.log(`[dev] API listening on http://127.0.0.1:${API_PORT} (.env.local loaded)`)
+
+  void (async () => {
+    // Paper bot for the dashboard — Live stays disabled (BOT_ALLOW_LIVE=0).
+    // Skip if something already owns :8790 (e.g. `pnpm bot:live` in another terminal).
+    // Or set DEV_NO_BOT=1 to never auto-start a bot.
+    if (process.env.DEV_NO_BOT === '1') {
+      console.log('[dev] DEV_NO_BOT=1 — bot not started (run pnpm bot:paper or pnpm bot:live)')
+    } else if (await botControlReachable()) {
+      console.log(
+        `[dev] bot control already on :${BOT_CONTROL_PORT} — not starting paper bot ` +
+          '(use that instance; Live works if it was started with pnpm bot:live)',
+      )
+    } else {
+      bot = spawn('pnpm', ['exec', 'tsx', 'bot/index.ts', 'paper'], {
+        cwd: ROOT,
+        stdio: 'inherit',
+        env: { ...process.env, BOT_ALLOW_LIVE: '0' },
+      })
+      bot.on('exit', (code) => {
+        if (code != null && code !== 0) console.error(`[dev] bot exited ${code}`)
+      })
+    }
+  })()
 
   vite = spawn('pnpm', ['exec', 'vite'], {
     cwd: ROOT,
