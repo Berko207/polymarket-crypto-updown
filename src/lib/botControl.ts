@@ -13,7 +13,7 @@ export interface BotStatus {
   /** CLOB USDC when live; optional for older bot builds. */
   usdcBalance?: number | null
   /** Optional so a bot predating the swing strategy still renders (defaults to value). */
-  strategy?: 'value' | 'swing' | 'maker'
+  strategy?: 'value' | 'swing' | 'maker' | 'certainty'
   allowLive: boolean
   halted: boolean
   connected: boolean
@@ -30,8 +30,19 @@ export interface BotStatus {
   /** Positions still being force-closed at market (strategy-switch retries). */
   pendingCloses?: number
   swingExits?: { reason: string; n: number; wins: number; pnl: number }[]
+  valueExits?: { reason: string; n: number; wins: number; pnl: number }[]
   swingTrigger?: 'edge' | 'move'
   swingSource?: 'flat' | 'regime' | 'blend'
+  certainty?: {
+    entryWithinSec: number
+    minWinProb: number
+    minEdge: number
+    maxAsk: number
+    minZ: number
+    minCoins: number
+    maxCoins: number
+    signalSource: 'flat' | 'regime' | 'blend'
+  }
   openPositions?: {
     coin: string
     timeframe: string
@@ -42,6 +53,9 @@ export interface BotStatus {
     mark: number | null
     unrealizedPnl: number | null
     msRemaining: number | null
+    phase?: 'live' | 'won' | 'lost' | 'settling'
+    redeemable?: boolean
+    outcome?: 'up' | 'down'
   }[]
   recentClosed?: {
     mode?: string
@@ -55,6 +69,38 @@ export interface BotStatus {
     pnl: number
     settleT: number
     status: string
+    oracleOutcome?: 'up' | 'down' | null
+  }[]
+  /** Newest entries first — includes open positions (older bot builds omit this). */
+  recentTrades?: {
+    mode?: string
+    coin: string
+    timeframe: string
+    side: 'up' | 'down'
+    strategy: string
+    entryPrice: number
+    entryT: number
+    exitPrice: number | null
+    exitReason: string | null
+    pnl: number | null
+    settleT: number | null
+    status: string
+  }[]
+  /** Activity feed — newest settle or entry first (preferred for monitor Recent). */
+  recentActivity?: {
+    mode?: string
+    coin: string
+    timeframe: string
+    side: 'up' | 'down'
+    strategy: string
+    entryPrice: number
+    entryT: number
+    exitPrice: number | null
+    exitReason: string | null
+    pnl: number | null
+    settleT: number | null
+    status: string
+    oracleOutcome?: 'up' | 'down' | null
   }[]
   /** Maker-strategy live state — present only while strategy='maker'. */
   maker?: {
@@ -111,7 +157,7 @@ export const setBotHalted = (halted: boolean): Promise<BotStatus> => post('/halt
 export const setBotStake = (stakeUsd: number): Promise<BotStatus> => post('/stake', { stakeUsd })
 export const setBotMaxDailyTrades = (maxDailyTrades: number): Promise<BotStatus> =>
   post('/daily-cap', { maxDailyTrades })
-export const setBotStrategy = (strategy: 'value' | 'swing' | 'maker'): Promise<BotStatus> =>
+export const setBotStrategy = (strategy: 'value' | 'swing' | 'maker' | 'certainty'): Promise<BotStatus> =>
   post('/strategy', { strategy })
 export const setBotTradeTimeframes = (timeframes: string[]): Promise<BotStatus> =>
   post('/timeframes', { timeframes })
@@ -122,6 +168,14 @@ export interface MakerPatch {
   fillModel?: 'L1' | 'L2'
   rebateRate?: number
 }
+export interface CertaintyPatch {
+  entryWithinSec?: number
+  minWinProb?: number
+  minEdge?: number
+  maxAsk?: number
+  maxCoins?: number
+}
+export const setBotCertainty = (patch: CertaintyPatch): Promise<BotStatus> => post('/certainty', patch)
 export const setBotMaker = (patch: MakerPatch): Promise<BotStatus> => post('/maker', patch)
 
 /** One trade row in the history grid — mirrors the bot's TradeHistoryRow. */
@@ -148,6 +202,16 @@ export interface TradeHistoryRow {
   payout: number | null
   pnl: number | null
   orderId: string | null
+  entryPWin?: number | null
+  entryZ?: number | null
+  entryMsRemaining?: number | null
+  cfgEntryWithinSec?: number | null
+  cfgMinWinProb?: number | null
+  cfgMinEdge?: number | null
+  cfgMaxAsk?: number | null
+  cfgMinZ?: number | null
+  cfgMaxCoins?: number | null
+  cfgSignalSource?: string | null
 }
 
 export interface HistoryFilters {

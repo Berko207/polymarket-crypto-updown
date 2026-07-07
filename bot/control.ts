@@ -16,7 +16,7 @@ export interface BotStatus {
   /** CLOB USDC balance when live (null in record/dry or before first arm). */
   usdcBalance: number | null
   /** Active entry/exit family — runtime-switchable from the dashboard (POST /strategy). */
-  strategy: 'value' | 'swing' | 'maker'
+  strategy: 'value' | 'swing' | 'maker' | 'certainty'
   allowLive: boolean
   halted: boolean
   connected: boolean
@@ -35,9 +35,22 @@ export interface BotStatus {
   pendingCloses: number
   /** Closed swing trades by exit reason (empty for the value strategy). */
   swingExits: { reason: string; n: number; wins: number; pnl: number }[]
+  /** Closed value trades by exit reason (empty for the swing strategy). */
+  valueExits: { reason: string; n: number; wins: number; pnl: number }[]
   /** Active swing entry trigger + fair-value source (swing strategy only). */
   swingTrigger: 'edge' | 'move'
   swingSource: 'flat' | 'regime' | 'blend'
+  /** Certainty strategy knobs — present while strategy='certainty'. */
+  certainty?: {
+    entryWithinSec: number
+    minWinProb: number
+    minEdge: number
+    maxAsk: number
+    minZ: number
+    minCoins: number
+    maxCoins: number
+    signalSource: 'flat' | 'regime' | 'blend'
+  }
   /** Currently-open positions with live mark, unrealized P&L, and time left. */
   openPositions: {
     coin: string
@@ -49,6 +62,11 @@ export interface BotStatus {
     mark: number | null
     unrealizedPnl: number | null
     msRemaining: number | null
+    /** live = in-window; won/lost = outcome known; settling = window ended, no outcome yet. */
+    phase?: 'live' | 'won' | 'lost' | 'settling'
+    redeemable?: boolean
+    /** Oracle-recorded winning side when the window has resolved. */
+    outcome?: 'up' | 'down'
   }[]
   /** Most-recent finished trades, newest first (activity feed). */
   recentClosed: {
@@ -63,6 +81,38 @@ export interface BotStatus {
     pnl: number
     settleT: number
     status: string
+    oracleOutcome?: 'up' | 'down' | null
+  }[]
+  /** Most-recent trades (open + closed), newest entry first. */
+  recentTrades: {
+    mode: string
+    coin: string
+    timeframe: string
+    side: 'up' | 'down'
+    strategy: string
+    entryPrice: number
+    entryT: number
+    exitPrice: number | null
+    exitReason: string | null
+    pnl: number | null
+    settleT: number | null
+    status: string
+  }[]
+  /** Activity feed — sorted by latest settle or entry (best for monitor Recent). */
+  recentActivity: {
+    mode: string
+    coin: string
+    timeframe: string
+    side: 'up' | 'down'
+    strategy: string
+    entryPrice: number
+    entryT: number
+    exitPrice: number | null
+    exitReason: string | null
+    pnl: number | null
+    settleT: number | null
+    status: string
+    oracleOutcome?: 'up' | 'down' | null
   }[]
   /** Maker-strategy live state — present only while strategy='maker'. */
   maker?: {
@@ -91,7 +141,7 @@ export interface BotRuntime {
   setStakeUsd(stakeUsd: number): { ok: boolean; error?: string }
   /** 0 = mode default (50 live, unlimited paper). */
   setMaxDailyTrades(maxDailyTrades: number): { ok: boolean; error?: string }
-  setStrategy(strategy: 'value' | 'swing' | 'maker'): { ok: boolean; error?: string }
+  setStrategy(strategy: 'value' | 'swing' | 'maker' | 'certainty'): { ok: boolean; error?: string }
   setTradeTimeframes(timeframes: string[]): { ok: boolean; error?: string }
   /** Runtime maker tuning — any subset of the knobs. */
   setMaker(patch: {
@@ -100,6 +150,14 @@ export interface BotRuntime {
     maxInventory?: number
     fillModel?: 'L1' | 'L2'
     rebateRate?: number
+  }): { ok: boolean; error?: string }
+  /** Runtime certainty / easy-bet tuning — any subset of the knobs. */
+  setCertainty(patch: {
+    entryWithinSec?: number
+    minWinProb?: number
+    minEdge?: number
+    maxAsk?: number
+    maxCoins?: number
   }): { ok: boolean; error?: string }
   getHistory(query: TradeQuery): TradeHistoryPage
 }
@@ -211,8 +269,8 @@ export function startControlServer(
           }
           if (url.pathname === '/strategy') {
             const strategy = body.strategy
-            if (strategy !== 'value' && strategy !== 'swing' && strategy !== 'maker') {
-              return send(400, { error: 'strategy must be value|swing|maker' })
+            if (strategy !== 'value' && strategy !== 'swing' && strategy !== 'maker' && strategy !== 'certainty') {
+              return send(400, { error: 'strategy must be value|swing|maker|certainty' })
             }
             const r = runtime.setStrategy(strategy)
             return r.ok ? send(200, runtime.getStatus()) : send(400, { error: r.error })
@@ -241,6 +299,26 @@ export function startControlServer(
             if (rb != null) patch.rebateRate = rb
             if (body.fillModel === 'L1' || body.fillModel === 'L2') patch.fillModel = body.fillModel
             const r = runtime.setMaker(patch)
+            return r.ok ? send(200, runtime.getStatus()) : send(400, { error: r.error })
+          }
+          if (url.pathname === '/certainty') {
+            const num = (v: unknown): number | undefined => {
+              if (v == null || v === '') return undefined
+              const n = Number(v)
+              return Number.isFinite(n) ? n : undefined
+            }
+            const patch: Parameters<BotRuntime['setCertainty']>[0] = {}
+            const entryWithinSec = num(body.entryWithinSec)
+            if (entryWithinSec != null) patch.entryWithinSec = entryWithinSec
+            const minWinProb = num(body.minWinProb)
+            if (minWinProb != null) patch.minWinProb = minWinProb
+            const minEdge = num(body.minEdge)
+            if (minEdge != null) patch.minEdge = minEdge
+            const maxAsk = num(body.maxAsk)
+            if (maxAsk != null) patch.maxAsk = maxAsk
+            const maxCoins = num(body.maxCoins)
+            if (maxCoins != null) patch.maxCoins = maxCoins
+            const r = runtime.setCertainty(patch)
             return r.ok ? send(200, runtime.getStatus()) : send(400, { error: r.error })
           }
         }

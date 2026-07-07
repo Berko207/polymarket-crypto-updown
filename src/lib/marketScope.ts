@@ -12,6 +12,20 @@ export function windowEndMsFromKey(windowKey: string): number | null {
   return Number.isFinite(end) ? end : null
 }
 
+/** Parse eventSlug + window bounds from a marketWindowKey, or null if malformed. */
+export function parseMarketWindowKey(windowKey: string): {
+  eventSlug: string
+  startMs: number
+  endMs: number
+} | null {
+  const parts = windowKey.split(':')
+  if (parts.length !== 3) return null
+  const startMs = Number(parts[1])
+  const endMs = Number(parts[2])
+  if (!parts[0] || !Number.isFinite(startMs) || !Number.isFinite(endMs)) return null
+  return { eventSlug: parts[0], startMs, endMs }
+}
+
 /** True when a polled market belongs to the selected coin + timeframe tab. */
 export function marketMatchesScope(
   market: ParsedMarket,

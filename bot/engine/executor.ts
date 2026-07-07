@@ -4,6 +4,7 @@
  * loop never change between dry and live.
  */
 import type { Order } from './strategy'
+import { normalizeLiveFill } from '../tradeFill'
 
 export interface Fill {
   fillPrice: number
@@ -62,6 +63,17 @@ export function isInsufficientBalanceError(message: string): boolean {
   return lower.includes('not enough balance') || lower.includes('insufficient usdc')
 }
 
+/** Outcome token no longer tradeable — usually already redeemed or delisted post-resolution. */
+export function isGoneOutcomeTokenError(message: string): boolean {
+  const lower = message.toLowerCase()
+  return (
+    lower.includes('invalid token') ||
+    lower.includes('token not found') ||
+    lower.includes('market not found') ||
+    lower.includes('not enough balance / allowance')
+  )
+}
+
 export function makeLiveExecutor(): Executor {
   let place: typeof import('../../api/_lib/clob').placeMarketOrder | null = null
   let fetchBal: typeof import('../../api/_lib/clob').fetchUsdcBalance | null = null
@@ -95,23 +107,25 @@ export function makeLiveExecutor(): Executor {
           negRisk: order.negRisk ?? undefined,
         })
         const status = (res.status ?? '').toLowerCase()
-        let fillPrice = res.fillPrice ?? 0
-        let fillSize = res.fillSize ?? 0
         const matched =
           res.success && status !== 'unmatched' && order.fillPrice > 0 && order.fillPrice < 1
-        const reportedCost = fillPrice > 0 && fillSize > 0 ? fillPrice * fillSize : 0
-        // Fallback when CLOB omits amounts or reports a dust fill on a full $stake order.
-        if (
-          matched &&
-          (reportedCost < order.stakeUsd * 0.9 || !fillPrice || !fillSize)
-        ) {
-          fillPrice = fillPrice > 0 && fillPrice < 1 ? fillPrice : order.fillPrice
-          fillSize = order.stakeUsd / fillPrice
-        }
-        if (!res.success || status === 'unmatched' || !fillSize || !fillPrice) {
+        if (!matched) {
           return { fillPrice: 0, fillSize: 0, orderId: res.orderId ?? null }
         }
-        return { fillPrice, fillSize, orderId: res.orderId ?? null }
+        const amounts = normalizeLiveFill(
+          order.stakeUsd,
+          order.fillPrice,
+          res.fillPrice ?? 0,
+          res.fillSize ?? 0,
+        )
+        if (!amounts) {
+          return { fillPrice: 0, fillSize: 0, orderId: res.orderId ?? null }
+        }
+        return {
+          fillPrice: amounts.entryPrice,
+          fillSize: amounts.size,
+          orderId: res.orderId ?? null,
+        }
       }
       const p = buyChain.then(run, run)
       buyChain = p.catch(() => {})
@@ -121,7 +135,7 @@ export function makeLiveExecutor(): Executor {
       const res = await (await load())({
         tokenId: order.tokenId,
         side: 'SELL',
-        size: order.size,
+        amount: order.size,
         price: order.sellPrice,
         orderType: 'market',
         tickSize: order.tickSize ?? undefined,

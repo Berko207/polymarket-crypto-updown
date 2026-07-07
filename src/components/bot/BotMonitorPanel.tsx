@@ -1,6 +1,6 @@
 import { cn } from '@/lib/utils'
 import { useBotStatus } from '@/queries/bot'
-import { EXIT_META, fmtAgo, fmtCountdown, sideArrow, sideCls } from '@/lib/botFormat'
+import { EXIT_META, fmtAgo, fmtCountdown, sideArrow, sideCls, tradeResolvedWin } from '@/lib/botFormat'
 import { BotHistoryDialog } from './BotHistoryDialog'
 
 /**
@@ -15,13 +15,23 @@ export function BotMonitorPanel() {
   if (!s) return null
 
   const open = s.openPositions ?? []
-  const recent = s.recentClosed ?? []
+  const openLive = open.filter((p) => p.phase === 'live' || p.msRemaining == null || p.msRemaining > 0)
+  const openSettling = open.filter(
+    (p) => p.phase !== 'live' && p.msRemaining != null && p.msRemaining <= 0,
+  )
+  const openKeys = new Set(open.map((p) => `${p.coin}-${p.timeframe}-${p.side}`))
+  const recent = (s.recentActivity ?? s.recentClosed ?? [])
+    .filter((r) => r.status !== 'open' && !openKeys.has(`${r.coin}-${r.timeframe}-${r.side}`))
+    .slice(0, 8)
   const isMaker = s.strategy === 'maker'
   const m = s.maker
   const now = Date.now()
   const modeLabel = s.mode === 'live' ? 'live' : s.mode === 'dry' ? 'paper' : 'record'
   const sum = s.summary
   const sumPnl = sum?.pnl ?? 0
+  const openPnl = openLive.reduce((acc, p) => acc + (p.unrealizedPnl ?? 0), 0)
+  const settlingPnl = openSettling.reduce((acc, p) => acc + (p.unrealizedPnl ?? 0), 0)
+  const totalPnl = sumPnl + openPnl + settlingPnl
   const sumStaked = sum?.staked ?? 0
 
   return (
@@ -31,15 +41,28 @@ export function BotMonitorPanel() {
           Bot monitor
         </p>
         <span className="flex items-center gap-2">
-          {sum && sum.settled > 0 ? (
+          {sum && (sum.settled > 0 || open.length > 0) ? (
             <span
               className={cn(
                 'text-[0.65rem] font-semibold tabular-nums',
-                sumPnl >= 0 ? 'text-up' : 'text-down',
+                totalPnl >= 0 ? 'text-up' : 'text-down',
               )}
+              title={
+                openLive.length > 0 || openSettling.length > 0
+                  ? `Settled ${sumPnl >= 0 ? '+' : ''}$${sumPnl.toFixed(2)}` +
+                    (openLive.length > 0
+                      ? ` · live ${openPnl >= 0 ? '+' : ''}$${openPnl.toFixed(2)}`
+                      : '') +
+                    (openSettling.length > 0
+                      ? ` · settling ${settlingPnl >= 0 ? '+' : ''}$${settlingPnl.toFixed(2)}`
+                      : '')
+                  : undefined
+              }
             >
-              {modeLabel} {sumPnl >= 0 ? '+' : ''}${sumPnl.toFixed(2)}
-              {sumStaked > 0 ? ` · ${((sumPnl / sumStaked) * 100).toFixed(0)}%` : ''}
+              {modeLabel} {totalPnl >= 0 ? '+' : ''}${totalPnl.toFixed(2)}
+              {sumStaked > 0 && openLive.length === 0 && openSettling.length === 0
+                ? ` · ${((totalPnl / sumStaked) * 100).toFixed(0)}%`
+                : ''}
             </span>
           ) : null}
           <span className="text-[0.65rem] text-muted-foreground">watching {s.scopes.length} markets</span>
@@ -113,18 +136,22 @@ export function BotMonitorPanel() {
           )}
         </div>
       ) : (
+      <>
       <div className="flex flex-col gap-1.5">
         <p className="text-[0.6rem] font-semibold uppercase tracking-wide text-muted-foreground/70">
-          Open · {open.length}
+          Open · {openLive.length}
           {s.pendingCloses ? (
             <span className="ml-1 text-amber-300">· closing {s.pendingCloses}</span>
           ) : null}
         </p>
-        {open.length === 0 ? (
+        {openLive.length === 0 ? (
           <p className="text-[0.7rem] text-muted-foreground">no open positions</p>
         ) : (
-          open.map((p) => {
+          openLive.map((p) => {
             const up = (p.unrealizedPnl ?? 0) >= 0
+            const won = p.phase === 'won'
+            const lost = p.phase === 'lost'
+            const settling = p.phase === 'settling'
             return (
               <div
                 key={`${p.coin}-${p.timeframe}-${p.side}`}
@@ -135,6 +162,25 @@ export function BotMonitorPanel() {
                   <span className="text-foreground">
                     {p.coin}/{p.timeframe}
                   </span>
+                  {won ? (
+                    <span
+                      title={p.outcome ? `oracle ${p.outcome}` : undefined}
+                      className="rounded bg-up-soft px-1 py-0.5 text-[0.55rem] font-semibold text-up"
+                    >
+                      won
+                    </span>
+                  ) : lost ? (
+                    <span
+                      title={p.outcome ? `oracle ${p.outcome}` : undefined}
+                      className="rounded bg-down-soft px-1 py-0.5 text-[0.55rem] font-semibold text-down"
+                    >
+                      lost
+                    </span>
+                  ) : settling ? (
+                    <span className="rounded bg-secondary px-1 py-0.5 text-[0.55rem] font-semibold text-muted-foreground">
+                      settling
+                    </span>
+                  ) : null}
                 </span>
                 <span className="text-muted-foreground">
                   {p.entryPrice.toFixed(2)}→{p.mark != null ? p.mark.toFixed(2) : '—'}
@@ -143,31 +189,126 @@ export function BotMonitorPanel() {
                   <span
                     className={cn(
                       'font-semibold',
-                      p.unrealizedPnl == null ? 'text-muted-foreground' : up ? 'text-up' : 'text-down',
+                      p.unrealizedPnl == null
+                        ? 'text-muted-foreground'
+                        : up
+                          ? 'text-up'
+                          : 'text-down',
                     )}
                   >
-                    {p.unrealizedPnl == null ? '—' : `${up ? '+' : ''}$${p.unrealizedPnl.toFixed(2)}`}
+                    {p.unrealizedPnl == null
+                      ? '—'
+                      : `${up ? '+' : ''}$${p.unrealizedPnl.toFixed(2)}`}
                   </span>
-                  <span className="w-9 text-right text-muted-foreground">{fmtCountdown(p.msRemaining)}</span>
+                  <span className="w-9 text-right text-muted-foreground">
+                    {p.redeemable ? 'redeem' : fmtCountdown(p.msRemaining)}
+                  </span>
                 </span>
               </div>
             )
           })
         )}
       </div>
+
+      {openSettling.length > 0 && (
+        <div className="flex flex-col gap-1.5 border-t border-border/60 pt-2">
+          <p className="text-[0.6rem] font-semibold uppercase tracking-wide text-muted-foreground/70">
+            Settling · {openSettling.length}
+          </p>
+          {openSettling.map((p) => {
+            const up = (p.unrealizedPnl ?? 0) >= 0
+            const won = p.phase === 'won'
+            const lost = p.phase === 'lost'
+            const settling = p.phase === 'settling'
+            return (
+              <div
+                key={`settling-${p.coin}-${p.timeframe}-${p.side}`}
+                className="flex items-center justify-between gap-2 text-[0.72rem] tabular-nums"
+              >
+                <span className="flex items-center gap-1.5">
+                  <span className={cn('font-semibold', sideCls(p.side))}>{sideArrow(p.side)}</span>
+                  <span className="text-foreground">
+                    {p.coin}/{p.timeframe}
+                  </span>
+                  {won ? (
+                    <span
+                      title={p.outcome ? `oracle ${p.outcome}` : undefined}
+                      className="rounded bg-up-soft px-1 py-0.5 text-[0.55rem] font-semibold text-up"
+                    >
+                      won
+                    </span>
+                  ) : lost ? (
+                    <span
+                      title={p.outcome ? `oracle ${p.outcome}` : undefined}
+                      className="rounded bg-down-soft px-1 py-0.5 text-[0.55rem] font-semibold text-down"
+                    >
+                      lost
+                    </span>
+                  ) : settling ? (
+                    <span className="rounded bg-secondary px-1 py-0.5 text-[0.55rem] font-semibold text-muted-foreground">
+                      settling
+                    </span>
+                  ) : null}
+                </span>
+                <span className="text-muted-foreground">
+                  {p.entryPrice.toFixed(2)}→{p.mark != null ? p.mark.toFixed(2) : '—'}
+                </span>
+                <span className="flex items-center gap-2">
+                  <span
+                    className={cn(
+                      'font-semibold',
+                      p.unrealizedPnl == null
+                        ? 'text-muted-foreground'
+                        : up
+                          ? 'text-up'
+                          : 'text-down',
+                    )}
+                  >
+                    {p.unrealizedPnl == null
+                      ? '—'
+                      : `${up ? '+' : ''}$${p.unrealizedPnl.toFixed(2)}`}
+                  </span>
+                  <span className="w-9 text-right text-muted-foreground">
+                    {p.redeemable ? 'redeem' : 'end'}
+                  </span>
+                </span>
+              </div>
+            )
+          })}
+        </div>
+      )}
+      </>
       )}
 
       {recent.length > 0 && (
         <div className="flex flex-col gap-1.5 border-t border-border/60 pt-2">
           <p className="text-[0.6rem] font-semibold uppercase tracking-wide text-muted-foreground/70">Recent</p>
           {recent.map((r, i) => {
-            const meta = r.exitReason ? EXIT_META[r.exitReason] : null
-            const label = meta?.label ?? (r.pnl >= 0 ? 'Won' : 'Lost')
-            const cls = meta?.cls ?? (r.pnl >= 0 ? 'bg-up-soft text-up' : 'bg-down-soft text-down')
-            const up = r.pnl >= 0
+            const isOpen = r.status === 'open'
+            const meta = !isOpen && r.exitReason ? EXIT_META[r.exitReason] : null
+            const pnl = r.pnl ?? 0
+            const resolved =
+              'oracleOutcome' in r
+                ? tradeResolvedWin(r.side, r.oracleOutcome, r.pnl)
+                : tradeResolvedWin(r.side, undefined, r.pnl)
+            const label = isOpen
+              ? 'open'
+              : meta?.label ?? (resolved == null ? '—' : resolved ? 'Won' : 'Lost')
+            const cls = isOpen
+              ? 'bg-secondary text-muted-foreground'
+              : meta?.cls ??
+                (resolved == null
+                  ? 'bg-secondary text-muted-foreground'
+                  : resolved
+                    ? 'bg-up-soft text-up'
+                    : 'bg-down-soft text-down')
+            const up = resolved != null ? resolved : pnl >= 0
+            const when = isOpen
+              ? ('entryT' in r && r.entryT ? r.entryT : 0)
+              : (r.settleT ?? ('entryT' in r ? r.entryT : 0) ?? 0)
             return (
               <div
-                key={`${r.settleT}-${r.coin}-${r.timeframe}-${i}`}
+                key={`${when}-${r.coin}-${r.timeframe}-${i}`}
                 className="flex items-center justify-between gap-2 text-[0.72rem] tabular-nums"
               >
                 <span className="flex items-center gap-1.5">
@@ -178,10 +319,15 @@ export function BotMonitorPanel() {
                 </span>
                 <span className={cn('rounded px-1 py-0.5 text-[0.58rem] font-semibold', cls)}>{label}</span>
                 <span className="flex items-center gap-2">
-                  <span className={cn('font-semibold', up ? 'text-up' : 'text-down')}>
-                    {up ? '+' : ''}${r.pnl.toFixed(2)}
+                  <span
+                    className={cn(
+                      'font-semibold',
+                      isOpen ? 'text-muted-foreground' : up ? 'text-up' : 'text-down',
+                    )}
+                  >
+                    {isOpen ? `@ ${r.entryPrice.toFixed(2)}` : `${up ? '+' : ''}$${pnl.toFixed(2)}`}
                   </span>
-                  <span className="w-9 text-right text-muted-foreground">{fmtAgo(now - r.settleT)}</span>
+                  <span className="w-9 text-right text-muted-foreground">{fmtAgo(now - when)}</span>
                 </span>
               </div>
             )

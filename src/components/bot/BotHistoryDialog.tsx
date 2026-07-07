@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { cn } from '@/lib/utils'
 import {
   Dialog,
@@ -9,7 +9,7 @@ import {
   DialogTrigger,
 } from '@/components/ui/dialog'
 import { useBotHistory, useBotStatus } from '@/queries/bot'
-import { EXIT_META, sideArrow, sideCls } from '@/lib/botFormat'
+import { EXIT_META, formatCertaintyConfigShort, formatCertaintyEntryDetail, sideArrow, sideCls } from '@/lib/botFormat'
 import type { HistoryFilters, TradeHistoryRow } from '@/lib/botControl'
 
 const PAGE = 100
@@ -25,6 +25,8 @@ const STRAT_OPTS = [
   { v: 'all', label: 'Any strategy' },
   { v: 'swing', label: 'Swing strategy' },
   { v: 'value', label: 'Value strategy' },
+  { v: 'certainty', label: 'Easy strategy' },
+  { v: 'maker', label: 'Maker strategy' },
 ]
 const STATUS_OPTS = [
   { v: 'all', label: 'Any status' },
@@ -93,6 +95,7 @@ function ResultCell({ t }: { t: TradeHistoryRow }) {
 export function BotHistoryDialog() {
   const [open, setOpen] = useState(false)
   const [page, setPage] = useState(0)
+  const [modeSynced, setModeSynced] = useState(false)
   const [f, setF] = useState({
     mode: 'dry',
     strategy: 'all',
@@ -115,6 +118,17 @@ export function BotHistoryDialog() {
   const scopes = s?.scopes ?? []
   const coins = [...new Set(scopes.map((x) => x.split('/')[0]))]
   const tfs = s?.availableTimeframes ?? [...new Set(scopes.map((x) => x.split('/')[1]))]
+
+  // Default history mode to the bot's active mode when the dialog first opens.
+  useEffect(() => {
+    if (!open) {
+      setModeSynced(false)
+      return
+    }
+    if (modeSynced || !s?.mode || s.mode === 'record') return
+    setF((cur) => ({ ...cur, mode: s.mode === 'live' ? 'live' : 'dry' }))
+    setModeSynced(true)
+  }, [open, s?.mode, modeSynced])
 
   const filters: HistoryFilters = {
     mode: f.mode === 'all' ? undefined : f.mode,
@@ -249,13 +263,14 @@ export function BotHistoryDialog() {
           ) : rows.length === 0 ? (
             <p className="p-4 text-center text-xs text-muted-foreground">No trades match these filters.</p>
           ) : (
-            <table className="w-full min-w-[760px] text-[0.72rem] tabular-nums">
+            <table className="w-full min-w-[860px] text-[0.72rem] tabular-nums">
               <thead className="sticky top-0 z-10 bg-background">
                 <tr className="border-b border-border text-left text-[0.6rem] uppercase tracking-wide text-muted-foreground">
                   <th className="px-2 py-1.5 font-semibold">When</th>
                   <th className="px-2 py-1.5 font-semibold">Market</th>
                   <th className="px-2 py-1.5 font-semibold">Side</th>
                   <th className="px-2 py-1.5 font-semibold">Strat</th>
+                  <th className="px-2 py-1.5 font-semibold">Easy cfg</th>
                   <th className="px-2 py-1.5 font-semibold">Mode</th>
                   <th className="px-2 py-1.5 text-right font-semibold">Entry</th>
                   <th className="px-2 py-1.5 text-right font-semibold">Exit</th>
@@ -270,12 +285,20 @@ export function BotHistoryDialog() {
                 {rows.map((t) => {
                   const fee = t.entryFee + (t.exitFee ?? 0)
                   const pnlUp = (t.pnl ?? 0) >= 0
+                  const easyCfg = formatCertaintyConfigShort(t)
+                  const easyTip = formatCertaintyEntryDetail(t)
                   return (
                     <tr key={t.id} className="border-b border-border/50 last:border-0 hover:bg-secondary/40">
                       <td className="whitespace-nowrap px-2 py-1 text-muted-foreground">{fmtWhen(t.entryT)}</td>
                       <td className="whitespace-nowrap px-2 py-1 text-foreground">{t.coin}/{t.timeframe}</td>
                       <td className={cn('px-2 py-1 font-semibold', sideCls(t.side))}>{sideArrow(t.side)} {t.side}</td>
                       <td className="px-2 py-1 text-muted-foreground">{t.strategy}</td>
+                      <td
+                        className="max-w-[9rem] truncate px-2 py-1 font-mono text-[0.62rem] text-emerald-300/90"
+                        title={easyTip ?? undefined}
+                      >
+                        {easyCfg ?? (t.strategy === 'certainty' ? '—' : '')}
+                      </td>
                       <td className="px-2 py-1">
                         <span
                           title={t.orderId ?? undefined}

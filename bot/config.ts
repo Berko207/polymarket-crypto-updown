@@ -45,15 +45,55 @@ export interface BotConfig {
   marketPollMs: number
   /**
    * Entry/exit family:
-   *  'value' = model edge on the cheap side, held to settlement ($0/$1).
+   *  'value' = model edge on the cheap side; hold to settlement unless P(win) collapses late.
    *  'swing' = fade a fresh odds overshoot, auto take-profit/stop mid-window.
    *  'maker' = post two-sided passive limit quotes; capture spread + rebate (paper).
+   *  'certainty' = late-window oracle-side locks: high P(win) + underpriced ask; cross-coin pick.
    */
-  strategy: 'value' | 'swing' | 'maker'
+  strategy: 'value' | 'swing' | 'maker' | 'certainty'
   // --- value strategy (edge + cheap ask, any time in window) ---
   edgeThreshold: number
   /** Skip value entries when the buy ask is above this (avoids 90¢ favorites). */
   valueMaxEntryPrice: number
+  /** Sell value holds when P(win) drops below this inside the late window. */
+  valueExitEnabled: boolean
+  /** Exit when model P(our side wins) falls below this (0–1). */
+  valueExitMinWinProb: number
+  /** Only apply the low-prob cut when this many seconds (or fewer) remain. */
+  valueExitWithinSec: number
+  /** Min seconds after entry before a low-prob cut (panic exits ignore this). */
+  valueExitMinHoldSec: number
+  /** Poll cadence for a scope holding an open value position (tighter stop). */
+  valueOpenPollMs: number
+  // --- certainty (strategy='certainty'; late-window multi-coin easy bets) ---
+  /** Start evaluating when this many seconds (or fewer) remain in the window. */
+  certaintyEntryWithinSec: number
+  /** Stop entering when fewer than this many ms remain (oracle/fill lag). */
+  certaintyMinMsRemaining: number
+  /** Min model P(win) on the oracle-favored side. */
+  certaintyMinWinProb: number
+  /** Min edge on the winning side: P(win) − ask. */
+  certaintyMinEdge: number
+  /** Skip when the winning-side ask is above this. */
+  certaintyMaxAsk: number
+  /** Min CLOB ask on the oracle-favored side — blocks cheap-loser / strike-mismatch entries. */
+  certaintyMinFavoredAsk: number
+  /** Max P(win)−ask edge — values above this usually mean strike/book disagreement. */
+  certaintyMaxEdge: number
+  /** Min |ln(S/K)| / σ√T; 0 disables the z gate. */
+  certaintyMinZ: number
+  /** Min qualifying coins per sweep to fire any trade (usually 1). */
+  certaintyMinCoins: number
+  /** Max coins to enter per tick across the universe. */
+  certaintyMaxCoins: number
+  /** Faster gamma poll while inside the late entry band. */
+  certaintyOpenPollMs: number
+  /** Market-sell when the held side's bid reaches this (default 99¢). */
+  certaintyTakeProfitBid: number
+  /** Backoff between buy retries inside the T-N entry band (ms). */
+  certaintyEntryRetryMs: number
+  /** Min bid to accept when selling after the window ends (before redeem). */
+  certaintyWindowEndMinBid: number
   stakeUsd: number
   /** Max entries in a rolling 24h window; 0 = unlimited (paper default). Live falls back to 50. */
   maxDailyTrades: number
@@ -171,8 +211,14 @@ export function loadConfig(): BotConfig {
   const tradeIntersect = tradeWanted.filter((tf) => timeframes.includes(tf))
   const tradeTimeframes = tradeIntersect.length ? tradeIntersect : timeframes
   const strategyRaw = env.BOT_STRATEGY?.trim().toLowerCase()
-  const strategy: 'value' | 'swing' | 'maker' =
-    strategyRaw === 'swing' ? 'swing' : strategyRaw === 'maker' ? 'maker' : 'value'
+  const strategy: BotConfig['strategy'] =
+    strategyRaw === 'swing'
+      ? 'swing'
+      : strategyRaw === 'maker'
+        ? 'maker'
+        : strategyRaw === 'certainty'
+          ? 'certainty'
+          : 'value'
   const makerFillModel: 'L1' | 'L2' =
     env.BOT_MAKER_FILL_MODEL?.trim().toUpperCase() === 'L2' ? 'L2' : 'L1'
   const swingTrigger: SwingTrigger =
@@ -194,6 +240,25 @@ export function loadConfig(): BotConfig {
     signalSource,
     edgeThreshold: num(env.BOT_EDGE_THRESHOLD, 0.05),
     valueMaxEntryPrice: num(env.BOT_VALUE_MAX_ENTRY_PRICE, 0.5),
+    valueExitEnabled: env.BOT_VALUE_EXIT !== '0',
+    valueExitMinWinProb: num(env.BOT_VALUE_EXIT_MIN_WIN_PROB, 0.2),
+    valueExitWithinSec: num(env.BOT_VALUE_EXIT_WITHIN_SEC, 180),
+    valueExitMinHoldSec: num(env.BOT_VALUE_EXIT_MIN_HOLD_SEC, 60),
+    valueOpenPollMs: num(env.BOT_VALUE_OPEN_POLL_MS, 2_000),
+    certaintyEntryWithinSec: num(env.BOT_CERTAINTY_ENTRY_WITHIN_SEC, 30),
+    certaintyMinMsRemaining: num(env.BOT_CERTAINTY_MIN_MS_REMAINING, 5_000),
+    certaintyMinWinProb: num(env.BOT_CERTAINTY_MIN_WIN_PROB, 0.93),
+    certaintyMinEdge: num(env.BOT_CERTAINTY_MIN_EDGE, 0.03),
+    certaintyMaxAsk: num(env.BOT_CERTAINTY_MAX_ASK, 0.95),
+    certaintyMinFavoredAsk: num(env.BOT_CERTAINTY_MIN_FAVORED_ASK, 0.55),
+    certaintyMaxEdge: num(env.BOT_CERTAINTY_MAX_EDGE, 0.2),
+    certaintyMinZ: numNonNeg(env.BOT_CERTAINTY_MIN_Z, 2),
+    certaintyMinCoins: num(env.BOT_CERTAINTY_MIN_COINS, 1),
+    certaintyMaxCoins: num(env.BOT_CERTAINTY_MAX_COINS, 6),
+    certaintyOpenPollMs: num(env.BOT_CERTAINTY_OPEN_POLL_MS, 2_000),
+    certaintyTakeProfitBid: num(env.BOT_CERTAINTY_TAKE_PROFIT_BID, 0.99),
+    certaintyEntryRetryMs: num(env.BOT_CERTAINTY_ENTRY_RETRY_MS, 1_000),
+    certaintyWindowEndMinBid: numNonNeg(env.BOT_CERTAINTY_WINDOW_END_MIN_BID, 0.01),
     stakeUsd: num(env.BOT_STAKE_USD, 1),
     maxDailyTrades: numNonNeg(env.BOT_MAX_DAILY_TRADES, 0),
     maxConcurrent: num(env.BOT_MAX_CONCURRENT, 5),

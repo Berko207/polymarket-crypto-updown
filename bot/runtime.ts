@@ -4,6 +4,14 @@ import { dirname } from 'node:path'
 
 export interface RuntimeSettings {
   maxDailyTrades?: number
+  /** Dashboard-tuned certainty knobs — survives bot restarts. */
+  certainty?: {
+    entryWithinSec?: number
+    minWinProb?: number
+    minEdge?: number
+    maxAsk?: number
+    maxCoins?: number
+  }
 }
 
 export function loadRuntimeSettings(path: string): RuntimeSettings {

@@ -6,6 +6,7 @@ import { Input } from '@/components/ui/input'
 import {
   useBotHalt,
   useBotMaker,
+  useBotCertainty,
   useBotMaxDailyTrades,
   useBotMode,
   useBotStake,
@@ -14,7 +15,7 @@ import {
   useBotTradeTimeframes,
 } from '@/queries/bot'
 import { EXIT_META } from '@/lib/botFormat'
-import type { BotMode, MakerPatch } from '@/lib/botControl'
+import type { BotMode, CertaintyPatch, MakerPatch } from '@/lib/botControl'
 
 // Record = observe/log only · Paper = simulated fills, no real money · Live =
 // real orders (gated). "Paper" is the wire id 'dry' — the bot/DB keep that id.
@@ -29,10 +30,16 @@ const modeLabel = (id: BotMode): string => MODES.find((m) => m.id === id)?.label
 const STAKE_PRESETS = [1, 5, 10, 25] as const
 const DAILY_CAP_PRESETS = [50, 100, 250, 500, 1000] as const
 
-const STRAT_META: Record<'value' | 'swing' | 'maker', { label: string; title: string; badge: string }> = {
+const CERTAINTY_ENTRY_SEC = [30, 45, 60] as const
+const CERTAINTY_MIN_P = [0.9, 0.93, 0.95, 0.97] as const
+const CERTAINTY_MIN_EDGE = [0.02, 0.03, 0.05] as const
+const CERTAINTY_MAX_ASK = [0.92, 0.95, 0.97] as const
+const CERTAINTY_MAX_COINS = [1, 2, 3, 4, 5, 6] as const
+
+const STRAT_META: Record<'value' | 'swing' | 'maker' | 'certainty', { label: string; title: string; badge: string }> = {
   value: {
     label: 'Value',
-    title: 'Value — late edge bet held to settlement',
+    title: 'Value — cheap-side edge; hold to settlement or cut when P(win) collapses',
     badge: 'bg-secondary text-muted-foreground',
   },
   swing: {
@@ -44,6 +51,11 @@ const STRAT_META: Record<'value' | 'swing' | 'maker', { label: string; title: st
     label: 'Maker',
     title: 'Maker — two-sided passive quotes; capture spread + rebate (paper simulation)',
     badge: 'bg-sky-500/15 text-sky-300',
+  },
+  certainty: {
+    label: 'Easy',
+    title: 'Certainty — T-30 oracle-side locks; high P(win) + underpriced ask; picks best coins',
+    badge: 'bg-emerald-500/15 text-emerald-300',
   },
 }
 
@@ -63,6 +75,7 @@ export function BotControlPanel() {
   const strat = useBotStrategy()
   const tradeTf = useBotTradeTimeframes()
   const makerMut = useBotMaker()
+  const certaintyMut = useBotCertainty()
   // TanStack keeps the last successful data while polling errors — without the
   // isError gate a killed bot would show "streaming" with stale PnL forever.
   const s = status.isError ? undefined : status.data
@@ -73,6 +86,8 @@ export function BotControlPanel() {
   const [draftStake, setDraftStake] = useState(serverStake)
   const [draftDailyCap, setDraftDailyCap] = useState(serverDailyCap)
   const maker = s?.maker
+  const certainty = s?.certainty
+  const certaintySupported = certainty != null
   const mkSpread = maker?.baseSpread
   const mkClip = maker?.clipUsd
   const mkMaxInv = maker?.maxInventory
@@ -108,6 +123,17 @@ export function BotControlPanel() {
       onError: (e) => {
         const msg = e instanceof Error ? e.message : 'maker update failed'
         toast.error(msg === 'not found' ? 'Restart the bot to enable maker controls' : msg)
+      },
+      onSuccess: () => toast.success(label),
+    })
+  }
+
+  const commitCertainty = (patch: CertaintyPatch, label: string) => {
+    if (!certaintySupported || certaintyMut.isPending) return
+    certaintyMut.mutate(patch, {
+      onError: (e) => {
+        const msg = e instanceof Error ? e.message : 'easy-bet update failed'
+        toast.error(msg === 'not found' ? 'Restart the bot to enable Easy controls' : msg)
       },
       onSuccess: () => toast.success(label),
     })
@@ -155,7 +181,7 @@ export function BotControlPanel() {
     })
   }
 
-  const switchStrategy = (next: 'value' | 'swing' | 'maker') => {
+  const switchStrategy = (next: 'value' | 'swing' | 'maker' | 'certainty') => {
     if (!s || next === s.strategy || strat.isPending) return
     strat.mutate(next, {
       onError: (e) => {
@@ -185,7 +211,11 @@ export function BotControlPanel() {
   const hit = s && s.summary.settled > 0 ? (s.summary.wins / s.summary.settled) * 100 : null
   const strategy = s?.strategy ?? 'value'
   const swingExits = s?.swingExits ?? []
+  const valueExits = s?.valueExits ?? []
+  // Daily cap is only enforced for value/swing entries — maker quotes continuously
+  // and never checks it, so the warning would be misleading while maker is active.
   const dailyCap =
+    strategy !== 'maker' &&
     s?.dailyTrades != null &&
     s.maxDailyTrades != null &&
     s.maxDailyTrades > 0 &&
@@ -219,6 +249,14 @@ export function BotControlPanel() {
               }
             >
               {s.swingTrigger === 'edge' ? 'model' : 'fade'} · {s.swingSource}
+            </span>
+          )}
+          {s && strategy === 'certainty' && s.certainty && (
+            <span
+              title={`T-${s.certainty.entryWithinSec}s · P≥${s.certainty.minWinProb} · edge≥${s.certainty.minEdge} · pick ${s.certainty.minCoins}-${s.certainty.maxCoins}`}
+              className="rounded bg-emerald-500/10 px-1.5 py-0.5 text-[0.6rem] font-medium tabular-nums text-emerald-300"
+            >
+              T-{s.certainty.entryWithinSec}s · P≥{(s.certainty.minWinProb * 100).toFixed(0)}%
             </span>
           )}
           {s && strategy === 'maker' && s.maker && (
@@ -272,8 +310,8 @@ export function BotControlPanel() {
         <div className="flex flex-col gap-2 rounded-lg bg-secondary px-3 py-2">
           <div className="flex items-center justify-between gap-2">
             <span className="text-xs font-medium text-muted-foreground">Strategy</span>
-            <div className="grid grid-cols-3 gap-0.5 rounded-md bg-background/60 p-0.5">
-              {(['value', 'swing', 'maker'] as const).map((st) => (
+            <div className="grid grid-cols-4 gap-0.5 rounded-md bg-background/60 p-0.5">
+              {(['value', 'swing', 'maker', 'certainty'] as const).map((st) => (
                 <button
                   key={st}
                   type="button"
@@ -322,6 +360,166 @@ export function BotControlPanel() {
               })}
             </div>
           </div>
+        </div>
+      )}
+
+      {s && strategy === 'certainty' && (
+        <div className="flex flex-col gap-2 rounded-lg bg-secondary px-3 py-2">
+          <div className="flex items-center justify-between gap-2">
+            <span className="text-xs font-medium text-muted-foreground">Easy bets</span>
+            {certainty && (
+              <span className="text-[0.6rem] tabular-nums text-muted-foreground">
+                z≥{certainty.minZ} · src {certainty.signalSource}
+              </span>
+            )}
+          </div>
+          {!certaintySupported ? (
+            <p className="text-[0.65rem] text-amber-300">
+              Restart the bot to enable — stop it and run{' '}
+              <code className="rounded bg-background/60 px-1 py-0.5">pnpm bot:certainty</code>
+            </p>
+          ) : (
+            <>
+              <div className="flex flex-col gap-1">
+                <span className="text-[0.6rem] font-medium uppercase tracking-wide text-muted-foreground">
+                  Entry window
+                </span>
+                <div className="flex flex-wrap gap-1">
+                  {CERTAINTY_ENTRY_SEC.map((sec) => (
+                    <button
+                      key={sec}
+                      type="button"
+                      disabled={certaintyMut.isPending}
+                      onClick={() =>
+                        certainty!.entryWithinSec !== sec &&
+                        commitCertainty({ entryWithinSec: sec }, `Entry window → T-${sec}s`)
+                      }
+                      title={`Evaluate and enter when ≤${sec}s remain`}
+                      className={cn(
+                        'rounded px-2 py-0.5 text-[0.7rem] font-semibold tabular-nums transition disabled:opacity-40',
+                        certainty!.entryWithinSec === sec
+                          ? 'bg-emerald-500/15 text-emerald-300'
+                          : 'bg-background/40 text-muted-foreground hover:text-foreground',
+                      )}
+                    >
+                      T-{sec}s
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div className="flex flex-col gap-1">
+                <span className="text-[0.6rem] font-medium uppercase tracking-wide text-muted-foreground">
+                  Min P(win)
+                </span>
+                <div className="flex flex-wrap gap-1">
+                  {CERTAINTY_MIN_P.map((p) => (
+                    <button
+                      key={p}
+                      type="button"
+                      disabled={certaintyMut.isPending}
+                      onClick={() =>
+                        Math.abs(certainty!.minWinProb - p) > 1e-9 &&
+                        commitCertainty({ minWinProb: p }, `Min P(win) → ${(p * 100).toFixed(0)}%`)
+                      }
+                      className={cn(
+                        'rounded px-2 py-0.5 text-[0.7rem] font-semibold tabular-nums transition disabled:opacity-40',
+                        Math.abs(certainty!.minWinProb - p) < 1e-9
+                          ? 'bg-emerald-500/15 text-emerald-300'
+                          : 'bg-background/40 text-muted-foreground hover:text-foreground',
+                      )}
+                    >
+                      {(p * 100).toFixed(0)}%
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div className="flex flex-col gap-1">
+                <span className="text-[0.6rem] font-medium uppercase tracking-wide text-muted-foreground">
+                  Min edge
+                </span>
+                <div className="flex flex-wrap gap-1">
+                  {CERTAINTY_MIN_EDGE.map((e) => (
+                    <button
+                      key={e}
+                      type="button"
+                      disabled={certaintyMut.isPending}
+                      onClick={() =>
+                        Math.abs(certainty!.minEdge - e) > 1e-9 &&
+                        commitCertainty({ minEdge: e }, `Min edge → ${(e * 100).toFixed(0)}¢`)
+                      }
+                      className={cn(
+                        'rounded px-2 py-0.5 text-[0.7rem] font-semibold tabular-nums transition disabled:opacity-40',
+                        Math.abs(certainty!.minEdge - e) < 1e-9
+                          ? 'bg-emerald-500/15 text-emerald-300'
+                          : 'bg-background/40 text-muted-foreground hover:text-foreground',
+                      )}
+                    >
+                      {(e * 100).toFixed(0)}¢
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div className="flex flex-col gap-1">
+                <span className="text-[0.6rem] font-medium uppercase tracking-wide text-muted-foreground">
+                  Max ask
+                </span>
+                <div className="flex flex-wrap gap-1">
+                  {CERTAINTY_MAX_ASK.map((a) => (
+                    <button
+                      key={a}
+                      type="button"
+                      disabled={certaintyMut.isPending}
+                      onClick={() =>
+                        Math.abs(certainty!.maxAsk - a) > 1e-9 &&
+                        commitCertainty({ maxAsk: a }, `Max ask → ${(a * 100).toFixed(0)}¢`)
+                      }
+                      className={cn(
+                        'rounded px-2 py-0.5 text-[0.7rem] font-semibold tabular-nums transition disabled:opacity-40',
+                        Math.abs(certainty!.maxAsk - a) < 1e-9
+                          ? 'bg-emerald-500/15 text-emerald-300'
+                          : 'bg-background/40 text-muted-foreground hover:text-foreground',
+                      )}
+                    >
+                      {(a * 100).toFixed(0)}¢
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div className="flex flex-col gap-1">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-[0.6rem] font-medium uppercase tracking-wide text-muted-foreground">
+                    Max coins / sweep
+                  </span>
+                  <span className="text-[0.6rem] text-muted-foreground">ranked best first</span>
+                </div>
+                <div className="flex flex-wrap gap-1">
+                  {CERTAINTY_MAX_COINS.map((n) => (
+                    <button
+                      key={n}
+                      type="button"
+                      disabled={certaintyMut.isPending}
+                      onClick={() =>
+                        certainty!.maxCoins !== n &&
+                        commitCertainty({ maxCoins: n }, `Max coins → ${n}`)
+                      }
+                      className={cn(
+                        'rounded px-2 py-0.5 text-[0.7rem] font-semibold tabular-nums transition disabled:opacity-40',
+                        certainty!.maxCoins === n
+                          ? 'bg-emerald-500/15 text-emerald-300'
+                          : 'bg-background/40 text-muted-foreground hover:text-foreground',
+                      )}
+                    >
+                      {n}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </>
+          )}
         </div>
       )}
 
@@ -424,7 +622,7 @@ export function BotControlPanel() {
         </div>
       )}
 
-      {s && s.mode !== 'record' && (
+      {s && s.mode !== 'record' && strategy !== 'maker' && (
         <div className="flex flex-col gap-1.5 rounded-lg bg-secondary px-3 py-2">
           <div className="flex items-center justify-between gap-2">
             <span className="text-xs font-medium text-muted-foreground">Stake per trade</span>
@@ -475,7 +673,7 @@ export function BotControlPanel() {
         </div>
       )}
 
-      {s && s.mode !== 'record' && (
+      {s && s.mode !== 'record' && strategy !== 'maker' && (
         <div className="flex flex-col gap-1.5 rounded-lg bg-secondary px-3 py-2">
           <div className="flex items-center justify-between gap-2">
             <span className="text-xs font-medium text-muted-foreground">
@@ -597,7 +795,7 @@ export function BotControlPanel() {
       {s && s.summary.settled > 0 && (
         <div className="flex items-center justify-between text-[0.7rem] tabular-nums text-muted-foreground">
           <span>
-            {s.summary.settled} {strategy === 'swing' ? 'closed' : 'settled'} · {hit?.toFixed(0)}% hit
+            {s.summary.settled} {strategy === 'swing' ? 'closed' : 'realized'} · {hit?.toFixed(0)}% hit
           </span>
           <span className={cn('font-semibold', s.summary.pnl >= 0 ? 'text-up' : 'text-down')}>
             {s.summary.pnl >= 0 ? '+' : ''}${s.summary.pnl.toFixed(2)}
@@ -609,6 +807,23 @@ export function BotControlPanel() {
       {strategy === 'swing' && swingExits.length > 0 && (
         <div className="flex flex-wrap gap-1" title="Swing exits by reason (count) — hover for win rate + P&L">
           {swingExits.map((e) => {
+            const meta = EXIT_META[e.reason] ?? { label: e.reason, cls: 'bg-secondary text-muted-foreground' }
+            return (
+              <span
+                key={e.reason}
+                title={`${meta.label}: ${e.wins}/${e.n} win · pnl ${e.pnl >= 0 ? '+' : ''}$${e.pnl.toFixed(2)}`}
+                className={cn('rounded px-1.5 py-0.5 text-[0.6rem] font-semibold tabular-nums', meta.cls)}
+              >
+                {meta.label} {e.n}
+              </span>
+            )
+          })}
+        </div>
+      )}
+
+      {strategy === 'value' && valueExits.length > 0 && (
+        <div className="flex flex-wrap gap-1" title="Value exits by reason (count) — hover for win rate + P&L">
+          {valueExits.map((e) => {
             const meta = EXIT_META[e.reason] ?? { label: e.reason, cls: 'bg-secondary text-muted-foreground' }
             return (
               <span

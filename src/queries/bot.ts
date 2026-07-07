@@ -9,10 +9,12 @@ import {
   setBotStrategy,
   setBotTradeTimeframes,
   setBotMaker,
+  setBotCertainty,
   type BotMode,
   type BotStatus,
   type HistoryFilters,
   type MakerPatch,
+  type CertaintyPatch,
 } from '@/lib/botControl'
 
 const KEY = ['bot', 'status'] as const
@@ -64,7 +66,7 @@ export function useBotMaxDailyTrades() {
 export function useBotStrategy() {
   const qc = useQueryClient()
   return useMutation({
-    mutationFn: (strategy: 'value' | 'swing' | 'maker') => setBotStrategy(strategy),
+    mutationFn: (strategy: 'value' | 'swing' | 'maker' | 'certainty') => setBotStrategy(strategy),
     onSuccess: (status: BotStatus) => qc.setQueryData(KEY, status),
   })
 }
@@ -85,7 +87,15 @@ export function useBotMaker() {
   })
 }
 
-/** Filtered trade history; only fetches while the grid is open (`enabled`). */
+export function useBotCertainty() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (patch: CertaintyPatch) => setBotCertainty(patch),
+    onSuccess: (status: BotStatus) => qc.setQueryData(KEY, status),
+  })
+}
+
+/** Filtered trade history; polls while the grid is open (`enabled`). */
 export function useBotHistory(filters: HistoryFilters, enabled: boolean) {
   return useQuery({
     queryKey: ['bot', 'history', filters],
@@ -93,5 +103,6 @@ export function useBotHistory(filters: HistoryFilters, enabled: boolean) {
     enabled,
     placeholderData: (prev) => prev,
     staleTime: 2_000,
+    refetchInterval: enabled ? 3_000 : false,
   })
 }

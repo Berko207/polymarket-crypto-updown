@@ -7,24 +7,51 @@
 import '../api/_lib/loadEnv' // side effect: load .env.local (POLY_* for live, BOT_* overrides)
 import { existsSync } from 'node:fs'
 import { resolve } from 'node:path'
-import { activeScopes, loadConfig } from './config'
+import { activeScopes, loadConfig, type BotConfig } from './config'
 import { openDb } from './db'
 import { loadRuntimeSettings, saveRuntimeSettings } from './runtime'
 import { ChainlinkStream } from './sources/chainlink'
-import { fetchCurrentMarket } from './sources/gamma'
+import { fetchCurrentMarket, fetchMarketByEventSlug } from './sources/gamma'
+import { fetchWindowOutcome } from './sources/resolveOutcome'
+import { fetchRedeemableByToken, redeemEnvHint, redeemWinningPosition } from './sources/redeem'
+import { fetchClobBestAsk, fetchClobBestBid } from './sources/clobBook'
+import { fetchPolyPositionsByToken, type PolyPositionSnap } from './sources/polyPositions'
+import { normalizeLiveFill, settlementPayout, tradeShares } from './tradeFill'
 import { predict, type Prediction } from './engine/predict'
 import { decideEntry, entryBlockReason } from './engine/strategy'
 import { decideSwingEntry, decideExit, deriveBook, bidForSide, sourceEdge, type MidPoint } from './engine/swing'
+import { decideValueExit } from './engine/valueExit'
+import { decideCertaintyExit } from './engine/certaintyExit'
+import {
+  certaintyBlockReason,
+  certaintyStrike,
+  evaluateCertainty,
+  inCertaintyEntryBand,
+  oracleFavoredSide,
+  orderFromCertainty,
+  pickCertaintyCandidates,
+  certaintyEntryRecord,
+  formatCertaintyConfig,
+  type CertaintyCandidate,
+  type CertaintyEvalOpts,
+} from './engine/certainty'
 import { takerFee } from './engine/fees'
-import { dryExecutor, isInsufficientBalanceError, makeLiveExecutor, type SellOrder } from './engine/executor'
+import {
+  dryExecutor,
+  isGoneOutcomeTokenError,
+  isInsufficientBalanceError,
+  makeLiveExecutor,
+  type SellOrder,
+} from './engine/executor'
 import { ClobMarketStream, type TradePrint } from './sources/clobMarket'
 import { MakerSimExecutor, type MakerFill, type MakerQuote } from './engine/makerExecutor'
 import { decideQuotes, type MakerContext, type MakerInventory } from './engine/maker'
 import { emptyAccount, applyFill, flatten as flattenAccount, settle as settleAccount } from './engine/makerAccount'
 import { maxOrderCost, tradingEnabled } from './engine/guards'
+import { getPolyConfig } from '../api/_lib/env'
 import { startControlServer, type BotMode, type BotStatus } from './control'
 import { VOL_LOOKBACK_MS } from '../src/lib/fairValue'
-import { marketWindowKey, windowEndMsFromKey } from '../src/lib/marketScope'
+import { marketWindowKey, parseMarketWindowKey, windowEndMsFromKey } from '../src/lib/marketScope'
 import { chainlinkPair } from '../src/lib/cryptoPrice'
 import type { CoinId, ParsedMarket, TimeframeId } from '../src/lib/types'
 
@@ -68,6 +95,30 @@ async function main(): Promise<void> {
   ) {
     config.maxDailyTrades = runtime.maxDailyTrades
   }
+  if (runtime.certainty) {
+    const rc = runtime.certainty
+    if (rc.entryWithinSec != null && rc.entryWithinSec >= 5 && rc.entryWithinSec <= 120) {
+      config.certaintyEntryWithinSec = rc.entryWithinSec
+    }
+    if (rc.minWinProb != null && rc.minWinProb > 0.5 && rc.minWinProb < 1) {
+      config.certaintyMinWinProb = rc.minWinProb
+    }
+    if (rc.minEdge != null && rc.minEdge >= 0.01 && rc.minEdge <= 0.2) {
+      config.certaintyMinEdge = rc.minEdge
+    }
+    if (rc.maxAsk != null && rc.maxAsk > 0.5 && rc.maxAsk < 1) {
+      config.certaintyMaxAsk = rc.maxAsk
+    }
+    if (
+      rc.maxCoins != null &&
+      Number.isInteger(rc.maxCoins) &&
+      rc.maxCoins >= 1 &&
+      rc.maxCoins <= 6
+    ) {
+      config.certaintyMaxCoins = rc.maxCoins
+      if (config.certaintyMinCoins > rc.maxCoins) config.certaintyMinCoins = rc.maxCoins
+    }
+  }
   // Mutable at runtime so the dashboard can flip the switch without a restart.
   // 'paper' is an alias for the wire mode 'dry' (paper-trading, no real orders).
   const launchArg = process.argv[2]
@@ -81,8 +132,8 @@ async function main(): Promise<void> {
     process.env.BOT_ALLOW_LIVE === '1'
   let halted = false
   const db = openDb(config.dbPath)
-  const repaired = db.repairDustLiveFills(config.stakeUsd)
-  if (repaired > 0) log(`repaired ${repaired} dust live fill(s) in trade history`)
+  const repaired = db.repairLiveTradeFills(config.stakeUsd)
+  if (repaired > 0) log(`repaired ${repaired} live trade fill(s) in trade history`)
   const stream = new ChainlinkStream()
 
   // --- maker strategy infra (strategy='maker'). The CLOB market socket supplies
@@ -124,10 +175,29 @@ async function main(): Promise<void> {
   let makerStepAt = 0
 
   const stats = { ticks: 0, predictions: 0, outcomes: 0, trades: 0, settled: 0, makerFills: 0 }
-  /** Windows successfully entered this session (DB tradeExists guards restarts). */
+  /** Windows successfully entered this session (per mode — dry paper does not block live). */
   const entered = new Set<string>()
+  const enteredKey = (windowKey: string): string => `${mode}:${windowKey}`
   /** In-flight value-entry guard — mirrors enteringSwing so a slow buy can't double-fire. */
   const enteringValue = new Set<string>()
+  /** In-flight certainty-entry guard — one slow buy must not double-fire per window. */
+  const enteringCertainty = new Set<string>()
+  /** Per-tick candidates collected across scopes; cleared after pickAndTradeCertainty. */
+  /** In-flight certainty redeem guard — one relayer tx per position at a time. */
+  const certaintyRedeeming = new Set<number>()
+  const certaintyRedeemAfter = new Map<number, number>()
+  let lastCertaintyCashSweep = 0
+  const CERTAINTY_CASH_SWEEP_MS = 5_000
+  const CERTAINTY_REDEEM_RETRY_MS = 30_000
+
+  let certaintyCandidates: CertaintyCandidate[] = []
+  /** Markets + marks for open positions whose windows have rolled off the live scope list. */
+  const openMarketCache = new Map<string, ParsedMarket>()
+  const openMarkCache = new Map<string, number | null>()
+  const openPolyCache = new Map<string, PolyPositionSnap>()
+  /** Polymarket crypto-price API resolution — overrides stale Chainlink outcomes. */
+  const polyOutcomeCache = new Map<string, 'up' | 'down'>()
+  let lastOutcomeRepair = 0
   /** dry paper executor by default; arming live swaps in the real one. */
   let executor = dryExecutor
   /** Last known CLOB USDC balance — refreshed when arming live and after fills. */
@@ -162,6 +232,8 @@ async function main(): Promise<void> {
 
   const lastSample = new Map<string, number>()
   const tracked = new Map<string, TrackedWindow>()
+  /** Windows currently being resolved via the Polymarket crypto-price API. */
+  const outcomeResolving = new Set<string>()
   // Swing state: recent mids per window (swing detection), per-window re-entry
   // cooldown, and in-flight guards so an async buy/sell can't double-fire.
   const midHistory = new Map<string, MidPoint[]>()
@@ -185,13 +257,25 @@ async function main(): Promise<void> {
         ? `maker/${config.makerFillModel} · src ${config.signalSource} · spread±${config.makerBaseSpread} ` +
           `(+${config.makerVolCoef}σ) · clip $${config.makerClipUsd} · maxInv ${config.makerMaxInventory} · ` +
           `skew ${config.makerInvSkew} · rebate ${config.makerRebateRate} · pull ${config.makerPullSec}s/flatten ${config.makerFlattenSec}s`
-        : `value · edge≥${config.edgeThreshold} · ask≤${config.valueMaxEntryPrice}`
+        : config.strategy === 'certainty'
+          ? `certainty · T-${config.certaintyEntryWithinSec}s · P≥${config.certaintyMinWinProb} · edge≥${config.certaintyMinEdge}` +
+            ` · ask ${(config.certaintyMinFavoredAsk * 100).toFixed(0)}–${(config.certaintyMaxAsk * 100).toFixed(0)}¢ · z≥${config.certaintyMinZ} · pick ${config.certaintyMinCoins}-${config.certaintyMaxCoins}` +
+            ` · sell≥${(config.certaintyTakeProfitBid * 100).toFixed(0)}¢` +
+            ` · src ${config.signalSource}`
+          : `value · edge≥${config.edgeThreshold} · ask≤${config.valueMaxEntryPrice}` +
+            (config.valueExitEnabled
+              ? ` · exit P<${config.valueExitMinWinProb} @${config.valueExitWithinSec}s`
+              : ' · exit off')
   log(
     `${mode} up · db=${config.dbPath} · scopes=${scopes.map((s) => `${s.coin}/${s.timeframe}`).join(',')}` +
       (mode !== 'record'
         ? ` · trade[${config.timeframes.filter((tf) => tradeTf.has(tf)).join(',') || 'none'}] · ${strategyBrief} · $${config.stakeUsd}`
         : ''),
   )
+  if (mode === 'live' && config.strategy === 'certainty') {
+    const redeemHint = redeemEnvHint()
+    if (redeemHint) log(`NOTE: ${redeemHint}`)
+  }
 
   // --- LIVE arming: every guard must pass; returns an error instead of exiting
   // so the same path serves both startup and a runtime switch. ---
@@ -263,9 +347,9 @@ async function main(): Promise<void> {
     return { ok: true }
   }
 
-  function setStrategy(next: 'value' | 'swing' | 'maker'): { ok: boolean; error?: string } {
-    if (next !== 'value' && next !== 'swing' && next !== 'maker') {
-      return { ok: false, error: 'strategy must be value|swing|maker' }
+  function setStrategy(next: BotConfig['strategy']): { ok: boolean; error?: string } {
+    if (next !== 'value' && next !== 'swing' && next !== 'maker' && next !== 'certainty') {
+      return { ok: false, error: 'strategy must be value|swing|maker|certainty' }
     }
     if (next === config.strategy) return { ok: true }
     const prev = config.strategy
@@ -345,6 +429,65 @@ async function main(): Promise<void> {
     return { ok: true }
   }
 
+  function setCertainty(patch: {
+    entryWithinSec?: number
+    minWinProb?: number
+    minEdge?: number
+    maxAsk?: number
+    maxCoins?: number
+  }): { ok: boolean; error?: string } {
+    const applied: string[] = []
+    const persist: NonNullable<typeof runtime.certainty> = { ...runtime.certainty }
+
+    if (patch.entryWithinSec != null) {
+      if (!Number.isInteger(patch.entryWithinSec) || patch.entryWithinSec < 5 || patch.entryWithinSec > 120) {
+        return { ok: false, error: 'entry window must be 5–120 seconds' }
+      }
+      config.certaintyEntryWithinSec = patch.entryWithinSec
+      persist.entryWithinSec = patch.entryWithinSec
+      applied.push(`T-${patch.entryWithinSec}s`)
+    }
+    if (patch.minWinProb != null) {
+      if (!(patch.minWinProb > 0.5 && patch.minWinProb < 0.999)) {
+        return { ok: false, error: 'min P(win) must be between 50% and 99.9%' }
+      }
+      config.certaintyMinWinProb = patch.minWinProb
+      persist.minWinProb = patch.minWinProb
+      applied.push(`P≥${patch.minWinProb.toFixed(2)}`)
+    }
+    if (patch.minEdge != null) {
+      if (!(patch.minEdge >= 0.01 && patch.minEdge <= 0.2)) {
+        return { ok: false, error: 'min edge must be 1–20¢' }
+      }
+      config.certaintyMinEdge = patch.minEdge
+      persist.minEdge = patch.minEdge
+      applied.push(`edge≥${patch.minEdge.toFixed(2)}`)
+    }
+    if (patch.maxAsk != null) {
+      if (!(patch.maxAsk > 0.5 && patch.maxAsk < 0.999)) {
+        return { ok: false, error: 'max ask must be between 50¢ and 99.9¢' }
+      }
+      config.certaintyMaxAsk = patch.maxAsk
+      persist.maxAsk = patch.maxAsk
+      applied.push(`ask≤${patch.maxAsk.toFixed(2)}`)
+    }
+    if (patch.maxCoins != null) {
+      if (!Number.isInteger(patch.maxCoins) || patch.maxCoins < 1 || patch.maxCoins > 6) {
+        return { ok: false, error: 'max coins must be 1–6' }
+      }
+      config.certaintyMaxCoins = patch.maxCoins
+      if (config.certaintyMinCoins > patch.maxCoins) config.certaintyMinCoins = patch.maxCoins
+      persist.maxCoins = patch.maxCoins
+      applied.push(`max ${patch.maxCoins} coins`)
+    }
+
+    if (applied.length === 0) return { ok: false, error: 'no certainty fields to update' }
+    runtime.certainty = persist
+    saveRuntimeSettings(RUNTIME_PATH, { certainty: persist })
+    log(`certainty config → ${applied.join(' · ')} (control)`)
+    return { ok: true }
+  }
+
   // Startup live still refuses hard (exit) — a launched-live bot that can't arm
   // shouldn't silently fall back to dry.
   if (mode === 'live') {
@@ -394,7 +537,19 @@ async function main(): Promise<void> {
   function dailyCapReached(now: number): boolean {
     const cap = effectiveDailyCap()
     if (cap <= 0) return false
-    return db.countTradesSince(now - 86_400_000) >= cap
+    return db.countTradesSince(now - 86_400_000, mode) >= cap
+  }
+
+  /** Normalize live CLOB fills before persisting — guards against absurd parse glitches. */
+  function liveFillAmounts(
+    order: { fillPrice: number; stakeUsd: number },
+    fill: { fillPrice: number; fillSize: number },
+  ): { entryPrice: number; size: number; cost: number } | null {
+    if (mode !== 'live') {
+      const cost = fill.fillPrice * fill.fillSize
+      return { entryPrice: fill.fillPrice, size: fill.fillSize, cost }
+    }
+    return normalizeLiveFill(order.stakeUsd, order.fillPrice, fill.fillPrice, fill.fillSize)
   }
 
   // Value entry: once per window when edge clears and the ask is cheap enough.
@@ -402,7 +557,7 @@ async function main(): Promise<void> {
   // after NO FILL so an empty book isn't hammered every tick.
   async function maybeTrade(pred: Prediction, market: ParsedMarket, now: number): Promise<void> {
     if (entriesHalted(now)) return
-    if (entered.has(pred.windowKey) || db.tradeExists(pred.windowKey)) return
+    if (entered.has(enteredKey(pred.windowKey)) || db.tradeExists(pred.windowKey, mode)) return
     if (enteringValue.has(pred.windowKey)) return
     if ((balanceBlockedUntil.get(pred.windowKey) ?? 0) > now) return
     if ((entryRetryAfter.get(pred.windowKey) ?? 0) > now) return
@@ -467,7 +622,17 @@ async function main(): Promise<void> {
       return
     }
 
-    const cost = fill.fillPrice * fill.fillSize
+    const amounts = liveFillAmounts(order, fill)
+    if (!amounts) {
+      log(
+        `${mode.toUpperCase()} NO FILL ${pred.coin}/${pred.timeframe} ${order.side} @ ${order.fillPrice.toFixed(3)} · ` +
+          `$${order.stakeUsd} · ${secLeft}s left — bad fill parse` +
+          (attempt < ENTRY_MAX_ATTEMPTS ? ` (retry in ${ENTRY_NO_FILL_BACKOFF_MS / 1000}s)` : ' (max attempts)'),
+      )
+      if (attempt < ENTRY_MAX_ATTEMPTS) entryRetryAfter.set(pred.windowKey, now + ENTRY_NO_FILL_BACKOFF_MS)
+      return
+    }
+    const { entryPrice, size, cost } = amounts
     if (mode === 'live' && cost < order.stakeUsd * 0.9) {
       log(
         `${mode.toUpperCase()} NO FILL ${pred.coin}/${pred.timeframe} ${order.side} ` +
@@ -475,7 +640,7 @@ async function main(): Promise<void> {
       )
       return
     }
-    entered.add(pred.windowKey)
+    entered.add(enteredKey(pred.windowKey))
     if (mode === 'live') cachedUsdcBalance = cachedUsdcBalance == null ? null : cachedUsdcBalance - cost
     db.insertTrade({
       windowKey: pred.windowKey,
@@ -485,8 +650,8 @@ async function main(): Promise<void> {
       strategy: 'value',
       side: order.side,
       entryT: now,
-      entryPrice: fill.fillPrice,
-      size: fill.fillSize,
+      entryPrice,
+      size,
       cost,
       entryFee: 0,
       signalEdge: pred.edge,
@@ -502,6 +667,148 @@ async function main(): Promise<void> {
     )
   }
 
+  async function executeCertaintyEntry(candidate: CertaintyCandidate, now: number): Promise<void> {
+    let active = candidate
+    if (mode === 'live') {
+      const fresh = await revalidateCertaintyCandidate(candidate, now)
+      if (!fresh) {
+        const { pred, market } = candidate
+        log(
+          `${mode.toUpperCase()} SKIP certainty ${pred.coin}/${pred.timeframe} — pre-buy re-check failed · ` +
+            `${Math.round((market.endDate.getTime() - now) / 1000)}s left`,
+        )
+        return
+      }
+      active = fresh
+    }
+    const { pred, market, eval: ev } = active
+    const windowKey = pred.windowKey
+    const msRemaining = market.endDate.getTime() - now
+    if (entriesHalted(now)) return
+    if (entered.has(enteredKey(windowKey)) || db.tradeExists(windowKey, mode)) return
+    if (enteringCertainty.has(windowKey)) return
+    if ((balanceBlockedUntil.get(windowKey) ?? 0) > now) return
+    if ((entryRetryAfter.get(windowKey) ?? 0) > now) return
+    if (!inCertaintyEntryBand(msRemaining, config)) return
+    if (db.countOpenTrades() >= config.maxConcurrent) return
+    if (dailyCapReached(now)) return
+
+    const order = orderFromCertainty(active, config)
+    const secLeft = Math.round(msRemaining / 1000)
+    const attempt = (entryAttemptCount.get(windowKey) ?? 0) + 1
+    entryAttemptCount.set(windowKey, attempt)
+    log(
+      `${mode.toUpperCase()} ATTEMPT certainty ${pred.coin}/${pred.timeframe} ${order.side} @ ${order.fillPrice.toFixed(3)} · ` +
+        `$${order.stakeUsd} · P ${ev.pWin.toFixed(3)} · edge ${ev.edge.toFixed(3)} · z ${ev.zDist.toFixed(2)} · ` +
+        `${secLeft}s left · try ${attempt} (T-band)`,
+    )
+
+    enteringCertainty.add(windowKey)
+    let fill
+    try {
+      fill = await executor.buy(order)
+    } catch (e) {
+      enteringCertainty.delete(windowKey)
+      const msg = e instanceof Error ? e.message : String(e)
+      if (isInsufficientBalanceError(msg)) {
+        balanceBlockedUntil.set(windowKey, now + 30_000)
+        log(
+          `${mode.toUpperCase()} SKIP certainty ${pred.coin}/${pred.timeframe} ${order.side} — ${msg} ` +
+            `(deposit or lower stake; pausing retries 30s)`,
+        )
+        return
+      }
+      log(
+        `${mode.toUpperCase()} ORDER FAILED certainty ${pred.coin}/${pred.timeframe} ${order.side} @ ${order.fillPrice.toFixed(3)} · ` +
+          `$${order.stakeUsd} · ${secLeft}s left — ${msg}` +
+          (inCertaintyEntryBand(market.endDate.getTime() - now, config)
+            ? ` (retry in ${config.certaintyEntryRetryMs / 1000}s)`
+            : ''),
+      )
+      if (inCertaintyEntryBand(market.endDate.getTime() - now, config)) {
+        entryRetryAfter.set(windowKey, now + config.certaintyEntryRetryMs)
+      }
+      return
+    }
+    enteringCertainty.delete(windowKey)
+    if (!(fill.fillSize > 0 && fill.fillPrice > 0)) {
+      log(
+        `${mode.toUpperCase()} NO FILL certainty ${pred.coin}/${pred.timeframe} ${order.side} @ ${order.fillPrice.toFixed(3)} · ` +
+          `$${order.stakeUsd} · ${secLeft}s left — book empty / FAK killed` +
+          (inCertaintyEntryBand(market.endDate.getTime() - now, config)
+            ? ` (retry in ${config.certaintyEntryRetryMs / 1000}s)`
+            : ''),
+      )
+      if (inCertaintyEntryBand(market.endDate.getTime() - now, config)) {
+        entryRetryAfter.set(windowKey, now + config.certaintyEntryRetryMs)
+      }
+      return
+    }
+
+    const amounts = liveFillAmounts(order, fill)
+    if (!amounts) {
+      log(
+        `${mode.toUpperCase()} NO FILL certainty ${pred.coin}/${pred.timeframe} ${order.side} @ ${order.fillPrice.toFixed(3)} · ` +
+          `$${order.stakeUsd} · ${secLeft}s left — bad fill parse` +
+          (inCertaintyEntryBand(market.endDate.getTime() - now, config)
+            ? ` (retry in ${config.certaintyEntryRetryMs / 1000}s)`
+            : ''),
+      )
+      if (inCertaintyEntryBand(market.endDate.getTime() - now, config)) {
+        entryRetryAfter.set(windowKey, now + config.certaintyEntryRetryMs)
+      }
+      return
+    }
+    const { entryPrice, size, cost } = amounts
+    if (mode === 'live' && cost < order.stakeUsd * 0.9) {
+      log(
+        `${mode.toUpperCase()} NO FILL certainty ${pred.coin}/${pred.timeframe} ${order.side} ` +
+          `(dust fill $${cost.toFixed(4)} on $${order.stakeUsd} order — not recording)`,
+      )
+      return
+    }
+    entered.add(enteredKey(windowKey))
+    if (mode === 'live') cachedUsdcBalance = cachedUsdcBalance == null ? null : cachedUsdcBalance - cost
+    const snap = certaintyEntryRecord(ev, pred, config)
+    db.insertTrade({
+      windowKey,
+      coin: pred.coin,
+      timeframe: pred.timeframe,
+      mode,
+      strategy: 'certainty',
+      side: order.side,
+      entryT: now,
+      entryPrice,
+      size,
+      cost,
+      entryFee: 0,
+      signalEdge: ev.edge,
+      regimeEntry: pred.regime,
+      status: 'open',
+      orderId: fill.orderId,
+      certainty: snap,
+    })
+    stats.trades += 1
+    log(
+      `${mode.toUpperCase()} ENTER certainty ${pred.coin}/${pred.timeframe} ${order.side} @ ${entryPrice.toFixed(3)} · ` +
+        `size ${size.toFixed(1)} · cost $${cost.toFixed(2)} · P ${ev.pWin.toFixed(3)} · edge ${ev.edge.toFixed(3)} · ` +
+        `z ${ev.zDist.toFixed(2)} · ${secLeft}s left · ${formatCertaintyConfig(snap)}` +
+        (fill.orderId ? ` · ${fill.orderId.slice(0, 10)}` : ''),
+    )
+  }
+
+  /** Rank cross-scope candidates and enter up to certaintyMaxCoins this tick. */
+  async function pickAndTradeCertainty(candidates: CertaintyCandidate[], now: number): Promise<void> {
+    if (entriesHalted(now)) return
+    const picked = pickCertaintyCandidates(candidates, config)
+    if (picked.length === 0) return
+    for (const c of picked) {
+      if (db.countOpenTrades() >= config.maxConcurrent) break
+      if (dailyCapReached(now)) break
+      await executeCertaintyEntry(c, now)
+    }
+  }
+
   // --- Swing scalp: record the mid, manage open exits, then consider an entry. ---
   function recordMid(pred: Prediction, now: number): void {
     const hist = midHistory.get(pred.windowKey) ?? []
@@ -512,48 +819,371 @@ async function main(): Promise<void> {
     midHistory.set(pred.windowKey, hist)
   }
 
+  type SellExitResult = 'closed' | 'retry' | 'gone'
+
+  /** Market-sell an open position; returns how the attempt resolved. */
+  async function marketSellExit(
+    pos: { id: number; side: 'up' | 'down'; size: number; cost: number },
+    pred: Prediction,
+    market: ParsedMarket,
+    now: number,
+    exit: { reason: string; mark: number },
+    logPrefix: string,
+  ): Promise<SellExitResult> {
+    if (exitingTrades.has(pos.id)) return 'retry'
+    const tokenId = pos.side === 'up' ? market.upTokenId : market.downTokenId
+    if (!tokenId) return 'retry'
+    const sellOrder: SellOrder = {
+      side: pos.side,
+      tokenId,
+      size: pos.size,
+      sellPrice: exit.mark,
+      tickSize: market.tickSize,
+      negRisk: market.negRisk,
+    }
+    exitingTrades.add(pos.id)
+    let fill
+    try {
+      fill = await executor.sell(sellOrder)
+    } catch (e) {
+      exitingTrades.delete(pos.id)
+      const msg = e instanceof Error ? e.message : String(e)
+      if (isGoneOutcomeTokenError(msg)) return 'gone'
+      log(`${mode.toUpperCase()} SELL FAILED #${pos.id} ${pos.side} — ${msg} (will retry)`)
+      return 'retry'
+    }
+    exitingTrades.delete(pos.id)
+    if (!(fill.fillSize > 0 && fill.fillPrice > 0)) return 'retry'
+
+    const exitFee = config.feeSell ? takerFee(fill.fillPrice, fill.fillSize, config.feeRate) : 0
+    const payout = fill.fillPrice * fill.fillSize - exitFee
+    const pnl = payout - pos.cost
+    db.closeTrade({
+      id: pos.id,
+      exitT: now,
+      exitPrice: fill.fillPrice,
+      exitReason: exit.reason,
+      exitFee,
+      payout,
+      pnl,
+    })
+    stats.settled += 1
+    log(
+      `${mode.toUpperCase()} EXIT ${exit.reason} ${logPrefix}${pred.coin}/${pred.timeframe} ${pos.side} @ ${fill.fillPrice.toFixed(3)} · ` +
+        `pnl ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(3)} · ${Math.round((market.endDate.getTime() - now) / 1000)}s left`,
+    )
+    if (mode === 'live' && cachedUsdcBalance != null) cachedUsdcBalance += payout
+    return 'closed'
+  }
+
+  function closeCertaintyAsRecovered(
+    pos: {
+      id: number
+      coin: string
+      timeframe: string
+      side: 'up' | 'down'
+      size: number
+      cost: number
+      entryPrice: number
+    },
+    now: number,
+    note = 'already recovered',
+  ): void {
+    const payout = tradeShares(pos)
+    const pnl = payout - pos.cost
+    db.closeTrade({
+      id: pos.id,
+      exitT: now,
+      exitPrice: 1,
+      exitReason: 'redeem',
+      exitFee: 0,
+      payout,
+      pnl,
+    })
+    if (cachedUsdcBalance != null) cachedUsdcBalance += payout
+    stats.settled += 1
+    log(
+      `${mode.toUpperCase()} REDEEM certainty ${pos.coin}/${pos.timeframe} ${pos.side} · ` +
+        `pnl ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(3)} (${note})`,
+    )
+  }
+
+  function certaintyTokensGone(
+    tokenId: string | null | undefined,
+    polyByToken: Map<string, PolyPositionSnap> | null,
+  ): boolean {
+    if (!tokenId || !polyByToken) return false
+    const snap = polyByToken.get(tokenId)
+    return !snap || snap.currentValue <= 0.01
+  }
+
   async function swingExit(pred: Prediction, market: ParsedMarket, now: number): Promise<void> {
     for (const pos of db.openTradesForWindow(pred.windowKey)) {
       if (pos.strategy !== 'swing' || exitingTrades.has(pos.id)) continue
       const exit = decideExit(pos, pred, market, config, now)
       if (!exit) continue
-      const tokenId = pos.side === 'up' ? market.upTokenId : market.downTokenId
-      if (!tokenId) continue
-      const sellOrder: SellOrder = {
-        side: pos.side,
-        tokenId,
-        size: pos.size,
-        sellPrice: exit.mark,
-        tickSize: market.tickSize,
-        negRisk: market.negRisk,
-      }
-      exitingTrades.add(pos.id)
-      let fill
+      const result = await marketSellExit(pos, pred, market, now, exit, '')
+      if (result === 'closed') swingCooldown.set(pred.windowKey, now)
+    }
+  }
+
+  async function valueExit(pred: Prediction, market: ParsedMarket, now: number): Promise<void> {
+    for (const pos of db.openTradesForWindow(pred.windowKey)) {
+      if (pos.strategy !== 'value' || exitingTrades.has(pos.id)) continue
+      const exit = decideValueExit(pos, pred, market, config, now, pos.entryT)
+      if (!exit) continue
+      await marketSellExit(pos, pred, market, now, exit, 'value ')
+    }
+  }
+
+  async function certaintyExit(pred: Prediction, market: ParsedMarket, now: number): Promise<void> {
+    for (const pos of db.openTradesForWindow(pred.windowKey)) {
+      if (pos.strategy !== 'certainty' || exitingTrades.has(pos.id)) continue
+      const exit = decideCertaintyExit(pos, market, config, now)
+      if (!exit) continue
+      await marketSellExit(pos, pred, market, now, exit, 'certainty ')
+    }
+  }
+
+  /** Post-window USDC recovery — sell into any bid, then redeem on live when flagged. */
+  async function tryCertaintyRedeem(
+    pos: {
+      id: number
+      windowKey: string
+      coin: string
+      timeframe: string
+      side: 'up' | 'down'
+      size: number
+      cost: number
+      entryPrice: number
+    },
+    market: ParsedMarket,
+    now: number,
+  ): Promise<boolean> {
+    if (mode !== 'live') return false
+    if (certaintyRedeeming.has(pos.id)) return false
+    if ((certaintyRedeemAfter.get(pos.id) ?? 0) > now) return false
+    certaintyRedeemAfter.set(pos.id, now + CERTAINTY_REDEEM_RETRY_MS)
+
+    const poly = getPolyConfig()
+    if (!poly) return false
+    const tokenId = pos.side === 'up' ? market.upTokenId : market.downTokenId
+    if (!tokenId) return false
+
+    let redeemable = false
+    try {
+      const byToken = await fetchRedeemableByToken(poly.funderAddress)
+      redeemable = byToken.get(tokenId)?.redeemable === true
+    } catch {
+      return false
+    }
+    if (!redeemable) {
       try {
-        fill = await executor.sell(sellOrder)
-      } catch (e) {
-        exitingTrades.delete(pos.id)
-        log(
-          `${mode.toUpperCase()} SELL FAILED #${pos.id} ${pos.side} — ` +
-            `${e instanceof Error ? e.message : String(e)} (will retry)`,
-        )
-        continue
+        const positions = await fetchPolyPositionsByToken(poly.funderAddress)
+        const snap = positions.get(tokenId)
+        if (!snap || snap.currentValue <= 0.01) {
+          closeCertaintyAsRecovered(pos, now)
+          return true
+        }
+      } catch {
+        return false
       }
-      exitingTrades.delete(pos.id)
-      if (!(fill.fillSize > 0 && fill.fillPrice > 0)) {
-        // Unmatched — empty/thin book. Retry next tick while exit conditions hold.
-        continue
-      }
-      const exitFee = config.feeSell ? takerFee(fill.fillPrice, fill.fillSize, config.feeRate) : 0
-      const payout = fill.fillPrice * fill.fillSize - exitFee
-      const pnl = payout - pos.cost
-      db.closeTrade({ id: pos.id, exitT: now, exitPrice: fill.fillPrice, exitReason: exit.reason, exitFee, payout, pnl })
-      swingCooldown.set(pred.windowKey, now)
-      stats.settled += 1
+      return false
+    }
+
+    const parsed = parseMarketWindowKey(pos.windowKey)
+    if (!parsed) return false
+
+    certaintyRedeeming.add(pos.id)
+    const shares = tradeShares(pos)
+    const result = await redeemWinningPosition({
+      eventSlug: parsed.eventSlug,
+      side: pos.side,
+      size: shares,
+      negRisk: market.negRisk === true,
+    })
+    certaintyRedeeming.delete(pos.id)
+    if (!result.ok) {
       log(
-        `${mode.toUpperCase()} EXIT ${exit.reason} ${pred.coin}/${pred.timeframe} ${pos.side} @ ${fill.fillPrice.toFixed(3)} · ` +
-          `pnl ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(3)} · ${Math.round((market.endDate.getTime() - now) / 1000)}s left`,
+        `${mode.toUpperCase()} REDEEM FAILED #${pos.id} ${pos.coin}/${pos.timeframe} ${pos.side} — ${result.error ?? 'unknown'}`,
       )
+      return false
+    }
+
+    const payout = shares
+    const pnl = payout - pos.cost
+    db.closeTrade({
+      id: pos.id,
+      exitT: now,
+      exitPrice: 1,
+      exitReason: 'redeem',
+      exitFee: 0,
+      payout,
+      pnl,
+    })
+    if (cachedUsdcBalance != null) cachedUsdcBalance += payout
+    stats.settled += 1
+    log(
+      `${mode.toUpperCase()} REDEEM certainty ${pos.coin}/${pos.timeframe} ${pos.side} · ` +
+        `pnl ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(3)}`,
+    )
+    return true
+  }
+
+  async function sweepCertaintyCash(now: number): Promise<void> {
+    if (mode === 'record') return
+    const open = db.openTrades().filter((t) => t.strategy === 'certainty')
+    if (open.length === 0) return
+
+    const liveMarkets = new Map<string, ParsedMarket>()
+    for (const s of scopes) if (s.market) liveMarkets.set(marketWindowKey(s.market), s.market)
+
+    let polyByToken: Map<string, PolyPositionSnap> | null = null
+    if (mode === 'live') {
+      const poly = getPolyConfig()
+      if (poly) {
+        try {
+          polyByToken = await fetchPolyPositionsByToken(poly.funderAddress)
+        } catch {
+          polyByToken = null
+        }
+      }
+    }
+
+    for (const pos of open) {
+      if (exitingTrades.has(pos.id) || certaintyRedeeming.has(pos.id)) continue
+      const endMs = windowEndMsFromKey(pos.windowKey)
+      if (endMs == null || now <= endMs + 2_000) continue
+
+      const outcome = db.outcomeFor(pos.windowKey)
+      if (outcome && pos.side !== outcome) continue // loser — settleTrades closes the book row
+
+      let market = liveMarkets.get(pos.windowKey) ?? null
+      if (!market) {
+        const parsed = parseMarketWindowKey(pos.windowKey)
+        if (parsed) {
+          market = await fetchMarketByEventSlug(
+            parsed.eventSlug,
+            pos.coin as CoinId,
+            pos.timeframe as TimeframeId,
+          )
+        }
+      }
+      if (!market) continue
+
+      const tokenId = pos.side === 'up' ? market.upTokenId : market.downTokenId
+      if (mode === 'live' && outcome && pos.side === outcome && certaintyTokensGone(tokenId, polyByToken)) {
+        closeCertaintyAsRecovered(pos, now)
+        continue
+      }
+
+      const stubPred = {
+        windowKey: pos.windowKey,
+        coin: pos.coin as CoinId,
+        timeframe: pos.timeframe as TimeframeId,
+      } as Prediction
+
+      let windowEndMark = bidForSide(deriveBook(market), pos.side)
+      if (mode === 'live') {
+        if (tokenId) {
+          const clobBid = await fetchClobBestBid(tokenId)
+          if (clobBid != null) windowEndMark = clobBid
+        }
+      }
+      const exit =
+        windowEndMark != null && windowEndMark >= config.certaintyWindowEndMinBid
+          ? { reason: 'window-end' as const, mark: windowEndMark }
+          : null
+      if (exit) {
+        const result = await marketSellExit(pos, stubPred, market, now, exit, 'certainty ')
+        if (result === 'closed') continue
+        if (result === 'gone' && outcome && pos.side === outcome) {
+          closeCertaintyAsRecovered(pos, now, 'tokens gone')
+          continue
+        }
+      }
+
+      if (outcome && pos.side === outcome) {
+        await tryCertaintyRedeem(pos, market, now)
+      }
+    }
+  }
+
+  async function certaintyClobAsks(
+    market: ParsedMarket,
+    side: 'up' | 'down',
+  ): Promise<{ clobAsk: number | null; clobOppAsk: number | null }> {
+    const favoredId = side === 'up' ? market.upTokenId : market.downTokenId
+    const oppId = side === 'up' ? market.downTokenId : market.upTokenId
+    const [clobAsk, clobOppAsk] = await Promise.all([
+      favoredId ? fetchClobBestAsk(favoredId) : Promise.resolve(null),
+      oppId ? fetchClobBestAsk(oppId) : Promise.resolve(null),
+    ])
+    return { clobAsk, clobOppAsk }
+  }
+
+  async function certaintyEvalOpts(
+    market: ParsedMarket,
+    spot: number,
+    strike: number,
+    now: number,
+  ): Promise<CertaintyEvalOpts | undefined> {
+    if (!inCertaintyEntryBand(market.endDate.getTime() - now, config)) return undefined
+    if (mode !== 'live') return undefined
+    const side = oracleFavoredSide(spot, strike)
+    const { clobAsk, clobOppAsk } = await certaintyClobAsks(market, side)
+    return { clobAsk, clobOppAsk, requireClobAsk: true }
+  }
+
+  /** Fresh spot/strike/book check immediately before a live Easy buy. */
+  async function revalidateCertaintyCandidate(
+    candidate: CertaintyCandidate,
+    now: number,
+  ): Promise<CertaintyCandidate | null> {
+    const { pred, market } = candidate
+    const pair = chainlinkPair(pred.coin as CoinId)
+    if (!pair) return null
+    const windowStart = market.startDate?.getTime()
+    const chainlinkOpen =
+      windowStart != null ? stream.firstPriceAtOrAfter(pair, windowStart, 90_000) : null
+    const strike = certaintyStrike(market, chainlinkOpen)
+    const spot = stream.latest(pair)?.value ?? null
+    if (strike == null || spot == null) return null
+    const ticks = stream.ticksSince(pair, now - VOL_LOOKBACK_MS[pred.timeframe as TimeframeId])
+    const freshPred = predict(market, ticks, strike, spot, now)
+    if (!freshPred) return null
+    const evalOpts = await certaintyEvalOpts(market, spot, strike, now)
+    const ev = evaluateCertainty(freshPred, market, spot, strike, config, now, evalOpts)
+    if (!ev.ok) return null
+    return { pred: freshPred, market, eval: ev }
+  }
+
+  async function manageCertainty(
+    pred: Prediction,
+    market: ParsedMarket,
+    spot: number,
+    strike: number,
+    now: number,
+    canEnter: boolean,
+  ): Promise<void> {
+    await certaintyExit(pred, market, now)
+    if (!canEnter) return
+    const evalOpts = await certaintyEvalOpts(market, spot, strike, now)
+    const ev = evaluateCertainty(pred, market, spot, strike, config, now, evalOpts)
+    if (ev.ok) {
+      certaintyCandidates.push({ pred, market, eval: ev })
+      return
+    }
+    const block = ev.reason ?? certaintyBlockReason(pred, market, spot, strike, config, now, evalOpts)
+    if (block) {
+      const key = `${pred.windowKey}:${block}`
+      if (!entrySkipLogged.has(key)) {
+        entrySkipLogged.add(key)
+        log(
+          `${mode.toUpperCase()} SKIP certainty ${pred.coin}/${pred.timeframe} — ${block} · ` +
+            `${Math.round((market.endDate.getTime() - now) / 1000)}s left`,
+        )
+      }
     }
   }
 
@@ -594,9 +1224,12 @@ async function main(): Promise<void> {
       // Retries next tick while decideSwingEntry still qualifies (edge/move/band).
       return
     }
-    const entryFee = takerFee(fill.fillPrice, fill.fillSize, config.feeRate)
-    const cost = fill.fillPrice * fill.fillSize + entryFee
-    if (mode === 'live' && fill.fillPrice * fill.fillSize < order.stakeUsd * 0.9) {
+    const amounts = liveFillAmounts(order, fill)
+    if (!amounts) return
+    const { entryPrice, size, cost: fillCost } = amounts
+    const entryFee = takerFee(entryPrice, size, config.feeRate)
+    const cost = fillCost + entryFee
+    if (mode === 'live' && fillCost < order.stakeUsd * 0.9) {
       return
     }
     if (mode === 'live') cachedUsdcBalance = cachedUsdcBalance == null ? null : cachedUsdcBalance - cost
@@ -609,8 +1242,8 @@ async function main(): Promise<void> {
       strategy: 'swing',
       side: order.side,
       entryT: now,
-      entryPrice: fill.fillPrice,
-      size: fill.fillSize,
+      entryPrice,
+      size,
       cost,
       entryFee,
       signalEdge,
@@ -620,8 +1253,8 @@ async function main(): Promise<void> {
     })
     stats.trades += 1
     log(
-      `${mode.toUpperCase()} ENTER swing/${config.swingTrigger} ${pred.coin}/${pred.timeframe} ${order.side} @ ${fill.fillPrice.toFixed(3)} · ` +
-        `size ${fill.fillSize.toFixed(1)} · cost $${cost.toFixed(2)} · edge ${signalEdge.toFixed(3)} (${config.signalSource}) · ${pred.regime} · ` +
+      `${mode.toUpperCase()} ENTER swing/${config.swingTrigger} ${pred.coin}/${pred.timeframe} ${order.side} @ ${entryPrice.toFixed(3)} · ` +
+        `size ${size.toFixed(1)} · cost $${cost.toFixed(2)} · edge ${signalEdge.toFixed(3)} (${config.signalSource}) · ${pred.regime} · ` +
         `${Math.round((market.endDate.getTime() - now) / 1000)}s left`,
     )
   }
@@ -637,6 +1270,17 @@ async function main(): Promise<void> {
   ): Promise<void> {
     await swingExit(pred, market, now)
     if (canEnter) await swingEnter(pred, market, now)
+  }
+
+  /** Value entries + statistical cut-loss exits (same exit-before-entry ordering). */
+  async function manageValue(
+    pred: Prediction,
+    market: ParsedMarket,
+    now: number,
+    canEnter: boolean,
+  ): Promise<void> {
+    await valueExit(pred, market, now)
+    if (canEnter) await maybeTrade(pred, market, now)
   }
 
   // --- Maker strategy (strategy='maker'): post two-sided passive quotes, book
@@ -926,12 +1570,129 @@ async function main(): Promise<void> {
   function settleTrades(now: number): void {
     for (const s of db.pendingSettlements()) {
       const won = s.side === s.outcome
-      const payout = won ? s.size : 0
-      const pnl = payout - s.cost
+      // Live Easy winners stay open until sell/redeem actually returns USDC.
+      if (mode === 'live' && won && s.strategy === 'certainty') continue
+      const { payout, pnl } = settlementPayout(s, s.outcome)
       db.settleTrade(s.id, now, payout, pnl)
       stats.settled += 1
       log(`${mode.toUpperCase()} SETTLE ${s.side} ${won ? 'WIN ' : 'loss'} · pnl ${pnl >= 0 ? '+' : ''}${pnl.toFixed(3)}`)
     }
+  }
+
+  async function refreshOpenMarkets(): Promise<void> {
+    if (mode === 'record') return
+    const scopeMarkets = new Map<string, ParsedMarket>()
+    for (const s of scopes) {
+      if (s.market) scopeMarkets.set(marketWindowKey(s.market), s.market)
+    }
+    const open = db.openTrades().filter((t) => t.mode === mode)
+    const openKeys = new Set(open.map((t) => t.windowKey))
+    for (const key of openMarketCache.keys()) {
+      if (!openKeys.has(key)) {
+        openMarketCache.delete(key)
+        openMarkCache.delete(key)
+        openPolyCache.delete(key)
+        polyOutcomeCache.delete(key)
+      }
+    }
+
+    let polyByToken: Map<string, PolyPositionSnap> | null = null
+    if (mode === 'live') {
+      const poly = getPolyConfig()
+      if (poly) {
+        try {
+          polyByToken = await fetchPolyPositionsByToken(poly.funderAddress)
+        } catch {
+          polyByToken = null
+        }
+      }
+    }
+
+    for (const pos of open) {
+      let market = scopeMarkets.get(pos.windowKey) ?? openMarketCache.get(pos.windowKey) ?? null
+      if (!market) {
+        const parsed = parseMarketWindowKey(pos.windowKey)
+        if (parsed) {
+          market = await fetchMarketByEventSlug(
+            parsed.eventSlug,
+            pos.coin as CoinId,
+            pos.timeframe as TimeframeId,
+          )
+        }
+      }
+      if (!market) continue
+      openMarketCache.set(pos.windowKey, market)
+      const tokenId = pos.side === 'up' ? market.upTokenId : market.downTokenId
+      const poly = tokenId ? polyByToken?.get(tokenId) : undefined
+      if (poly) {
+        openPolyCache.set(pos.windowKey, poly)
+        openMarkCache.set(pos.windowKey, poly.curPrice)
+        continue
+      }
+      let mark: number | null = null
+      if (mode === 'live' && tokenId) {
+        mark = await fetchClobBestBid(tokenId)
+      }
+      if (mark == null) mark = bidForSide(deriveBook(market), pos.side)
+      openMarkCache.set(pos.windowKey, mark)
+    }
+
+    if (mode === 'live' && Date.now() - lastOutcomeRepair > 30_000) {
+      lastOutcomeRepair = Date.now()
+      void repairOpenOutcomesFromPoly()
+    }
+    await reconcileGhostOpenPositions(polyByToken)
+  }
+
+  /** Close book rows for ended windows whose tokens no longer appear on Polymarket. */
+  async function reconcileGhostOpenPositions(
+    polyByToken: Map<string, PolyPositionSnap> | null,
+  ): Promise<void> {
+    if (mode !== 'live' || !polyByToken) return
+    const now = Date.now()
+    for (const pos of db.openTrades().filter((t) => t.mode === mode)) {
+      const endMs = windowEndMsFromKey(pos.windowKey)
+      if (endMs == null || now <= endMs + 2_000) continue
+      const outcome = polyOutcomeCache.get(pos.windowKey) ?? db.outcomeFor(pos.windowKey)
+      if (!outcome) continue
+
+      const market = openMarketCache.get(pos.windowKey) ?? null
+      const tokenId = market ? (pos.side === 'up' ? market.upTokenId : market.downTokenId) : null
+      if (!tokenId) continue
+      if (polyByToken.has(tokenId)) continue
+
+      const { payout, pnl } = settlementPayout(pos, outcome)
+      if (pos.side === outcome) {
+        db.closeTrade({
+          id: pos.id,
+          exitT: now,
+          exitPrice: 1,
+          exitReason: 'redeem',
+          exitFee: 0,
+          payout,
+          pnl,
+        })
+      } else {
+        db.settleTrade(pos.id, now, payout, pnl)
+      }
+      stats.settled += 1
+      log(
+        `${mode.toUpperCase()} RECONCILE ${pos.coin}/${pos.timeframe} ${pos.side} ` +
+          `${pos.side === outcome ? 'WIN' : 'loss'} · pnl ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(3)} (wallet flat)`,
+      )
+    }
+  }
+
+  /** Settlement display for resolved windows — $1/share on win, $0 on loss. */
+  function resolvedOpenPnl(
+    t: { side: 'up' | 'down'; size: number; cost: number; entryPrice: number },
+    outcome: 'up' | 'down',
+  ): { phase: 'won' | 'lost'; mark: number; unrealizedPnl: number } {
+    const won = t.side === outcome
+    const shares = tradeShares(t)
+    return won
+      ? { phase: 'won', mark: 1, unrealizedPnl: shares - t.cost }
+      : { phase: 'lost', mark: 0, unrealizedPnl: -t.cost }
   }
 
   // Open positions enriched with the live mark (current bid for the held side) so
@@ -946,38 +1707,162 @@ async function main(): Promise<void> {
     mark: number | null
     unrealizedPnl: number | null
     msRemaining: number | null
+    phase: 'live' | 'won' | 'lost' | 'settling'
+    redeemable: boolean
+    /** Recorded oracle outcome for this window (when known). */
+    outcome?: 'up' | 'down'
   }[] {
     const now = Date.now()
-    const live = new Map<string, ParsedMarket>()
-    for (const s of scopes) if (s.market) live.set(marketWindowKey(s.market), s.market)
-    return db.openTrades().map((t) => {
-      const market = live.get(t.windowKey) ?? null
-      const mark = market ? bidForSide(deriveBook(market), t.side) : null
-      const endMs = market?.endDate.getTime() ?? windowEndMsFromKey(t.windowKey)
-      return {
-        coin: t.coin,
-        timeframe: t.timeframe,
-        side: t.side,
-        strategy: t.strategy,
-        entryPrice: t.entryPrice,
-        size: t.size,
-        mark,
-        unrealizedPnl: mark != null ? mark * t.size - t.cost : null,
-        msRemaining: endMs != null ? endMs - now : null,
+    return db.openTrades()
+      .filter((t) => t.mode === mode)
+      .map((t) => {
+        const market = openMarketCache.get(t.windowKey) ?? null
+        const endMs = market?.endDate.getTime() ?? windowEndMsFromKey(t.windowKey)
+        const msRemaining = endMs != null ? endMs - now : null
+        const ended = msRemaining != null && msRemaining <= 0
+        const polyOutcome = polyOutcomeCache.get(t.windowKey) ?? null
+        const dbOutcome = db.outcomeFor(t.windowKey)
+        const settlementOutcome = polyOutcome ?? dbOutcome
+        const poly = openPolyCache.get(t.windowKey)
+
+        let phase: 'live' | 'won' | 'lost' | 'settling'
+        let mark: number | null
+        let unrealizedPnl: number | null
+        let redeemable = false
+
+        if (!ended) {
+          phase = 'live'
+          mark =
+            openMarkCache.get(t.windowKey) ?? (market ? bidForSide(deriveBook(market), t.side) : null)
+          if (mode === 'live' && poly) {
+            mark = poly.curPrice
+            unrealizedPnl = poly.cashPnl
+          } else {
+            unrealizedPnl = mark != null ? mark * t.size - t.cost : null
+          }
+        } else if (settlementOutcome) {
+          const resolved = resolvedOpenPnl(t, settlementOutcome)
+          phase = resolved.phase
+          mark = resolved.mark
+          unrealizedPnl = resolved.unrealizedPnl
+          redeemable =
+            mode === 'live' && resolved.phase === 'won' && poly?.redeemable === true
+        } else if (mode === 'live' && poly) {
+          const shares = tradeShares(t)
+          if (poly.currentValue > 0.01) {
+            phase = 'won'
+            mark = 1
+            unrealizedPnl = shares - t.cost
+            redeemable = poly.redeemable
+          } else {
+            phase = 'lost'
+            mark = 0
+            unrealizedPnl = -t.cost
+          }
+        } else {
+          phase = 'settling'
+          mark = null
+          unrealizedPnl = null
+        }
+
+        return {
+          coin: t.coin,
+          timeframe: t.timeframe,
+          side: t.side,
+          strategy: t.strategy,
+          entryPrice: t.entryPrice,
+          size: t.size,
+          mark,
+          unrealizedPnl,
+          msRemaining,
+          phase,
+          redeemable,
+          outcome: settlementOutcome ?? undefined,
+        }
+      })
+  }
+
+  function recordOutcome(
+    windowKey: string,
+    w: TrackedWindow,
+    finalPrice: number,
+    now: number,
+    source: 'chainlink' | 'api',
+    strikeOverride?: number,
+  ): void {
+    if (source === 'chainlink' && db.hasOutcome(windowKey)) {
+      forget(windowKey)
+      return
+    }
+    const strike = strikeOverride ?? w.strike
+    const outcome = finalPrice > strike ? 'up' : 'down'
+    const row = {
+      windowKey,
+      coin: w.coin,
+      timeframe: w.timeframe,
+      strike,
+      finalPrice,
+      outcome: outcome as 'up' | 'down',
+      endMs: w.endMs,
+      recordedAt: now,
+    }
+    if (source === 'api') {
+      const existing = db.outcomeFor(windowKey)
+      if (existing === outcome) {
+        forget(windowKey)
+        return
       }
-    })
+      db.setOutcome(row)
+    } else {
+      db.upsertOutcome(row)
+    }
+    stats.outcomes += 1
+    forget(windowKey)
+    log(
+      `OUTCOME ${source} ${w.coin}/${w.timeframe} · ${outcome} @ ${finalPrice.toFixed(2)} ` +
+        `(strike ${strike.toFixed(2)})`,
+    )
+  }
+
+  /** Polymarket crypto-price fallback when the Chainlink stream missed the boundary. */
+  function tryCryptoPriceOutcome(windowKey: string, w: TrackedWindow): void {
+    if (outcomeResolving.has(windowKey)) return
+    const hasOpen = db.openTradesForWindow(windowKey).length > 0
+    // Allow API refresh when open positions still need the correct Polymarket outcome.
+    if (db.hasOutcome(windowKey) && !hasOpen) return
+    outcomeResolving.add(windowKey)
+    void fetchWindowOutcome(w.coin as CoinId, w.timeframe, windowKey)
+      .then((resolved) => {
+        if (!resolved) return
+        recordOutcome(windowKey, w, resolved.finalPrice, Date.now(), 'api', resolved.strike)
+        settleTrades(Date.now())
+      })
+      .catch(() => {})
+      .finally(() => outcomeResolving.delete(windowKey))
   }
 
   function refreshMarket(state: ScopeState, now: number): void {
     const ended = state.market ? now >= state.market.endDate.getTime() : true
     if (state.fetching) return
-    // Poll faster while this scope holds an open swing position so the exit marks
-    // against a fresher book and the stop slips less past its target on a fast move.
+    // Poll faster while this scope holds an open position so exit marks stay fresh.
     const hasOpen =
-      config.strategy === 'swing' &&
       state.market != null &&
-      db.openTradesForWindow(marketWindowKey(state.market)).length > 0
-    const pollMs = hasOpen ? config.swingOpenPollMs : config.marketPollMs
+      db.openTradesForWindow(marketWindowKey(state.market)).length > 0 &&
+      (config.strategy === 'swing' || config.strategy === 'value' || config.strategy === 'certainty')
+    const endMs = state.market?.endDate.getTime()
+    const inCertaintyBand =
+      config.strategy === 'certainty' &&
+      endMs != null &&
+      inCertaintyEntryBand(endMs - now, config)
+    const pollMs = hasOpen
+      ? config.strategy === 'swing'
+        ? config.swingOpenPollMs
+        : config.strategy === 'certainty'
+          ? config.certaintyOpenPollMs
+          : config.valueOpenPollMs
+      : inCertaintyBand
+        ? config.certaintyOpenPollMs
+        : config.marketPollMs
     if (state.market && !ended && now - state.lastFetch < pollMs) return
     state.fetching = true
     void fetchCurrentMarket(state.coin, state.timeframe)
@@ -991,16 +1876,17 @@ async function main(): Promise<void> {
       })
   }
 
-  function sampleScope(state: ScopeState, now: number): void {
+  function sampleScope(state: ScopeState, now: number): void | Promise<void> {
     const market = state.market
     if (!market || now >= market.endDate.getTime()) return
 
     const windowStart = market.startDate?.getTime()
-    // Prefer the observed Chainlink open; fall back to gamma's strike when the
-    // bot started mid-window (no pre-open tick in the ring buffer).
-    let strike =
+    const chainlinkOpen =
       windowStart != null ? stream.firstPriceAtOrAfter(state.pair, windowStart, 90_000) : null
-    if (strike == null) strike = market.priceToBeat
+    const strike =
+      config.strategy === 'certainty'
+        ? (certaintyStrike(market, chainlinkOpen) ?? market.priceToBeat)
+        : (chainlinkOpen ?? market.priceToBeat)
     const spot = stream.latest(state.pair)?.value ?? null
     if (strike == null || spot == null) return
 
@@ -1021,7 +1907,7 @@ async function main(): Promise<void> {
 
     // Trade every tick (not throttled) so entries/exits land on time. Entries only
     // fire on tradable timeframes; recorded-but-not-traded ones (e.g. 5m) still log
-    // predictions above but never enter. Swing exits are managed regardless.
+    // predictions above but never enter. Open-position exits run regardless.
     if (mode !== 'record') {
       const canEnter = tradeTf.has(state.timeframe)
       if (config.strategy === 'swing') {
@@ -1029,8 +1915,10 @@ async function main(): Promise<void> {
         void manageSwing(pred, market, now, canEnter)
       } else if (config.strategy === 'maker') {
         manageMaker(pred, market, now, canEnter)
-      } else if (canEnter) {
-        void maybeTrade(pred, market, now)
+      } else if (config.strategy === 'value') {
+        void manageValue(pred, market, now, canEnter)
+      } else if (config.strategy === 'certainty') {
+        return manageCertainty(pred, market, spot, strike, now, canEnter)
       }
     }
 
@@ -1088,30 +1976,62 @@ async function main(): Promise<void> {
   function sweepOutcomes(now: number): void {
     for (const [windowKey, w] of tracked) {
       if (now <= w.endMs + 2_000) continue
+      // Polymarket crypto-price API is the settlement source of truth — always try first.
+      tryCryptoPriceOutcome(windowKey, w)
       if (db.hasOutcome(windowKey)) {
         forget(windowKey)
         continue
       }
-      let finalPrice =
+      // Chainlink fallback only after the API has had time to mark completed (~90s).
+      if (now <= w.endMs + 90_000) {
+        const hasOpen = db.openTradesForWindow(windowKey).length > 0
+        if (!hasOpen && now > w.endMs + OUTCOME_GIVEUP_MS) forget(windowKey)
+        continue
+      }
+      const finalPrice =
         stream.firstPriceAtOrAfter(w.pair, w.endMs, OUTCOME_SLOP_MS) ??
         db.tickAtOrAfter(w.pair, w.endMs, OUTCOME_SLOP_MS)
       if (finalPrice != null) {
-        db.upsertOutcome({
-          windowKey,
-          coin: w.coin,
-          timeframe: w.timeframe,
-          strike: w.strike,
-          finalPrice,
-          outcome: finalPrice > w.strike ? 'up' : 'down',
-          endMs: w.endMs,
-          recordedAt: now,
-        })
-        stats.outcomes += 1
-        forget(windowKey)
-      } else if (now > w.endMs + OUTCOME_GIVEUP_MS) {
-        forget(windowKey) // boundary tick never arrived
+        recordOutcome(windowKey, w, finalPrice, now, 'chainlink')
+        continue
+      }
+      const hasOpen = db.openTradesForWindow(windowKey).length > 0
+      if (!hasOpen && now > w.endMs + OUTCOME_GIVEUP_MS) forget(windowKey)
+    }
+  }
+
+  /** Fix oracle rows for open windows using Polymarket's completed crypto-price API. */
+  async function repairOpenOutcomesFromPoly(): Promise<void> {
+    const seen = new Set<string>()
+    for (const t of db.openTrades()) {
+      if (seen.has(t.windowKey)) continue
+      seen.add(t.windowKey)
+      const endMs = windowEndMsFromKey(t.windowKey)
+      if (endMs == null || Date.now() <= endMs + 2_000) continue
+      const pair = chainlinkPair(t.coin as CoinId)
+      if (!pair) continue
+      const w: TrackedWindow = tracked.get(t.windowKey) ?? {
+        pair,
+        coin: t.coin,
+        timeframe: t.timeframe,
+        strike: db.windowStrike(t.windowKey) ?? 0,
+        endMs,
+      }
+      try {
+        const resolved = await fetchWindowOutcome(t.coin as CoinId, t.timeframe, t.windowKey)
+        if (!resolved) continue
+        const prev = db.outcomeFor(t.windowKey)
+        const next = resolved.finalPrice > resolved.strike ? 'up' : 'down'
+        polyOutcomeCache.set(t.windowKey, next)
+        recordOutcome(t.windowKey, w, resolved.finalPrice, Date.now(), 'api', resolved.strike)
+        if (prev !== next) {
+          log(`OUTCOME repair ${t.coin}/${t.timeframe} · ${prev ?? '—'} → ${next} (poly API)`)
+        }
+      } catch {
+        /* retry next refresh */
       }
     }
+    settleTrades(Date.now())
   }
 
   // Maker live state for the dashboard monitor (only meaningful while strategy='maker').
@@ -1174,7 +2094,7 @@ async function main(): Promise<void> {
                 settled: stats.settled,
               },
               summary: db.tradeSummaryForMode(mode),
-              dailyTrades: db.countTradesSince(Date.now() - 86_400_000),
+              dailyTrades: db.countTradesSince(Date.now() - 86_400_000, mode),
               maxDailyTrades: effectiveDailyCap(),
               // Traded subset + the full recorded universe it can be toggled across.
               tradeTimeframes: config.timeframes.filter((tf) => tradeTf.has(tf)),
@@ -1182,10 +2102,26 @@ async function main(): Promise<void> {
               // Positions still being force-closed at market (strategy switch retries).
               pendingCloses: pendingClose.size,
               swingExits: config.strategy === 'swing' ? db.swingExits() : [],
+              valueExits: config.strategy === 'value' ? db.valueExits() : [],
               swingTrigger: config.swingTrigger,
               swingSource: config.signalSource,
+              certainty:
+                config.strategy === 'certainty'
+                  ? {
+                      entryWithinSec: config.certaintyEntryWithinSec,
+                      minWinProb: config.certaintyMinWinProb,
+                      minEdge: config.certaintyMinEdge,
+                      maxAsk: config.certaintyMaxAsk,
+                      minZ: config.certaintyMinZ,
+                      minCoins: config.certaintyMinCoins,
+                      maxCoins: config.certaintyMaxCoins,
+                      signalSource: config.signalSource,
+                    }
+                  : undefined,
               openPositions: openPositions(),
               recentClosed: db.recentClosed(8, mode),
+              recentTrades: db.recentTrades(8, mode),
+              recentActivity: db.recentActivity(8, mode),
               maker: config.strategy === 'maker' ? makerStatus() : undefined,
             }),
             setMode,
@@ -1195,6 +2131,7 @@ async function main(): Promise<void> {
             setStrategy,
             setTradeTimeframes,
             setMaker,
+            setCertainty,
             getHistory: (query) => db.queryTrades(query),
           },
           Number(process.env.BOT_CONTROL_PORT ?? 8790),
@@ -1203,72 +2140,98 @@ async function main(): Promise<void> {
         )
 
   seedTrackedFromOpen()
+  await repairOpenOutcomesFromPoly()
+  sweepOutcomes(Date.now())
+  settleTrades(Date.now())
 
   let lastStatus = 0
   let lastBalanceRefresh = 0
+  let tickRunning = false
   const BALANCE_REFRESH_MS = 60_000
   const timer = setInterval(() => {
-    const now = Date.now()
-    // Maker: keep the CLOB feed subscribed to tradable tokens and advance the fill
-    // sim BEFORE quoting happens inside sampleScope (fills update inventory first).
-    if (mode !== 'record' && config.strategy === 'maker') {
-      const ids: string[] = []
-      for (const s of scopes) {
-        if (!s.market || !tradeTf.has(s.timeframe)) continue
-        if (s.market.upTokenId) ids.push(s.market.upTokenId)
-        if (s.market.downTokenId) ids.push(s.market.downTokenId)
+    void (async () => {
+      if (tickRunning) return
+      tickRunning = true
+      try {
+        const now = Date.now()
+        // Maker: keep the CLOB feed subscribed to tradable tokens and advance the fill
+        // sim BEFORE quoting happens inside sampleScope (fills update inventory first).
+        if (mode !== 'record' && config.strategy === 'maker') {
+          const ids: string[] = []
+          for (const s of scopes) {
+            if (!s.market || !tradeTf.has(s.timeframe)) continue
+            if (s.market.upTokenId) ids.push(s.market.upTokenId)
+            if (s.market.downTokenId) ids.push(s.market.downTokenId)
+          }
+          makerStream.setTokens(ids)
+          makerStep(now)
+        }
+        certaintyCandidates = []
+        const certaintyWork: Promise<void>[] = []
+        for (const state of scopes) {
+          refreshMarket(state, now)
+          const work = sampleScope(state, now)
+          if (work) certaintyWork.push(work)
+        }
+        if (mode !== 'record' && config.strategy === 'certainty') {
+          await Promise.all(certaintyWork)
+          if (certaintyCandidates.length > 0) {
+            await pickAndTradeCertainty(certaintyCandidates, now)
+          }
+        }
+        seedTrackedFromOpen()
+        sweepOutcomes(now)
+        // Finalize maker windows regardless of the current strategy so a switch-away
+        // still settles inventory once the boundary outcome lands.
+        if (mode !== 'record') finalizeMakerWindows(now)
+        if (mode !== 'record') settleTrades(now)
+        if (mode !== 'record') await refreshOpenMarkets()
+        if (mode !== 'record' && now - lastCertaintyCashSweep >= CERTAINTY_CASH_SWEEP_MS) {
+          lastCertaintyCashSweep = now
+          void sweepCertaintyCash(now)
+        }
+        // Retry any queued force-closes (strategy switch) whose book was empty/thin.
+        if (mode !== 'record' && pendingClose.size > 0 && now - lastCloseDrain >= CLOSE_RETRY_MS) {
+          lastCloseDrain = now
+          void drainPendingCloses()
+        }
+
+        if (mode === 'live' && now - lastBalanceRefresh >= BALANCE_REFRESH_MS) {
+          lastBalanceRefresh = now
+          void import('../api/_lib/clob')
+            .then(({ fetchUsdcBalance }) => fetchUsdcBalance())
+            .then((b) => {
+              cachedUsdcBalance = b
+            })
+            .catch(() => {})
+        }
+
+        if (now - lastStatus >= STATUS_MS) {
+          lastStatus = now
+          const live = scopes.filter((s) => s.market).length
+          const dailyTrades = db.countTradesSince(now - 86_400_000, mode)
+          const cap = effectiveDailyCap()
+          const dailyCap = mode !== 'record' && cap > 0 && dailyTrades >= cap
+          const makerBrief =
+            config.strategy === 'maker' && mode !== 'record'
+              ? ` · maker[cw=${makerStream.connected ? 'up' : 'down'} quotes=${makerExec.open().length}` +
+                ` fills=${stats.makerFills} invWin=${makerInv.size}]`
+              : ''
+          log(
+            `[${mode}] ws=${stream.connected ? 'up' : 'down'} · live=${live}/${scopes.length} · ` +
+              `ticks=${stats.ticks} preds=${stats.predictions} outcomes=${stats.outcomes}` +
+              (mode !== 'record'
+                ? ` · trades=${stats.trades} settled=${stats.settled} open=${db.countOpenTrades()}` +
+                  ` · daily ${dailyTrades}/${cap || '∞'}${dailyCap ? ' CAP' : ''}`
+                : '') +
+              makerBrief +
+              ` · pending=${tracked.size}`,
+          )
+        }
+      } finally {
+        tickRunning = false
       }
-      makerStream.setTokens(ids)
-      makerStep(now)
-    }
-    for (const state of scopes) {
-      refreshMarket(state, now)
-      sampleScope(state, now)
-    }
-    seedTrackedFromOpen()
-    sweepOutcomes(now)
-    // Finalize maker windows regardless of the current strategy so a switch-away
-    // still settles inventory once the boundary outcome lands.
-    if (mode !== 'record') finalizeMakerWindows(now)
-    if (mode !== 'record') settleTrades(now)
-    // Retry any queued force-closes (strategy switch) whose book was empty/thin.
-    if (mode !== 'record' && pendingClose.size > 0 && now - lastCloseDrain >= CLOSE_RETRY_MS) {
-      lastCloseDrain = now
-      void drainPendingCloses()
-    }
-
-    if (mode === 'live' && now - lastBalanceRefresh >= BALANCE_REFRESH_MS) {
-      lastBalanceRefresh = now
-      void import('../api/_lib/clob')
-        .then(({ fetchUsdcBalance }) => fetchUsdcBalance())
-        .then((b) => {
-          cachedUsdcBalance = b
-        })
-        .catch(() => {})
-    }
-
-    if (now - lastStatus >= STATUS_MS) {
-      lastStatus = now
-      const live = scopes.filter((s) => s.market).length
-      const dailyTrades = db.countTradesSince(now - 86_400_000)
-      const cap = effectiveDailyCap()
-      const dailyCap = mode !== 'record' && cap > 0 && dailyTrades >= cap
-      const makerBrief =
-        config.strategy === 'maker' && mode !== 'record'
-          ? ` · maker[cw=${makerStream.connected ? 'up' : 'down'} quotes=${makerExec.open().length}` +
-            ` fills=${stats.makerFills} invWin=${makerInv.size}]`
-          : ''
-      log(
-        `[${mode}] ws=${stream.connected ? 'up' : 'down'} · live=${live}/${scopes.length} · ` +
-          `ticks=${stats.ticks} preds=${stats.predictions} outcomes=${stats.outcomes}` +
-          (mode !== 'record'
-            ? ` · trades=${stats.trades} settled=${stats.settled} open=${db.countOpenTrades()}` +
-              ` · daily ${dailyTrades}/${cap || '∞'}${dailyCap ? ' CAP' : ''}`
-            : '') +
-          makerBrief +
-          ` · pending=${tracked.size}`,
-      )
-    }
+    })()
   }, config.tickMs)
 
   const shutdown = (): void => {
