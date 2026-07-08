@@ -154,7 +154,7 @@ export async function warmOrderPath(tokenIds: string[]): Promise<void> {
 function parseOrderFill(
   side: 'BUY' | 'SELL',
   record: Record<string, unknown> | null,
-  intendedUsdc?: number,
+  intendedAmount?: number,
 ): Pick<PlaceOrderResult, 'fillPrice' | 'fillSize'> {
   const make = Number(record?.makingAmount)
   const take = Number(record?.takingAmount)
@@ -183,14 +183,30 @@ function parseOrderFill(
   // order's intended USDC when the parsed cost is far below what we sent.
   if (
     side === 'BUY' &&
-    intendedUsdc != null &&
-    intendedUsdc > 0 &&
+    intendedAmount != null &&
+    intendedAmount > 0 &&
     best.fillPrice! > 0 &&
     best.fillPrice! < 1
   ) {
     const reported = best.fillSize! * best.fillPrice!
-    if (reported < intendedUsdc * 0.5) {
-      return { fillPrice: best.fillPrice, fillSize: intendedUsdc / best.fillPrice! }
+    if (reported < intendedAmount * 0.5) {
+      return { fillPrice: best.fillPrice, fillSize: intendedAmount / best.fillPrice! }
+    }
+  }
+
+  // Same dust-parse issue on SELL — micro-unit ambiguity can zero out share count
+  // while USDC received is correct. Trust the order size when parsed shares are tiny.
+  if (
+    side === 'SELL' &&
+    intendedAmount != null &&
+    intendedAmount > 0 &&
+    best.fillPrice! > 0 &&
+    best.fillPrice! < 1
+  ) {
+    if (best.fillSize! < intendedAmount * 0.5) {
+      const fromUsdc = usdc > 0 ? usdc / best.fillPrice! : intendedAmount
+      const size = fromUsdc >= intendedAmount * 0.5 ? fromUsdc : intendedAmount
+      return { fillPrice: best.fillPrice, fillSize: size }
     }
   }
 
@@ -200,14 +216,14 @@ function parseOrderFill(
 function unwrapOrderResult(
   response: unknown,
   side?: 'BUY' | 'SELL',
-  intendedUsdc?: number,
+  intendedAmount?: number,
 ): PlaceOrderResult {
   const record = response as Record<string, unknown> | null
   return {
     success: true,
     orderId: typeof record?.orderID === 'string' ? record.orderID : undefined,
     status: typeof record?.status === 'string' ? record.status : undefined,
-    ...(side ? parseOrderFill(side, record, intendedUsdc) : {}),
+    ...(side ? parseOrderFill(side, record, intendedAmount) : {}),
   }
 }
 
@@ -412,7 +428,7 @@ export async function placeMarketOrder(params: PlaceOrderParams): Promise<PlaceO
     marketOrderType,
   )
 
-  let result = unwrapOrderResult(response, params.side, params.side === 'BUY' ? amount : undefined)
+  let result = unwrapOrderResult(response, params.side, amount)
   if (params.side === 'BUY' && (result.status ?? '').toLowerCase() === 'unmatched') {
     if (hint != null) {
       try {

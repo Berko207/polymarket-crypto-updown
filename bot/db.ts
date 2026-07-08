@@ -7,7 +7,7 @@ import Database from 'better-sqlite3'
 import { mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
 import type { CertaintyEntryRecord } from './engine/certainty'
-import { repairTradeAmounts, settlementPayout } from './tradeFill'
+import { repairTradeAmounts, repairDustExitPayout, settlementPayout } from './tradeFill'
 
 export interface TickRow {
   symbol: string
@@ -318,6 +318,8 @@ export interface BotDb {
   recentActivity(limit: number, mode?: string): RecentTradeRow[]
   /** Fix live rows with CLOB parse glitches (dust fills, absurd entry prices, inflated size). */
   repairLiveTradeFills(stakeUsd: number): number
+  /** Fix live early-exit rows where dust-parse zeroed payout/P&L. */
+  repairLiveTradeExits(): number
   /** Filtered, paged trade history for the dashboard grid (newest first). */
   queryTrades(query: TradeQuery): TradeHistoryPage
   /** Last recorded strike for a window (from predictions), for outcome sweeps after restart. */
@@ -672,6 +674,34 @@ export function openDb(path: string, readonly = false): BotDb {
           payout,
           pnl,
         })
+        n += 1
+      }
+      return n
+    },
+    repairLiveTradeExits: () => {
+      const rows = raw
+        .prepare(
+          `SELECT id, size, cost, entry_price AS entryPrice, exit_price AS exitPrice,
+                  payout, pnl, exit_reason AS exitReason
+           FROM trades
+           WHERE mode = 'live' AND status = 'closed' AND exit_price IS NOT NULL`,
+        )
+        .all() as {
+        id: number
+        size: number
+        cost: number
+        entryPrice: number
+        exitPrice: number | null
+        payout: number | null
+        pnl: number | null
+        exitReason: string | null
+      }[]
+      const upd = raw.prepare(`UPDATE trades SET payout=@payout, pnl=@pnl WHERE id=@id`)
+      let n = 0
+      for (const r of rows) {
+        const fixed = repairDustExitPayout(r)
+        if (!fixed) continue
+        upd.run({ id: r.id, payout: fixed.payout, pnl: fixed.pnl })
         n += 1
       }
       return n

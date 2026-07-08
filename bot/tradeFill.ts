@@ -68,6 +68,61 @@ export function normalizeLiveFill(
   return { entryPrice: price, size, cost }
 }
 
+export interface SellFillAmounts {
+  exitPrice: number
+  size: number
+  payout: number
+}
+
+/** Normalize a live market sell — same dust-parse issue as buys. */
+export function normalizeLiveSellFill(
+  orderSize: number,
+  markPrice: number,
+  fillPrice: number,
+  fillSize: number,
+): SellFillAmounts | null {
+  if (!(orderSize > 0)) return null
+  const book = markPrice > 0 && markPrice < 1 ? markPrice : null
+  let price = fillPrice > 0 && fillPrice < 1 ? fillPrice : book
+  if (price == null) return null
+
+  let size = fillSize > 0 ? fillSize : orderSize
+  let payout = price * size
+
+  if (size < orderSize * 0.5) {
+    size = orderSize
+    payout = price * size
+  }
+  const anchor = book ?? price
+  if (payout < orderSize * anchor * 0.5) {
+    price = fillPrice > 0 && fillPrice < 1 ? fillPrice : anchor
+    size = orderSize
+    payout = price * size
+  }
+
+  if (!(payout > 0)) return null
+  return { exitPrice: price, size, payout }
+}
+
+/** Repair closed rows where CLOB dust-parse zeroed payout on an early exit. */
+export function repairDustExitPayout(row: {
+  size: number
+  cost: number
+  entryPrice: number
+  exitPrice: number | null
+  payout: number | null
+  exitReason: string | null
+}): { payout: number; pnl: number } | null {
+  if (row.exitReason === 'redeem' || row.exitReason === 'window-end') return null
+  const exitPrice = row.exitPrice
+  if (exitPrice == null || !(exitPrice > 0 && exitPrice < 1)) return null
+  const shares = tradeShares(row)
+  const expected = shares * exitPrice
+  const payout = row.payout ?? 0
+  if (payout >= row.cost * 0.5 || payout >= expected * 0.5) return null
+  return { payout: expected, pnl: expected - row.cost }
+}
+
 /** Repair stored live row amounts. Returns null when the row already looks sane. */
 export function repairTradeAmounts(
   row: {

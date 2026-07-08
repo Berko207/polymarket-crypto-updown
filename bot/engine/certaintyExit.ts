@@ -28,11 +28,13 @@ export function decideCertaintyExit(
   market: ParsedMarket,
   config: BotConfig,
   now: number,
+  /** Live: prefer CLOB bid over gamma/complement (matches post-window sells). */
+  markOverride?: number | null,
 ): CertaintyExitDecision | null {
   const msRemaining = market.endDate.getTime() - now
   if (msRemaining < 1_000) return null
 
-  const mark = bidForSide(deriveBook(market), pos.side)
+  const mark = markOverride ?? bidForSide(deriveBook(market), pos.side)
   if (mark != null && mark >= config.certaintyTakeProfitBid) {
     return { reason: 'take-profit', mark }
   }

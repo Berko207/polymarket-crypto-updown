@@ -1,6 +1,7 @@
 import { cn } from '@/lib/utils'
 import { useBotStatus } from '@/queries/bot'
 import { EXIT_META, fmtAgo, fmtCountdown, sideArrow, sideCls, tradeResolvedWin } from '@/lib/botFormat'
+import { formatPnlUsd } from '@/lib/positionPnl'
 import { BotHistoryDialog } from './BotHistoryDialog'
 
 /**
@@ -302,7 +303,7 @@ export function BotMonitorPanel() {
                   : resolved
                     ? 'bg-up-soft text-up'
                     : 'bg-down-soft text-down')
-            const up = resolved != null ? resolved : pnl >= 0
+            const pnlUp = pnl >= 0
             const when = isOpen
               ? ('entryT' in r && r.entryT ? r.entryT : 0)
               : (r.settleT ?? ('entryT' in r ? r.entryT : 0) ?? 0)
@@ -322,10 +323,10 @@ export function BotMonitorPanel() {
                   <span
                     className={cn(
                       'font-semibold',
-                      isOpen ? 'text-muted-foreground' : up ? 'text-up' : 'text-down',
+                      isOpen ? 'text-muted-foreground' : pnlUp ? 'text-up' : 'text-down',
                     )}
                   >
-                    {isOpen ? `@ ${r.entryPrice.toFixed(2)}` : `${up ? '+' : ''}$${pnl.toFixed(2)}`}
+                    {isOpen ? `@ ${r.entryPrice.toFixed(2)}` : formatPnlUsd(pnl)}
                   </span>
                   <span className="w-9 text-right text-muted-foreground">{fmtAgo(now - when)}</span>
                 </span>

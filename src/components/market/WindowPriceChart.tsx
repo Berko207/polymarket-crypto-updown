@@ -131,7 +131,8 @@ export const WindowPriceChart = memo(function WindowPriceChart({
 
   const chart = useMemo(() => {
     if (!width || ticks.length < 2 || startMs <= 0) return null
-    const points = downsample(ticks, Math.max(60, Math.floor(width / PX_PER_BUCKET)))
+    const ordered = [...ticks].sort((a, b) => a.timestamp - b.timestamp)
+    const points = downsample(ordered, Math.max(60, Math.floor(width / PX_PER_BUCKET)))
 
     const x0 = Math.max(startMs, points[0].t)
     const x1 = endMs

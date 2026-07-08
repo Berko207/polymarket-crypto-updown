@@ -11,6 +11,8 @@ const RECONNECT_MS = 2_000
 const STALE_SOCKET_MS = 25_000
 /** Watchdog cadence — well under STALE_SOCKET_MS so a stall is caught within ~one interval. */
 const WATCHDOG_MS = 5_000
+/** Re-send per-symbol subs — RTDS snapshots are the live refresh path. */
+const REFRESH_MS = 5_000
 /** Keep ticks long enough to cover a 4h window plus slack. */
 const HISTORY_MS = 5 * 60 * 60 * 1000
 const MAX_HISTORY_TICKS = 8_000
@@ -40,6 +42,8 @@ class ChainlinkSocket {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null
   private watchdogTimer: ReturnType<typeof setInterval> | null = null
   private connected = false
+  private refreshTimer: ReturnType<typeof setInterval> | null = null
+  private seeded = new Set<string>()
   /** Wall-clock ms of the last frame from the active socket (tick OR PONG). */
   private lastMessageAt = 0
   private listenersAttached = false
@@ -85,9 +89,34 @@ class ChainlinkSocket {
     if (this.pingTimer) clearInterval(this.pingTimer)
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer)
     if (this.watchdogTimer) clearInterval(this.watchdogTimer)
+    if (this.refreshTimer) clearInterval(this.refreshTimer)
     this.pingTimer = null
     this.reconnectTimer = null
     this.watchdogTimer = null
+    this.refreshTimer = null
+  }
+
+  private allSymbols(): string[] {
+    const out = new Set<string>()
+    for (const sub of this.subs) for (const sym of sub.symbols) out.add(sym)
+    return [...out]
+  }
+
+  private subscribeAll(ws: WebSocket): void {
+    for (const symbol of this.allSymbols()) {
+      ws.send(
+        JSON.stringify({
+          action: 'subscribe',
+          subscriptions: [
+            {
+              topic: 'crypto_prices_chainlink',
+              type: '*',
+              filters: JSON.stringify({ symbol }),
+            },
+          ],
+        }),
+      )
+    }
   }
 
   /** Debounced liveness check shared by the visibility/online listeners: revive a
@@ -212,11 +241,11 @@ class ChainlinkSocket {
     return null
   }
 
-  private recordTick(symbol: string, tick: ChainlinkTick) {
+  private recordQuiet(symbol: string, tick: ChainlinkTick): void {
     const arr = this.history[symbol] ?? []
     const last = arr[arr.length - 1]
     if (last?.timestamp === tick.timestamp && last.value === tick.value) return
-
+    if (last && tick.timestamp < last.timestamp) return
     arr.push(tick)
     const cutoff = Date.now() - HISTORY_MS
     while (arr.length > 0 && arr[0].timestamp < cutoff) arr.shift()
@@ -224,31 +253,71 @@ class ChainlinkSocket {
     this.history[symbol] = arr
   }
 
+  private ingest(symbol: string, tick: ChainlinkTick): boolean {
+    const prev = this.prices[symbol]
+    if (prev?.value === tick.value && prev.timestamp === tick.timestamp) return false
+    this.prices[symbol] = tick
+    this.recordQuiet(symbol, tick)
+    return true
+  }
+
+  private parseSnapshotRows(rows: unknown[]): ChainlinkTick[] {
+    const points: ChainlinkTick[] = []
+    for (const row of rows) {
+      if (!row || typeof row !== 'object') continue
+      const pt = row as Record<string, unknown>
+      const value = Number(pt.value)
+      const timestamp = Number(pt.timestamp)
+      if (!Number.isFinite(value) || !Number.isFinite(timestamp)) continue
+      points.push({ value, timestamp })
+    }
+    points.sort((a, b) => a.timestamp - b.timestamp)
+    return points
+  }
+
+  private applySnapshot(symbol: string, rows: unknown[]): boolean {
+    const points = this.parseSnapshotRows(rows)
+    if (!points.length) return false
+
+    if (!this.seeded.has(symbol)) {
+      for (let i = 0; i < points.length - 1; i++) this.recordQuiet(symbol, points[i]!)
+      this.seeded.add(symbol)
+      return this.ingest(symbol, points[points.length - 1]!)
+    }
+
+    const latestTs = this.prices[symbol]?.timestamp ?? 0
+    let changed = false
+    for (const p of points) {
+      if (p.timestamp > latestTs && this.ingest(symbol, p)) changed = true
+    }
+    return changed
+  }
+
   private applyMessage(raw: unknown): boolean {
     if (!raw || typeof raw !== 'object') return false
     const msg = raw as Record<string, unknown>
-    if (msg.topic !== 'crypto_prices_chainlink') return false
+    const topic = msg.topic
+    if (topic !== 'crypto_prices_chainlink' && topic !== 'crypto_prices') return false
 
     const payload = msg.payload as Record<string, unknown> | undefined
     if (!payload) return false
 
     const symbol = String(payload.symbol ?? '').toLowerCase()
+    if (!symbol.includes('/')) return false
+
+    const data = payload.data
+    if (Array.isArray(data)) return this.applySnapshot(symbol, data)
+
     const value = Number(payload.value)
     const timestamp = Number(payload.timestamp ?? msg.timestamp)
-    if (!symbol || !Number.isFinite(value)) return false
+    if (!Number.isFinite(value)) return false
 
     const tick: ChainlinkTick = {
       value,
       timestamp: Number.isFinite(timestamp) ? timestamp : Date.now(),
     }
     if (payload.is_carried_forward === true) tick.carried = true
-
-    const prev = this.prices[symbol]
-    if (prev?.value === tick.value && prev.timestamp === tick.timestamp) return false
-
-    this.prices[symbol] = tick
-    this.recordTick(symbol, tick)
-    return true
+    return this.ingest(symbol, tick)
   }
 
   private openSocket() {
@@ -271,15 +340,13 @@ class ChainlinkSocket {
       if (ws !== this.ws) return
       this.lastMessageAt = Date.now()
       this.setConnected(true)
-      ws.send(
-        JSON.stringify({
-          action: 'subscribe',
-          subscriptions: [{ topic: 'crypto_prices_chainlink', type: '*', filters: '' }],
-        }),
-      )
+      this.subscribeAll(ws)
       this.pingTimer = setInterval(() => {
         if (ws.readyState === WebSocket.OPEN) ws.send('PING')
       }, PING_MS)
+      this.refreshTimer = setInterval(() => {
+        if (ws.readyState === WebSocket.OPEN) this.subscribeAll(ws)
+      }, REFRESH_MS)
       // Force-reconnect a half-open socket the browser never reported as closed:
       // no tick AND no PONG for STALE_SOCKET_MS while still OPEN means it's dead.
       this.watchdogTimer = setInterval(() => {
@@ -296,9 +363,10 @@ class ChainlinkSocket {
     ws.onmessage = (event) => {
       if (ws !== this.ws) return
       this.lastMessageAt = Date.now()
-      if (event.data === 'PONG') return
+      const raw = String(event.data)
+      if (!raw.trim() || raw === 'PONG') return
       try {
-        if (this.applyMessage(JSON.parse(event.data as string))) this.notify()
+        if (this.applyMessage(JSON.parse(raw))) this.notify()
       } catch {
         // ignore malformed frames
       }
@@ -309,6 +377,7 @@ class ChainlinkSocket {
       this.setConnected(false)
       this.clearTimers()
       this.ws = null
+      this.seeded.clear()
       if (this.subs.size > 0) {
         this.reconnectTimer = setTimeout(() => this.openSocket(), RECONNECT_MS)
       }

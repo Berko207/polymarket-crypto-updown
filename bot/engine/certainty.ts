@@ -137,26 +137,28 @@ export function evaluateCertainty(
   const side = oracleFavoredSide(spot, strike)
   const pWin = winProbForSide(pred, side, config)
   const zDist = zDistance(spot, strike, pred.sigmaWindow)
-  let ask: number
-  const useClob = opts && 'clobAsk' in opts
-  if (useClob) {
-    if (opts.requireClobAsk && (opts.clobAsk == null || !(opts.clobAsk > 0 && opts.clobAsk < 1))) {
-      ask = opts.clobAsk ?? NaN
-    } else if (opts.clobAsk == null || !(opts.clobAsk > 0 && opts.clobAsk < 1)) {
-      ask = opts.clobAsk ?? NaN
-    } else {
-      ask = opts.clobAsk
-    }
-  } else {
+  const gammaAsk = (): number => {
     const book = deriveBook(market)
     const askRaw = askForSide(book, side)
-    ask =
+    return (
       askRaw ??
       (side === 'up'
         ? Number.isFinite(market.upPrice)
           ? market.upPrice
           : pred.marketP
         : 1 - pred.marketP)
+    )
+  }
+  let ask: number
+  const useClob = opts && 'clobAsk' in opts
+  if (useClob && opts.clobAsk != null && opts.clobAsk > 0 && opts.clobAsk < 1) {
+    ask = opts.clobAsk
+  } else if (useClob && opts.requireClobAsk) {
+    ask = NaN
+  } else if (useClob) {
+    ask = gammaAsk()
+  } else {
+    ask = gammaAsk()
   }
   const edge = pWin - ask
   const score = certaintyScore(pWin, edge, zDist)
@@ -175,7 +177,14 @@ export function evaluateCertainty(
   if (!inCertaintyEntryBand(msRemaining, config)) {
     return fail(`outside T-${config.certaintyEntryWithinSec}s band`)
   }
-  if (pred.confidence !== 'ok') return fail(`confidence ${pred.confidence}`)
+  const clobTrusted =
+    useClob &&
+    opts.requireClobAsk === true &&
+    opts.clobAsk != null &&
+    opts.clobAsk > 0 &&
+    opts.clobAsk < 1
+  // Gamma Up spread can read wide while the favored CLOB token has a real ask.
+  if (!clobTrusted && pred.confidence !== 'ok') return fail(`confidence ${pred.confidence}`)
   if (pred.regime === 'panic') return fail('regime panic')
   if (pWin < config.certaintyMinWinProb) {
     return fail(`P(win) ${pWin.toFixed(3)} < ${config.certaintyMinWinProb}`)

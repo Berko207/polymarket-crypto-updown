@@ -117,11 +117,28 @@ function testAcceptsAlignedBook(): void {
   assert.ok(ev.ask >= 0.9)
 }
 
+function testClobAskBypassesWideSpread(): void {
+  const config = loadConfig()
+  config.strategy = 'certainty'
+  config.certaintyMinZ = 0
+  const ev = evaluateCertainty(
+    basePred({ confidence: 'wide-spread' }),
+    baseMarket(),
+    1.13,
+    1.12,
+    config,
+    Date.now(),
+    { clobAsk: 0.92, clobOppAsk: 0.08, requireClobAsk: true },
+  )
+  assert.equal(ev.ok, true)
+}
+
 function main(): void {
   testStrikePrefersPriceToBeat()
   testRejectsCheapFavoredAsk()
   testRejectsPhantomEdge()
   testAcceptsAlignedBook()
+  testClobAskBypassesWideSpread()
   console.log('certainty-selftest: ok')
 }
 

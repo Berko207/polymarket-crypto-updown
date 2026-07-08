@@ -16,7 +16,7 @@ import { fetchWindowOutcome } from './sources/resolveOutcome'
 import { fetchRedeemableByToken, redeemEnvHint, redeemWinningPosition } from './sources/redeem'
 import { fetchClobBestAsk, fetchClobBestBid } from './sources/clobBook'
 import { fetchPolyPositionsByToken, type PolyPositionSnap } from './sources/polyPositions'
-import { normalizeLiveFill, settlementPayout, tradeShares } from './tradeFill'
+import { normalizeLiveFill, normalizeLiveSellFill, settlementPayout, tradeShares } from './tradeFill'
 import { predict, type Prediction } from './engine/predict'
 import { decideEntry, entryBlockReason } from './engine/strategy'
 import { decideSwingEntry, decideExit, deriveBook, bidForSide, sourceEdge, type MidPoint } from './engine/swing'
@@ -134,7 +134,14 @@ async function main(): Promise<void> {
   const db = openDb(config.dbPath)
   const repaired = db.repairLiveTradeFills(config.stakeUsd)
   if (repaired > 0) log(`repaired ${repaired} live trade fill(s) in trade history`)
-  const stream = new ChainlinkStream()
+  const repairedExits = db.repairLiveTradeExits()
+  if (repairedExits > 0) log(`repaired ${repairedExits} live exit payout(s) in trade history`)
+  const streamSymbols = [
+    ...new Set(
+      config.coins.map((c) => chainlinkPair(c)).filter((p): p is string => p != null),
+    ),
+  ]
+  const stream = new ChainlinkStream(streamSymbols)
 
   // --- maker strategy infra (strategy='maker'). The CLOB market socket supplies
   // the depth + trade tape the fill sim needs; only subscribed while maker is active. ---
@@ -362,9 +369,8 @@ async function main(): Promise<void> {
       makerStream.setTokens([])
     }
     // Market-close positions from the old regime so they realize now instead of
-    // riding to settlement. The flip is instant; drainPendingCloses keeps retrying
-    // the sells (empty/thin book) each cycle until filled or the window settles.
-    if (db.countOpenTrades() > 0) requestCloseAllOpen('strategy-switch')
+    // riding to settlement. Certainty winners are left on the sell/redeem path.
+    if (db.countOpenTrades() > 0) requestCloseAllOpen('strategy-switch', new Set(['certainty']))
     return { ok: true }
   }
 
@@ -855,13 +861,16 @@ async function main(): Promise<void> {
     exitingTrades.delete(pos.id)
     if (!(fill.fillSize > 0 && fill.fillPrice > 0)) return 'retry'
 
-    const exitFee = config.feeSell ? takerFee(fill.fillPrice, fill.fillSize, config.feeRate) : 0
-    const payout = fill.fillPrice * fill.fillSize - exitFee
+    const normalized = normalizeLiveSellFill(pos.size, exit.mark, fill.fillPrice, fill.fillSize)
+    if (!normalized) return 'retry'
+
+    const exitFee = config.feeSell ? takerFee(normalized.exitPrice, normalized.size, config.feeRate) : 0
+    const payout = normalized.payout - exitFee
     const pnl = payout - pos.cost
     db.closeTrade({
       id: pos.id,
       exitT: now,
-      exitPrice: fill.fillPrice,
+      exitPrice: normalized.exitPrice,
       exitReason: exit.reason,
       exitFee,
       payout,
@@ -869,7 +878,7 @@ async function main(): Promise<void> {
     })
     stats.settled += 1
     log(
-      `${mode.toUpperCase()} EXIT ${exit.reason} ${logPrefix}${pred.coin}/${pred.timeframe} ${pos.side} @ ${fill.fillPrice.toFixed(3)} · ` +
+      `${mode.toUpperCase()} EXIT ${exit.reason} ${logPrefix}${pred.coin}/${pred.timeframe} ${pos.side} @ ${normalized.exitPrice.toFixed(3)} · ` +
         `pnl ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(3)} · ${Math.round((market.endDate.getTime() - now) / 1000)}s left`,
     )
     if (mode === 'live' && cachedUsdcBalance != null) cachedUsdcBalance += payout
@@ -939,7 +948,12 @@ async function main(): Promise<void> {
   async function certaintyExit(pred: Prediction, market: ParsedMarket, now: number): Promise<void> {
     for (const pos of db.openTradesForWindow(pred.windowKey)) {
       if (pos.strategy !== 'certainty' || exitingTrades.has(pos.id)) continue
-      const exit = decideCertaintyExit(pos, market, config, now)
+      let clobBid: number | null = null
+      if (mode === 'live') {
+        const tokenId = pos.side === 'up' ? market.upTokenId : market.downTokenId
+        if (tokenId) clobBid = await fetchClobBestBid(tokenId)
+      }
+      const exit = decideCertaintyExit(pos, market, config, now, clobBid)
       if (!exit) continue
       await marketSellExit(pos, pred, market, now, exit, 'certainty ')
     }
@@ -1129,10 +1143,9 @@ async function main(): Promise<void> {
     now: number,
   ): Promise<CertaintyEvalOpts | undefined> {
     if (!inCertaintyEntryBand(market.endDate.getTime() - now, config)) return undefined
-    if (mode !== 'live') return undefined
     const side = oracleFavoredSide(spot, strike)
     const { clobAsk, clobOppAsk } = await certaintyClobAsks(market, side)
-    return { clobAsk, clobOppAsk, requireClobAsk: true }
+    return { clobAsk, clobOppAsk, requireClobAsk: mode === 'live' }
   }
 
   /** Fresh spot/strike/book check immediately before a live Easy buy. */
@@ -1481,9 +1494,10 @@ async function main(): Promise<void> {
   // Queue every open position to be force-closed at market (used on a strategy
   // switch). The selling is retried each cycle by drainPendingCloses until each
   // fills or its window ends, so an empty/thin book doesn't strand the switch.
-  function requestCloseAllOpen(reason: string): void {
+  function requestCloseAllOpen(reason: string, skipStrategies?: ReadonlySet<string>): void {
     let n = 0
     for (const t of db.openTrades()) {
+      if (skipStrategies?.has(t.strategy)) continue
       if (!pendingClose.has(t.id)) {
         pendingClose.set(t.id, reason)
         n += 1
@@ -1547,16 +1561,18 @@ async function main(): Promise<void> {
           // Unmatched — empty/thin book. Stay queued and retry next cycle.
           continue
         }
+        const normalized = normalizeLiveSellFill(pos.size, mark, fill.fillPrice, fill.fillSize)
+        if (!normalized) continue
         const now = Date.now()
-        const exitFee = config.feeSell ? takerFee(fill.fillPrice, fill.fillSize, config.feeRate) : 0
-        const payout = fill.fillPrice * fill.fillSize - exitFee
+        const exitFee = config.feeSell ? takerFee(normalized.exitPrice, normalized.size, config.feeRate) : 0
+        const payout = normalized.payout - exitFee
         const pnl = payout - pos.cost
-        db.closeTrade({ id, exitT: now, exitPrice: fill.fillPrice, exitReason: reason, exitFee, payout, pnl })
+        db.closeTrade({ id, exitT: now, exitPrice: normalized.exitPrice, exitReason: reason, exitFee, payout, pnl })
         swingCooldown.set(pos.windowKey, now)
         stats.settled += 1
         pendingClose.delete(id)
         log(
-          `${mode.toUpperCase()} CLOSE ${reason} ${pos.coin}/${pos.timeframe} ${pos.side} @ ${fill.fillPrice.toFixed(3)} · ` +
+          `${mode.toUpperCase()} CLOSE ${reason} ${pos.coin}/${pos.timeframe} ${pos.side} @ ${normalized.exitPrice.toFixed(3)} · ` +
             `pnl ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(3)}`,
         )
       }
@@ -1905,6 +1921,30 @@ async function main(): Promise<void> {
       })
     }
 
+    const persistPrediction = (): void => {
+      if (now - (lastSample.get(pred.windowKey) ?? 0) < config.sampleMs) return
+      lastSample.set(pred.windowKey, now)
+      db.insertPrediction({
+        windowKey: pred.windowKey,
+        coin: pred.coin,
+        timeframe: pred.timeframe,
+        t: pred.t,
+        msRemaining: pred.msRemaining,
+        spot: pred.spot,
+        strike: pred.strike,
+        modelP: pred.modelP,
+        regimeP: pred.regimeP,
+        regime: pred.regime,
+        regimeRatio: pred.regimeRatio,
+        marketP: pred.marketP,
+        upBid: pred.upBid,
+        upAsk: pred.upAsk,
+        sigmaWindow: pred.sigmaWindow,
+        confidence: pred.confidence,
+      })
+      stats.predictions += 1
+    }
+
     // Trade every tick (not throttled) so entries/exits land on time. Entries only
     // fire on tradable timeframes; recorded-but-not-traded ones (e.g. 5m) still log
     // predictions above but never enter. Open-position exits run regardless.
@@ -1918,31 +1958,11 @@ async function main(): Promise<void> {
       } else if (config.strategy === 'value') {
         void manageValue(pred, market, now, canEnter)
       } else if (config.strategy === 'certainty') {
-        return manageCertainty(pred, market, spot, strike, now, canEnter)
+        return manageCertainty(pred, market, spot, strike, now, canEnter).then(persistPrediction)
       }
     }
 
-    if (now - (lastSample.get(pred.windowKey) ?? 0) < config.sampleMs) return
-    lastSample.set(pred.windowKey, now)
-    db.insertPrediction({
-      windowKey: pred.windowKey,
-      coin: pred.coin,
-      timeframe: pred.timeframe,
-      t: pred.t,
-      msRemaining: pred.msRemaining,
-      spot: pred.spot,
-      strike: pred.strike,
-      modelP: pred.modelP,
-      regimeP: pred.regimeP,
-      regime: pred.regime,
-      regimeRatio: pred.regimeRatio,
-      marketP: pred.marketP,
-      upBid: pred.upBid,
-      upAsk: pred.upAsk,
-      sigmaWindow: pred.sigmaWindow,
-      confidence: pred.confidence,
-    })
-    stats.predictions += 1
+    persistPrediction()
   }
 
   // Drop a finished window from all in-memory per-window state.
@@ -2147,13 +2167,20 @@ async function main(): Promise<void> {
   let lastStatus = 0
   let lastBalanceRefresh = 0
   let tickRunning = false
+  let tickStartedAt = 0
+  const TICK_WATCHDOG_MS = 20_000
   const BALANCE_REFRESH_MS = 60_000
   const timer = setInterval(() => {
+    const now = Date.now()
+    if (tickRunning && now - tickStartedAt > TICK_WATCHDOG_MS) {
+      log(`tick watchdog — previous tick hung >${TICK_WATCHDOG_MS / 1000}s, releasing lock`)
+      tickRunning = false
+    }
+    if (tickRunning) return
+    tickRunning = true
+    tickStartedAt = now
     void (async () => {
-      if (tickRunning) return
-      tickRunning = true
       try {
-        const now = Date.now()
         // Maker: keep the CLOB feed subscribed to tradable tokens and advance the fill
         // sim BEFORE quoting happens inside sampleScope (fills update inventory first).
         if (mode !== 'record' && config.strategy === 'maker') {
@@ -2228,6 +2255,8 @@ async function main(): Promise<void> {
               ` · pending=${tracked.size}`,
           )
         }
+      } catch (e) {
+        log(`tick error — ${e instanceof Error ? e.message : String(e)}`)
       } finally {
         tickRunning = false
       }

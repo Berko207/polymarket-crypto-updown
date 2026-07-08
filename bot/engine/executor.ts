@@ -4,7 +4,7 @@
  * loop never change between dry and live.
  */
 import type { Order } from './strategy'
-import { normalizeLiveFill } from '../tradeFill'
+import { normalizeLiveFill, normalizeLiveSellFill } from '../tradeFill'
 
 export interface Fill {
   fillPrice: number
@@ -145,7 +145,16 @@ export function makeLiveExecutor(): Executor {
       if (!res.success || status === 'unmatched' || !res.fillSize || !res.fillPrice) {
         return { fillPrice: 0, fillSize: 0, orderId: res.orderId ?? null }
       }
-      return { fillPrice: res.fillPrice, fillSize: res.fillSize, orderId: res.orderId ?? null }
+      const amounts = normalizeLiveSellFill(
+        order.size,
+        order.sellPrice,
+        res.fillPrice,
+        res.fillSize,
+      )
+      if (!amounts) {
+        return { fillPrice: 0, fillSize: 0, orderId: res.orderId ?? null }
+      }
+      return { fillPrice: amounts.exitPrice, fillSize: amounts.size, orderId: res.orderId ?? null }
     },
   }
 }
